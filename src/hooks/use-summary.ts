@@ -26,11 +26,22 @@ export function useSummary() {
       return res.json();
     },
     refetchInterval: 5 * 60 * 1000,
+    staleTime: 2 * 60 * 1000,
   });
+
+  const forceRefresh = () => {
+    return fetch(`/api/summary?force=1&t=${Date.now()}`)
+      .then(r => r.json())
+      .then(data => {
+        query.refetch();
+        return data;
+      });
+  };
 
   return {
     ...query,
     isValidating: query.isFetching,
     mutate: query.refetch,
+    forceRefresh,
   };
 }

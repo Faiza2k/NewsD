@@ -7,7 +7,7 @@ import { groqChat } from '@/lib/groq';
 import Parser from 'rss-parser';
 
 const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
-const MAX_ITEMS_PER_FEED = 5;
+const MAX_ITEMS_PER_FEED = 8;
 const BATCH_SIZE = 5;
 
 const parser = new Parser({
@@ -35,7 +35,7 @@ export interface SummaryResponse {
 
 // Fetch top headlines for a category from RSS
 async function fetchHeadlines(categoryId: string): Promise<string[]> {
-  const sources = FEED_SOURCES.filter(s => s.category === categoryId).slice(0, 3);
+  const sources = FEED_SOURCES.filter(s => s.category === categoryId); // ALL sources, not just 3
   const titles: string[] = [];
 
   const allFetches = sources.map(async (source) => {
@@ -59,7 +59,7 @@ async function fetchHeadlines(categoryId: string): Promise<string[]> {
   }
 
   for (const batch of batches) titles.push(...batch);
-  return titles.slice(0, 12); // max 12 headlines per category for the prompt
+  return titles.slice(0, 20); // max 20 headlines per category for comprehensive coverage
 }
 
 export async function GET(request: NextRequest) {
@@ -81,16 +81,18 @@ export async function GET(request: NextRequest) {
     })
   );
 
-  // Build one consolidated prompt for all categories
+  // Build one consolidated prompt for all categories — include ALL categories even if no headlines
   const sections = CATEGORIES.map(cat => {
-    const headlines = headlineMap[cat.id];
-    if (!headlines || headlines.length === 0) return null;
+    const headlines = headlineMap[cat.id] || [];
+    if (headlines.length === 0) {
+      return `ID: "${cat.id}"\nCategory: ${cat.name}\n(No headlines fetched — provide a general summary based on your knowledge of current trends in this domain.)`;
+    }
     return `ID: "${cat.id}"\nCategory: ${cat.name}\n${headlines.map((h, i) => `${i + 1}. ${h}`).join('\n')}`;
-  }).filter(Boolean).join('\n\n');
+  }).join('\n\n');
 
   const prompt = `You are an expert intelligence analyst. Below are the latest headlines from each category in a real-time news dashboard.
 
-For each category provided, write a 1–2 sentence sharp, insightful summary of what's happening right now based ONLY on its headlines. Be direct, factual, and analytical — no fluff. Only include the most significant trend or development.
+For each category provided, write a 2–3 sentence sharp, insightful summary of what's happening right now based ONLY on its headlines. Be direct, factual, and analytical. Cover the most significant trends and developments — do not skip any important story.
 
 Format your response as a JSON array where each object has a "categoryId" exactly matching the ID provided, and a "summary".
 
@@ -107,40 +109,63 @@ ${sections}
 Return ONLY valid JSON. No markdown fences or explanations.`;
 
   let summaries: CategorySummary[] = [];
+  let aiSuccess = false;
 
-  try {
-    const raw = await groqChat([
-      { role: 'system', content: 'You are a precise intelligence analyst. Respond with valid JSON only.' },
-      { role: 'user', content: prompt },
-    ], { maxTokens: 1000, temperature: 0.2 });
+  // Check if we have any headlines at all
+  const totalHeadlines = Object.values(headlineMap).reduce((sum, h) => sum + h.length, 0);
 
-    // Parse the JSON response
-    const parsed: { categoryId: string; summary: string }[] = JSON.parse(raw);
+  if (totalHeadlines === 0) {
+    console.warn('[Summary API] No headlines fetched from any RSS feed');
+  }
 
+  if (sections.trim().length > 0) {
+    try {
+      const raw = await groqChat([
+        { role: 'system', content: 'You are a precise intelligence analyst. Respond with valid JSON only.' },
+        { role: 'user', content: prompt },
+      ], { maxTokens: 2000, temperature: 0.2 });
+
+      // Strip markdown code fences if present
+      const cleaned = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+
+      // Parse the JSON response
+      const parsed: { categoryId: string; summary: string }[] = JSON.parse(cleaned);
+
+      summaries = CATEGORIES.map(cat => {
+        const found = parsed.find(p => p.categoryId === cat.id);
+        const headlines = headlineMap[cat.id] || [];
+        return {
+          category: cat.name,
+          categoryId: cat.id,
+          icon: cat.icon,
+          gradient: cat.gradient,
+          summary: found?.summary ?? `Latest in ${cat.name}: ${headlines.slice(0, 2).join(' | ') || 'No updates available.'}`,
+          headlines: headlines.slice(0, 8),
+          generatedAt: new Date().toISOString(),
+        };
+      });
+      aiSuccess = true;
+    } catch (err) {
+      console.error('[Summary API] Groq error:', err);
+    }
+  }
+
+  // Fallback: if AI failed, generate simple summaries from headlines
+  if (!aiSuccess) {
     summaries = CATEGORIES.map(cat => {
-      const found = parsed.find(p => p.categoryId === cat.id);
+      const headlines = headlineMap[cat.id] || [];
       return {
         category: cat.name,
         categoryId: cat.id,
         icon: cat.icon,
         gradient: cat.gradient,
-        summary: found?.summary ?? 'Summary unavailable — check back shortly.',
-        headlines: (headlineMap[cat.id] || []).slice(0, 3),
+        summary: headlines.length > 0
+          ? `Top stories: ${headlines.slice(0, 3).join(' | ')}`
+          : 'No headlines available for this category.',
+        headlines: headlines.slice(0, 8),
         generatedAt: new Date().toISOString(),
       };
     });
-  } catch (err) {
-    console.error('[Summary API] Groq error:', err);
-    // Fallback: show top headlines as summary
-    summaries = CATEGORIES.map(cat => ({
-      category: cat.name,
-      categoryId: cat.id,
-      icon: cat.icon,
-      gradient: cat.gradient,
-      summary: 'AI summary temporarily unavailable. Showing latest headlines below.',
-      headlines: (headlineMap[cat.id] || []).slice(0, 3),
-      generatedAt: new Date().toISOString(),
-    }));
   }
 
   const result: SummaryResponse = {

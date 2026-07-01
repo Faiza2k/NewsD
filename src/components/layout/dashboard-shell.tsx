@@ -53,13 +53,16 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
   }, [router]);
 
   return (
-    <div className="flex min-h-screen" style={{ background: 'var(--bg-base)' }}>
+    <div className="flex min-h-screen overflow-x-hidden" style={{ background: 'var(--bg-canvas)' }}>
       <Sidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(prev => !prev)} />
 
-      {/* Main content — offset matches sidebar width */}
+      {/* Main content — width accounts for sidebar */}
       <div
-        className="flex-1 flex flex-col min-h-screen transition-[margin] duration-200"
-        style={{ marginLeft: sidebarCollapsed ? 'var(--sidebar-collapsed-width)' : 'var(--sidebar-width)' }}
+        className="flex flex-col min-h-screen transition-[width] duration-200"
+        style={{
+          width: sidebarCollapsed ? 'calc(100vw - var(--sidebar-collapsed-width))' : 'calc(100vw - var(--sidebar-width))',
+          marginLeft: sidebarCollapsed ? 'var(--sidebar-collapsed-width)' : 'var(--sidebar-width)',
+        }}
       >
         <TopBar onSearchClick={() => setCommandPaletteOpen(true)} />
 

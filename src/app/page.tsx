@@ -59,23 +59,23 @@ export default function DashboardPage() {
   const highPriority = globalData?.items?.filter(item => item.significance >= 8).length || 0;
 
   return (
-    <div className="-mt-5 -mx-5 pb-16 overflow-x-hidden">
+    <div className="-mt-2 pb-12 w-full">
       {/* 1. TOP TICKER BAR */}
       <TickerBar />
 
-      <div className="px-8 pt-8 max-w-[1800px] mx-auto">
+      <div className="w-full px-5 pt-6 max-w-[1400px] mx-auto">
         {/* 2. PAGE HEADER */}
-        <div className="mb-8">
-          <h1 className="text-[28px] font-bold leading-tight mb-1" style={{ color: 'var(--text-primary)' }}>
+        <div className="mb-5">
+          <h1 className="text-[24px] font-bold leading-tight mb-0.5" style={{ color: 'var(--text-primary)' }}>
             Intelligence Overview
           </h1>
-          <p className="text-[14px]" style={{ color: 'var(--text-muted)' }}>
+          <p className="text-[13px]" style={{ color: 'var(--text-muted)' }}>
             Real-time monitoring · Markets · AI · Technology
           </p>
         </div>
 
         {/* 4 KPI STAT BOXES */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-[32px]">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
           <KpiBox label="NEWS ITEMS" value={totalNews} />
           <KpiBox label="CRYPTO ASSETS" value={totalCrypto} />
           <KpiBox label="GITHUB REPOS" value={totalGithub} />
@@ -83,20 +83,20 @@ export default function DashboardPage() {
         </div>
 
         {/* 3. AI BRIEF SECTION */}
-        <div className="mb-[32px]">
+        <div className="mb-6">
           <AISummaryPanel />
         </div>
 
         {/* 4. CORE MARKETS SECTION */}
-        <div className="mb-[32px]">
+        <div className="mb-6">
           <SectionHeader
             title="Core Markets"
             subtitle="Latest intelligence across Artificial Intelligence and Crypto Markets"
           />
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 2xl:grid-cols-3 gap-4">
             {/* AI Intelligence news cards (2 columns inside) */}
-            <div className="lg:col-span-2">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="2xl:col-span-2">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {aiData?.items?.slice(0, 6).map((item) => (
                   <NewsCard key={item.id} item={item} />
                 ))}
@@ -105,7 +105,7 @@ export default function DashboardPage() {
 
             {/* Crypto Assets Sidebar */}
             <div className="card-terminal flex flex-col overflow-hidden">
-              <div className="p-4 border-b" style={{ borderColor: 'var(--border-default)' }}>
+              <div className="p-3 border-b" style={{ borderColor: 'var(--border-default)' }}>
                 <span className="label-mono">Live Crypto Feed</span>
               </div>
               <div className="flex-1 overflow-y-auto no-scrollbar">
@@ -118,14 +118,14 @@ export default function DashboardPage() {
         </div>
 
         {/* 5. TECHNOLOGY & OPEN SOURCE SECTION */}
-        <div className="mb-[32px]">
+        <div className="mb-6">
           <SectionHeader
             title="Technology & Open Source"
             subtitle="Trending repositories on GitHub and top stories from Hacker News"
           />
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 2xl:grid-cols-2 gap-4">
             {/* GitHub Trending */}
-            <div className="space-y-4">
+            <div className="space-y-3">
               {githubData?.repos?.slice(0, 6).map((repo) => (
                 <GithubCard key={repo.id} repo={repo} />
               ))}
@@ -133,7 +133,7 @@ export default function DashboardPage() {
 
             {/* Hacker News */}
             <div className="card-terminal overflow-hidden flex flex-col">
-              <div className="p-4 border-b" style={{ borderColor: 'var(--border-default)' }}>
+              <div className="p-3 border-b" style={{ borderColor: 'var(--border-default)' }}>
                 <span className="label-mono">Hacker News Top Stories</span>
               </div>
               <div className="flex-1">
@@ -143,20 +143,20 @@ export default function DashboardPage() {
                     href={story.url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="flex items-start gap-4 p-4 border-b transition-colors hover:bg-[var(--bg-hover)]"
+                    className="flex items-start gap-3 p-3 border-b transition-colors hover:bg-[var(--bg-hover)]"
                     style={{
                       borderColor: 'var(--border-default)',
                       borderBottomWidth: i === 7 ? 0 : 1,
                     }}
                   >
                     <span
-                      className="stat-number text-[18px] font-bold mt-0.5 w-10 text-right flex-shrink-0"
+                      className="stat-number text-[16px] font-bold mt-0.5 w-8 text-right flex-shrink-0"
                       style={{ color: 'var(--accent-cyan)' }}
                     >
                       {story.score}
                     </span>
                     <div className="min-w-0 flex-1">
-                      <p className="text-[14px] font-medium leading-snug mb-1" style={{ color: 'var(--text-primary)' }}>
+                      <p className="text-[13px] font-medium leading-snug mb-0.5" style={{ color: 'var(--text-primary)' }}>
                         {story.title}
                       </p>
                       <p className="label-mono lowercase" style={{ color: 'var(--text-muted)' }}>
