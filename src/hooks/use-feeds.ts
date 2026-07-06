@@ -3,12 +3,13 @@
 import { useQuery } from '@tanstack/react-query';
 import type { NewsItem, CryptoAsset, GithubRepo, ResearchPaper, HackerNewsStory, Category, FeedResponse } from '@/types';
 
-export function useFeeds(category?: Category, limit = 30) {
+export function useFeeds(category?: Category, limit = 30, module?: string) {
   return useQuery<FeedResponse>({
-    queryKey: ['feeds', category, limit],
+    queryKey: ['feeds', category, module, limit],
     queryFn: async () => {
       const params = new URLSearchParams();
-      if (category) params.set('category', category);
+      if (module) params.set('module', module);
+      else if (category) params.set('category', category);
       params.set('limit', String(limit));
       params.set('t', Date.now().toString());
       const res = await fetch(`/api/feeds?${params}`);

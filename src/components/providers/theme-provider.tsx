@@ -23,15 +23,14 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     const stored = localStorage.getItem('theme') as Theme | null;
     if (stored === 'light' || stored === 'dark') {
       setThemeState(stored);
+      document.documentElement.setAttribute('data-theme', stored);
     }
   }, []);
 
   const setTheme = (newTheme: Theme) => {
     setThemeState(newTheme);
     localStorage.setItem('theme', newTheme);
-    const root = window.document.documentElement;
-    root.classList.remove('light', 'dark');
-    root.classList.add(newTheme);
+    document.documentElement.setAttribute('data-theme', newTheme);
   };
 
   return (

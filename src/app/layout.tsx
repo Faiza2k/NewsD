@@ -1,24 +1,13 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { QueryProvider } from "@/components/providers/query-provider";
 import { ThemeProvider } from "@/components/providers/theme-provider";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
 export const metadata: Metadata = {
-  title: "NewsDash — AI & Crypto Intelligence Terminal",
-  description: "Real-time intelligence hub for AI, Crypto, Trading, Technology, Research & Innovation. Monitor 35+ trusted sources in one premium dashboard.",
-  keywords: ["AI news", "crypto dashboard", "trading intelligence", "tech news", "research papers", "GitHub trending"],
+  title: "AI News Intelligence & Decision Dashboard",
+  description:
+    "Premium professional-grade real-time global news aggregation, AI-generated summaries, impact analysis, sentiment analytics and decision-support hub.",
 };
 
 export default function RootLayout({
@@ -27,31 +16,23 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html suppressHydrationWarning
-      lang="en"
-      className={`dark ${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-      data-scroll-behavior="smooth"
-    >
+    <html lang="en" data-theme="dark" suppressHydrationWarning>
       <head>
         <script
           dangerouslySetInnerHTML={{
             __html: `
               try {
-                if (localStorage.getItem('theme') === 'light') {
-                  document.documentElement.classList.remove('dark');
-                  document.documentElement.classList.add('light');
-                }
+                const t = localStorage.getItem('theme');
+                if (t) document.documentElement.setAttribute('data-theme', t);
               } catch (_) {}
             `,
           }}
         />
       </head>
-      <body className="min-h-full flex flex-col">
+      <body>
         <ThemeProvider>
           <QueryProvider>
-            <DashboardShell>
-              {children}
-            </DashboardShell>
+            <DashboardShell>{children}</DashboardShell>
           </QueryProvider>
         </ThemeProvider>
       </body>

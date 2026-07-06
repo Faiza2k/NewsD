@@ -41,6 +41,27 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
       action: () => { router.push(`/${cat.id}`); onClose(); },
     })),
     {
+      id: 'cloud-devops',
+      label: 'Go to Cloud & DevOps',
+      icon: '☁️',
+      category: 'Navigation',
+      action: () => { router.push('/cloud-devops'); onClose(); },
+    },
+    {
+      id: 'forex',
+      label: 'Go to Forex Market',
+      icon: '💱',
+      category: 'Navigation',
+      action: () => { router.push('/forex'); onClose(); },
+    },
+    {
+      id: 'gold',
+      label: 'Go to Gold & Metals',
+      icon: '🥇',
+      category: 'Navigation',
+      action: () => { router.push('/gold'); onClose(); },
+    },
+    {
       id: 'refresh',
       label: 'Refresh all feeds',
       icon: '🔄',

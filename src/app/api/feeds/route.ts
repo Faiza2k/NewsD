@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 export const dynamic = 'force-dynamic';
 import { getCached, setCache } from '@/lib/feeds/cache';
 import { FEED_SOURCES } from '@/lib/feeds/registry';
+import { getFeedsForModule, isIntelligenceModule } from '@/lib/feeds/module-feeds';
 import { scoreSignificance, deduplicateByUrl, deduplicateByTitle } from '@/lib/utils/relevance-scorer';
 import type { NewsItem, Category } from '@/types';
 import Parser from 'rss-parser';
@@ -91,10 +92,11 @@ async function fetchFeedsBatch(sources: typeof FEED_SOURCES): Promise<NewsItem[]
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const category = searchParams.get('category') as Category | null;
+  const moduleId = searchParams.get('module');
   const limit = Math.min(parseInt(searchParams.get('limit') || '30'), 100);
   const offset = parseInt(searchParams.get('offset') || '0');
 
-  const cacheKey = `feeds_v5:${category || 'all'}`;
+  const cacheKey = `feeds_v5:${moduleId || category || 'all'}`;
   const cached = getCached<NewsItem[]>(cacheKey);
 
   if (cached) {
@@ -107,10 +109,13 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  // Filter sources by category if specified
-  const sources = category
-    ? FEED_SOURCES.filter(s => s.category === category)
-    : FEED_SOURCES;
+  // Filter sources by module or category
+  let sources = FEED_SOURCES;
+  if (moduleId && isIntelligenceModule(moduleId)) {
+    sources = getFeedsForModule(moduleId);
+  } else if (category) {
+    sources = FEED_SOURCES.filter((s) => s.category === category);
+  }
 
   const allItems = await fetchFeedsBatch(sources);
 

@@ -4,106 +4,137 @@ import { useState } from 'react';
 import { useGithubTrending, useFeeds } from '@/hooks/use-feeds';
 import { GithubCard } from '@/components/cards/github-card';
 import { NewsCard } from '@/components/cards/news-card';
-import { SkeletonGithubCard, SkeletonCard } from '@/components/ui/skeleton-card';
-import { getCategoryInfo } from '@/lib/feeds/registry';
+import { MODULE_CONFIGS } from '@/lib/module-configs';
+import { useBriefing } from '@/components/providers/briefing-provider';
 
-const TABS = ['All', 'Python', 'TypeScript', 'Rust', 'Go'];
+const LANG_TABS = ['All', 'Python', 'TypeScript', 'Rust', 'Go'];
 
 export default function GithubPage() {
   const [activeTab, setActiveTab] = useState('All');
+  const config = MODULE_CONFIGS.github;
   const { data, isLoading } = useGithubTrending();
   const { data: newsData, isLoading: newsLoading } = useFeeds('github', 30);
-  const info = getCategoryInfo('github');
 
-  const filteredItems = data?.repos?.filter(repo => {
-    if (activeTab === 'All') return true;
-    return repo.language === activeTab;
-  }) || [];
+  const filteredRepos =
+    data?.repos?.filter((repo) => activeTab === 'All' || repo.language === activeTab) ?? [];
+  const newsItems = newsData?.items ?? [];
 
-  const newsItems = newsData?.items || [];
+  const { openBriefing } = useBriefing();
 
   return (
-    <div className="max-w-6xl mx-auto">
-      <div className="mb-8">
-        <div className="flex items-center gap-3 mb-2">
-          <div className="w-10 h-10 rounded-xl flex items-center justify-center text-xl text-white"
-               style={{ background: info?.gradient }}>
-            {info?.icon}
+    <>
+      <div className="module-header animate-fade-in">
+        <div className="module-header-top">
+          <div className="module-title-group">
+            <div className={`module-icon ${config.iconClass}`}>{config.icon}</div>
+            <div className="module-title">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <h2>{config.title}</h2>
+                <span
+                  className="live-indicator"
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    fontSize: '0.72rem',
+                    color: 'var(--accent-emerald)',
+                    background: 'rgba(16, 185, 129, 0.08)',
+                    padding: '4px 8px',
+                    borderRadius: 'var(--radius-sm)',
+                    border: '1px solid rgba(16, 185, 129, 0.2)',
+                    fontWeight: 600,
+                  }}
+                >
+                  <span
+                    className="live-dot"
+                    style={{
+                      width: 6,
+                      height: 6,
+                      backgroundColor: 'var(--accent-emerald)',
+                      borderRadius: '50%',
+                      boxShadow: '0 0 8px var(--accent-emerald)',
+                    }}
+                  />
+                  Live · auto-refreshing
+                </span>
+              </div>
+              <p>{config.subtitle}</p>
+            </div>
           </div>
-          <h1 className="text-[28px] font-bold" style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-display)' }}>
-            {info?.name} Intelligence
-          </h1>
+          <div className="module-actions">
+            <button type="button" className="btn btn-primary" onClick={openBriefing}>
+              Daily Briefing
+            </button>
+          </div>
         </div>
-        <p className="text-[14px]" style={{ color: 'var(--text-secondary)' }}>
-          {info?.description}
-        </p>
       </div>
 
-      {/* ── Trending New Repositories ── */}
-      <div className="mb-4">
-        <h2 className="text-[18px] font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>
-          Trending New Repositories
-        </h2>
-        <p className="text-[13px] mb-4" style={{ color: 'var(--text-muted)' }}>
-          Fast-rising AI/ML projects created in the last 90 days
-        </p>
-      </div>
+      <div className="content-grid">
+        <div className="content-main">
+          <div className="panel" style={{ marginBottom: 14 }}>
+            <div className="panel-header">
+              <div>
+                <h3>Trending New Repositories</h3>
+                <span className="hot-trends-subtitle">Fast-rising AI/ML projects created in the last 90 days</span>
+              </div>
+            </div>
+            <div className="panel-body">
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 14 }}>
+                {LANG_TABS.map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    className={`cat-tab${activeTab === tab ? ' active' : ''}`}
+                    onClick={() => setActiveTab(tab)}
+                  >
+                    {tab}
+                  </button>
+                ))}
+              </div>
+              {isLoading ? (
+                <p style={{ fontSize: '0.82rem', color: 'var(--text-tertiary)' }}>Loading trending repositories…</p>
+              ) : filteredRepos.length === 0 ? (
+                <div className="empty-state">
+                  <div className="empty-icon">📭</div>
+                  <h3>No repositories found</h3>
+                  <p>Try a different language filter.</p>
+                </div>
+              ) : (
+                <div className="news-grid">
+                  {filteredRepos.map((repo) => (
+                    <GithubCard key={repo.id} repo={repo} />
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
 
-      <div className="flex items-center gap-2 mb-6 overflow-x-auto no-scrollbar pb-2">
-        {TABS.map(tab => (
-          <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            className="px-4 py-1.5 rounded-full text-[13px] font-semibold transition-colors flex-shrink-0"
-            style={{
-              background: activeTab === tab ? 'var(--text-primary)' : 'var(--bg-tertiary)',
-              color: activeTab === tab ? 'var(--bg-primary)' : 'var(--text-secondary)',
-            }}
-          >
-            {tab}
-          </button>
-        ))}
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-        {isLoading
-          ? Array.from({ length: 9 }).map((_, i) => <SkeletonGithubCard key={i} />)
-          : filteredItems.map((repo, i) => (
-            <GithubCard key={repo.id} repo={repo} index={i} />
-          ))
-        }
-      </div>
-
-      {!isLoading && filteredItems.length === 0 && (
-        <div className="py-12 text-center">
-          <p style={{ color: 'var(--text-tertiary)' }}>No recent repositories found for this filter.</p>
+          <div className="panel">
+            <div className="panel-header">
+              <div>
+                <h3>Latest from the Community</h3>
+                <span className="hot-trends-subtitle">GitHub Blog, Hacker News, DEV, Reddit & more</span>
+              </div>
+            </div>
+            <div className="panel-body">
+              {newsLoading ? (
+                <p style={{ fontSize: '0.82rem', color: 'var(--text-tertiary)' }}>Syncing community feeds…</p>
+              ) : newsItems.length === 0 ? (
+                <div className="empty-state">
+                  <div className="empty-icon">📭</div>
+                  <h3>No community news found</h3>
+                </div>
+              ) : (
+                <div className="news-grid">
+                  {newsItems.map((item) => (
+                    <NewsCard key={item.id} item={item} />
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
-      )}
-
-      {/* ── Latest from the Community ── */}
-      <div className="mt-12 mb-4">
-        <h2 className="text-[18px] font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>
-          Latest from the Community
-        </h2>
-        <p className="text-[13px] mb-4" style={{ color: 'var(--text-muted)' }}>
-          Fresh posts from GitHub Blog, Hacker News, DEV, Reddit & more
-        </p>
       </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-        {newsLoading
-          ? Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)
-          : newsItems.map((item, i) => (
-            <NewsCard key={item.id} item={item} index={i} />
-          ))
-        }
-      </div>
-
-      {!newsLoading && newsItems.length === 0 && (
-        <div className="py-12 text-center">
-          <p style={{ color: 'var(--text-tertiary)' }}>No recent community news found.</p>
-        </div>
-      )}
-    </div>
+    </>
   );
 }

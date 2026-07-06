@@ -1,48 +1,50 @@
 'use client';
 
 import { GithubRepo } from '@/types';
-import { Star, GitFork } from 'lucide-react';
 
-export function GithubCard({ repo, index }: { repo: GithubRepo; index?: number }) {
+export function GithubCard({ repo }: { repo: GithubRepo }) {
   return (
-    <a
-      href={repo.html_url}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="card-terminal flex flex-col justify-between p-4 block h-[130px]"
+    <div
+      className="news-card animate-fade-in"
+      onClick={() => window.open(repo.html_url, '_blank', 'noopener,noreferrer')}
+      onKeyDown={(e) => e.key === 'Enter' && window.open(repo.html_url, '_blank', 'noopener,noreferrer')}
+      tabIndex={0}
+      role="button"
+      style={{ display: 'flex', flexDirection: 'column' }}
     >
-      <div className="flex items-start gap-3">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={repo.owner.avatar_url} alt="" className="w-8 h-8 rounded-sm" />
-        <div className="flex-1 min-w-0">
-          <h3 className="text-[15px] font-semibold text-[var(--text-primary)] truncate">
-            {repo.owner.login} / {repo.name}
-          </h3>
-          <p className="text-[13px] text-[var(--text-body)] mt-1 line-clamp-2 leading-snug">
-            {repo.description}
-          </p>
-        </div>
+      <div className="news-card-top">
+        <span className="source" style={{ color: 'var(--accent-cyan)', fontSize: '0.7rem' }}>
+          {repo.language || 'Open Source'}
+        </span>
+        <span className="text-muted" style={{ fontSize: '0.7rem' }}>
+          ★ {repo.stargazers_count?.toLocaleString()} · ⑂ {repo.forks_count?.toLocaleString()}
+        </span>
       </div>
-
-      <div className="flex items-center justify-between mt-3">
-        <div className="flex items-center gap-2">
-          {repo.language && (
-            <span className="tag-terminal">
-              {repo.language}
-            </span>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', marginTop: 8 }}>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={repo.owner.avatar_url}
+          alt=""
+          style={{ width: 32, height: 32, borderRadius: 'var(--radius-sm)', flexShrink: 0 }}
+        />
+        <div style={{ minWidth: 0 }}>
+          <h4 style={{ margin: 0 }}>
+            {repo.owner.login}/{repo.name}
+          </h4>
+          {repo.description && (
+            <p className="news-card-summary" style={{ marginTop: 4 }}>
+              {repo.description}
+            </p>
           )}
         </div>
-        <div className="flex items-center gap-3 label-mono">
-          <span className="flex items-center gap-1">
-            <Star className="w-3 h-3 text-[var(--text-muted)]" />
-            {repo.stargazers_count?.toLocaleString()}
-          </span>
-          <span className="flex items-center gap-1">
-            <GitFork className="w-3 h-3 text-[var(--text-muted)]" />
-            {repo.forks_count?.toLocaleString()}
-          </span>
-        </div>
       </div>
-    </a>
+      {repo.topics && repo.topics.length > 0 && (
+        <div className="featured-tags" style={{ marginTop: 'auto', paddingTop: 10 }}>
+          {repo.topics.slice(0, 3).map((t) => (
+            <span key={t} className="tag">#{t}</span>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }

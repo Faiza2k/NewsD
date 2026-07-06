@@ -1,4 +1,21 @@
 import type { CategoryInfo, FeedSource, Category } from '@/types';
+import { NEWSDASHBOARD_FEEDS } from './newsdashboard-feeds';
+
+function mergeFeedSources(...lists: FeedSource[][]): FeedSource[] {
+  const seenUrls = new Set<string>();
+  const seenIds = new Set<string>();
+  const merged: FeedSource[] = [];
+  for (const list of lists) {
+    for (const feed of list) {
+      const urlKey = feed.url.replace(/\/$/, '').toLowerCase();
+      if (seenUrls.has(urlKey) || seenIds.has(feed.id)) continue;
+      seenUrls.add(urlKey);
+      seenIds.add(feed.id);
+      merged.push(feed);
+    }
+  }
+  return merged;
+}
 
 export const CATEGORIES: CategoryInfo[] = [
   {
@@ -67,7 +84,7 @@ export const CATEGORIES: CategoryInfo[] = [
   },
 ];
 
-export const FEED_SOURCES: FeedSource[] = [
+const BASE_FEED_SOURCES: FeedSource[] = [
   // ─── AI (18 sources) ───
   { id: 'openai-blog', name: 'OpenAI Blog', url: 'https://openai.com/blog/rss.xml', category: 'ai', subcategories: ['models', 'research'], priority: 5 },
   { id: 'anthropic-blog', name: 'Anthropic Blog', url: 'https://www.anthropic.com/rss.xml', category: 'ai', subcategories: ['models', 'safety'], priority: 5 },
@@ -218,6 +235,11 @@ export const FEED_SOURCES: FeedSource[] = [
   { id: 'reddit-geopolitics', name: 'Reddit r/geopolitics', url: 'https://www.reddit.com/r/geopolitics/.rss', category: 'global', subcategories: ['geopolitics', 'policy'], priority: 3 },
   { id: 'reddit-news', name: 'Reddit r/news', url: 'https://www.reddit.com/r/news/.rss', category: 'global', subcategories: ['world', 'news'], priority: 3 },
 ];
+
+/** All RSS sources: base registry + NewsDashboard app.py feeds (URL-deduped). */
+export const FEED_SOURCES: FeedSource[] = mergeFeedSources(BASE_FEED_SOURCES, NEWSDASHBOARD_FEEDS);
+
+export const FEED_SOURCE_COUNT = FEED_SOURCES.length;
 
 export function getFeedsByCategory(category: Category): FeedSource[] {
   return FEED_SOURCES

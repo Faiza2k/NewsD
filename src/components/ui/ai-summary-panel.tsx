@@ -3,6 +3,7 @@
 import { useSummary } from '@/hooks/use-summary';
 import { RefreshCw, Sparkles } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
+import { FEED_SOURCE_COUNT } from '@/lib/feeds/registry';
 import type { CategorySummary } from '@/hooks/use-summary';
 
 const CAT_ACCENT: Record<string, string> = {
@@ -129,7 +130,7 @@ export function AISummaryPanel() {
               <RefreshCw className="w-4 h-4 animate-spin" style={{ color: 'var(--accent-cyan)' }} />
             </div>
             <p className="label-mono" style={{ color: 'var(--text-muted)' }}>
-              Compiling intelligence from 35+ sources...
+              Compiling intelligence from {FEED_SOURCE_COUNT} sources...
             </p>
           </div>
         ) : data?.summaries ? (

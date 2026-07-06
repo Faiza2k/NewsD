@@ -2,108 +2,110 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
-import { Sidebar } from './sidebar';
-import { TopBar } from './top-bar';
+import { NewsIntelSidebar } from './newsintel-sidebar';
+import { NewsIntelHeader } from './newsintel-header';
+import { NewsIntelTicker } from '@/components/ui/newsintel-ticker';
 import { CommandPalette } from './command-palette';
+import { AIAssistantPanel } from '@/components/ui/ai-assistant-panel';
+import { BriefingProvider, useBriefing } from '@/components/providers/briefing-provider';
 import { CATEGORIES } from '@/lib/feeds/registry';
 
-export function DashboardShell({ children }: { children: React.ReactNode }) {
+function DashboardShellInner({ children }: { children: React.ReactNode }) {
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const { openBriefing } = useBriefing();
   const router = useRouter();
+  const pathname = usePathname();
 
-  // Global keyboard shortcuts
+  useEffect(() => {
+    setMobileNavOpen(false);
+  }, [pathname]);
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // Skip if typing in an input
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      const inInput = tag === 'INPUT' || tag === 'TEXTAREA';
 
-      // Cmd/Ctrl + K → command palette
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
         e.preventDefault();
-        setCommandPaletteOpen(prev => !prev);
+        setCommandPaletteOpen((prev) => !prev);
         return;
       }
 
-      // Sidebar collapse toggle
-      if (e.key === '[' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (inInput) return;
+
+      if (e.key.toLowerCase() === 'd') {
         e.preventDefault();
-        setSidebarCollapsed(prev => !prev);
+        openBriefing();
         return;
       }
 
-      // Number keys 1-8 → navigate to category
+      if (e.key.toLowerCase() === 'a') {
+        e.preventDefault();
+        setAssistantOpen(true);
+        return;
+      }
+
       if (!e.metaKey && !e.ctrlKey && !e.altKey) {
-        const num = parseInt(e.key);
+        const num = parseInt(e.key, 10);
         if (num >= 1 && num <= 8 && CATEGORIES[num - 1]) {
           e.preventDefault();
           router.push(`/${CATEGORIES[num - 1].id}`);
-          return;
-        }
-        if (e.key === '0') {
-          e.preventDefault();
-          router.push('/');
-          return;
         }
       }
     };
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [router]);
+  }, [router, openBriefing]);
+
+  const toggleMobileNav = () => {
+    const sidebar = document.querySelector('.sidebar');
+    const overlay = document.getElementById('mobile-sidebar-overlay');
+    const next = !mobileNavOpen;
+    setMobileNavOpen(next);
+    sidebar?.classList.toggle('mobile-open', next);
+    overlay?.classList.toggle('visible', next);
+  };
+
+  const closeMobileNav = () => {
+    setMobileNavOpen(false);
+    document.querySelector('.sidebar')?.classList.remove('mobile-open');
+    document.getElementById('mobile-sidebar-overlay')?.classList.remove('visible');
+  };
 
   return (
-    <div className="flex min-h-screen overflow-x-hidden" style={{ background: 'var(--bg-canvas)' }}>
-      <Sidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(prev => !prev)} />
-
-      {/* Main content — width accounts for sidebar */}
+    <div className="app-layout">
       <div
-        className="flex flex-col min-h-screen transition-[width] duration-200"
-        style={{
-          width: sidebarCollapsed ? 'calc(100vw - var(--sidebar-collapsed-width))' : 'calc(100vw - var(--sidebar-width))',
-          marginLeft: sidebarCollapsed ? 'var(--sidebar-collapsed-width)' : 'var(--sidebar-width)',
-        }}
-      >
-        <TopBar onSearchClick={() => setCommandPaletteOpen(true)} />
-
-        <main className="flex-1 p-5 overflow-y-auto overflow-x-hidden">
-          {children}
-        </main>
-
-        {/* Status bar — enterprise-style bottom strip */}
-        <footer
-          className="flex items-center justify-between flex-shrink-0 px-4"
-          style={{
-            height:      'var(--statusbar-height)',
-            borderTop:   '1px solid var(--border-subtle)',
-            background:  'var(--bg-secondary)',
-            color:       'var(--text-tertiary)',
-            fontSize:    '10.5px',
-          }}
-        >
-          <div className="flex items-center gap-3">
-            <span className="font-semibold" style={{ color: 'var(--text-tertiary)' }}>
-              NewsDash v1.0
-            </span>
-            <span style={{ color: 'var(--border-strong)' }}>|</span>
-            <span>35+ Sources</span>
-            <span style={{ color: 'var(--border-strong)' }}>|</span>
-            <span>8 Categories</span>
-          </div>
-          <div className="flex items-center gap-3 font-mono">
-            <span>⌘K  Search</span>
-            <span style={{ color: 'var(--border-strong)' }}>|</span>
-            <span>1–8  Navigate</span>
-            <span style={{ color: 'var(--border-strong)' }}>|</span>
-            <span>[  Sidebar</span>
-          </div>
-        </footer>
-      </div>
-
-      <CommandPalette
-        open={commandPaletteOpen}
-        onClose={() => setCommandPaletteOpen(false)}
+        id="mobile-sidebar-overlay"
+        className="mobile-sidebar-overlay"
+        onClick={closeMobileNav}
+        role="presentation"
       />
+      <NewsIntelSidebar />
+
+      <main className="main-wrapper">
+        <NewsIntelHeader
+          onSearchFocus={() => setCommandPaletteOpen(true)}
+          onAssistantOpen={() => setAssistantOpen(true)}
+          onBriefingOpen={openBriefing}
+          onMobileMenuToggle={toggleMobileNav}
+        />
+        <NewsIntelTicker />
+        <section className="content-area">{children}</section>
+      </main>
+
+      <AIAssistantPanel open={assistantOpen} onClose={() => setAssistantOpen(false)} />
+      <CommandPalette open={commandPaletteOpen} onClose={() => setCommandPaletteOpen(false)} />
     </div>
+  );
+}
+
+export function DashboardShell({ children }: { children: React.ReactNode }) {
+  return (
+    <BriefingProvider>
+      <DashboardShellInner>{children}</DashboardShellInner>
+    </BriefingProvider>
   );
 }
