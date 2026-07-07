@@ -16,7 +16,7 @@ const parser = new Parser({
 const CACHE_TTL = 5 * 60 * 1000;
 const BATCH_SIZE = 5;
 const MAX_ITEMS_PER_FEED = 8;
-const ALL_FEEDS_CACHE_KEY = 'feeds_v6:home';
+const ALL_FEEDS_CACHE_KEY = 'feeds_v5:all';
 
 interface RSSItem {
   title?: string;
@@ -111,7 +111,7 @@ export async function getAllFeedItems(force = false): Promise<NewsItem[]> {
 
   for (const cat of ['ai', 'crypto', 'trading', 'github', 'tech', 'research', 'startups', 'global'] as Category[]) {
     const catItems = processed.filter((i) => i.category === cat);
-    setCache(`feeds_v6:${cat}`, catItems, CACHE_TTL);
+    setCache(`feeds_v5:${cat}`, catItems, CACHE_TTL);
   }
 
   return processed;

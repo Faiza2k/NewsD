@@ -41,6 +41,13 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
       action: () => { router.push(`/${cat.id}`); onClose(); },
     })),
     {
+      id: 'cybersecurity',
+      label: 'Go to Cybersecurity',
+      icon: '🛡️',
+      category: 'Navigation',
+      action: () => { router.push('/cybersecurity'); onClose(); },
+    },
+    {
       id: 'cloud-devops',
       label: 'Go to Cloud & DevOps',
       icon: '☁️',

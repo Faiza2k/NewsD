@@ -1,6 +1,7 @@
 'use client';
 
 import type { NewsItem } from '@/types';
+import { useRouter } from 'next/navigation';
 
 interface Trend {
   topic: string;
@@ -31,6 +32,13 @@ function buildTrends(items: NewsItem[]): Trend[] {
 export function HotTrendsPanel({ items }: { items: NewsItem[] }) {
   const trends = buildTrends(items);
   const maxMentions = trends.length > 0 ? Math.max(...trends.map((t) => t.mentions)) : 1;
+  const router = useRouter();
+
+  const openCategory = (category: string) => {
+    // Categories are route segments in this app (tech/ai/crypto/.../global)
+    if (!category) return;
+    router.push(`/${category}`);
+  };
 
   return (
     <div className="panel hot-trends-panel">
@@ -60,6 +68,10 @@ export function HotTrendsPanel({ items }: { items: NewsItem[] }) {
                   title={`${t.mentions} stories in the last 24h`}
                   tabIndex={0}
                   role="button"
+                  onClick={() => openCategory(t.category)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') openCategory(t.category);
+                  }}
                 >
                   <span className="hot-trend-rank">{rank.toString().padStart(2, '0')}</span>
                   <div className="hot-trend-body">

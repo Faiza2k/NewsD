@@ -1,7 +1,7 @@
 import type { FeedSource } from '@/types';
 import { FEED_SOURCES } from './registry';
 
-export type IntelligenceModule = 'clouddevops' | 'forex' | 'gold';
+export type IntelligenceModule = 'clouddevops' | 'forex' | 'gold' | 'cybersecurity';
 
 const CLOUD_DEVOPS_IDS = new Set([
   'aws-news',
@@ -67,6 +67,20 @@ const GOLD_IDS = new Set([
   'investing-commodities',
 ]);
 
+const CYBERSECURITY_IDS = new Set([
+  'krebs',
+  'darkreading',
+  'bleepingcomputer',
+  'therecord',
+  'hackernews-security',
+  'thehackernews',
+  'schneier',
+  'threatpost',
+  'zdnet-security',
+  'securityweek',
+  'reddit-netsec',
+]);
+
 function matchesSubcategory(feed: FeedSource, pattern: RegExp): boolean {
   return feed.subcategories.some((s) => pattern.test(s));
 }
@@ -99,11 +113,22 @@ export function getFeedsForModule(moduleId: IntelligenceModule): FeedSource[] {
           ) ||
           /kitco|gold|silver|bullion|metals/i.test(f.id)
       );
+    case 'cybersecurity':
+      return FEED_SOURCES.filter(
+        (f) =>
+          CYBERSECURITY_IDS.has(f.id) ||
+          // Most security feeds in the expanded registry use these subcategory keywords
+          matchesSubcategory(
+            f,
+            /security|cyber|vuln|vulnerability|breach|ransomware|malware|threat|incident|exploit|cve/
+          ) ||
+          /security|cyber|infosec|netsec|cve|ransom|malware/i.test(f.id)
+      );
     default:
       return [];
   }
 }
 
 export function isIntelligenceModule(value: string): value is IntelligenceModule {
-  return value === 'clouddevops' || value === 'forex' || value === 'gold';
+  return value === 'clouddevops' || value === 'forex' || value === 'gold' || value === 'cybersecurity';
 }

@@ -96,7 +96,7 @@ export async function GET(request: NextRequest) {
   const limit = Math.min(parseInt(searchParams.get('limit') || '30'), 100);
   const offset = parseInt(searchParams.get('offset') || '0');
 
-  const cacheKey = `feeds_v6:${moduleId || category || 'home'}`;
+  const cacheKey = `feeds_v5:${moduleId || category || 'all'}`;
   const cached = getCached<NewsItem[]>(cacheKey);
 
   if (cached) {
@@ -115,9 +115,6 @@ export async function GET(request: NextRequest) {
     sources = getFeedsForModule(moduleId);
   } else if (category) {
     sources = FEED_SOURCES.filter((s) => s.category === category);
-  } else {
-    // Home/overview: high-priority feeds only (fast first paint on fresh clone)
-    sources = FEED_SOURCES.filter((s) => s.priority >= 4).slice(0, 50);
   }
 
   const allItems = await fetchFeedsBatch(sources);

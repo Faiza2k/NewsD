@@ -19,6 +19,22 @@ export const MODULE_CONFIGS: Record<string, ModulePageConfig> = {
     showLive: true,
     subcategories: ['All', 'Models', 'Research', 'Tools', 'Agents', 'Infrastructure'],
   },
+  cybersecurity: {
+    title: 'Cybersecurity Intelligence',
+    subtitle: 'Breaches, vulnerabilities, threat intel and incident response updates',
+    icon: '🛡️',
+    iconClass: 'icon-cyber',
+    moduleId: 'cybersecurity',
+    showLive: true,
+    subcategories: [
+      'All',
+      'Breaches & Incidents',
+      'Vulnerabilities & CVEs',
+      'Threat Intel',
+      'Ransomware & Malware',
+      'Security Research',
+    ],
+  },
   github: {
     title: 'GitHub Developer Intelligence',
     subtitle: 'Trending repositories, open-source tools and developer ecosystems',

@@ -7,7 +7,7 @@ const MODULE_HREFS: Record<string, string> = {
   home: '/',
   technology: '/tech',
   ai: '/ai',
-  cybersecurity: '/tech',
+  cybersecurity: '/cybersecurity',
   clouddevops: '/cloud-devops',
   github: '/github',
   science: '/research',
@@ -34,6 +34,7 @@ function activeModule(pathname: string): string {
     'cloud-devops': 'clouddevops',
     forex: 'forex',
     gold: 'gold',
+    cybersecurity: 'cybersecurity',
   };
   return reverse[seg] ?? 'home';
 }
