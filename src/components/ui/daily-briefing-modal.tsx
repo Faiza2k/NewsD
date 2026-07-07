@@ -3,7 +3,6 @@
 import { useState } from 'react';
 import type { BriefingArticle, DailyBriefing } from '@/lib/briefing/build-briefing';
 import { formatBriefingTime } from '@/lib/briefing/build-briefing';
-import { FEED_SOURCE_COUNT } from '@/lib/feeds/registry';
 import { useBriefingData, useRefreshBriefing } from '@/hooks/use-briefing';
 
 interface DailyBriefingModalProps {
@@ -321,7 +320,7 @@ export function DailyBriefingModal({ open, onClose }: DailyBriefingModalProps) {
               disabled={refreshing || isFetching}
               aria-label="Refresh executive briefing feed"
             >
-              {refreshing || isFetching ? 'Syncing...' : '🔄 Refresh Feed'}
+              🔄 Refresh Feed
             </button>
             <button type="button" className="modal-close" onClick={onClose} aria-label="Close dialog">
               ✕
@@ -329,13 +328,7 @@ export function DailyBriefingModal({ open, onClose }: DailyBriefingModalProps) {
           </div>
         </div>
         <div className="modal-body" id="modal-body-content">
-          {isLoading && !data ? (
-            <div style={{ padding: 40, textAlign: 'center' }}>
-              <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-                Synchronizing executive briefing from {FEED_SOURCE_COUNT} live sources…
-              </p>
-            </div>
-          ) : error ? (
+          {isLoading && !data ? null : error ? (
             <div style={{ padding: 40, textAlign: 'center' }}>
               <p style={{ color: 'var(--accent-red)', marginBottom: 12 }}>Could not load briefing.</p>
               <button type="button" className="btn btn-primary" onClick={() => refetch()}>

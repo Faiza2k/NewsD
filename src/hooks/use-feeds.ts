@@ -11,11 +11,11 @@ export function useFeeds(category?: Category, limit = 30, module?: string) {
       if (module) params.set('module', module);
       else if (category) params.set('category', category);
       params.set('limit', String(limit));
-      params.set('t', Date.now().toString());
       const res = await fetch(`/api/feeds?${params}`);
       if (!res.ok) throw new Error('Failed to fetch feeds');
       return res.json();
     },
+    staleTime: 60 * 1000,
   });
 }
 

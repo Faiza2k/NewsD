@@ -1,6 +1,7 @@
 'use client';
 
 import { useTheme } from '@/components/providers/theme-provider';
+import { Bot, ClipboardList, Moon, Sun } from 'lucide-react';
 
 interface NewsIntelHeaderProps {
   onSearchFocus: () => void;
@@ -62,32 +63,32 @@ export function NewsIntelHeader({
         <button
           type="button"
           className="header-btn theme-toggle"
-          title="Toggle color theme (Light / Dark)"
+          data-tooltip="Toggle theme"
           aria-label="Toggle color theme"
           onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
         >
-          <span className="sun">☀️</span>
-          <span className="moon">🌙</span>
+          <Sun className="sun" size={18} />
+          <Moon className="moon" size={18} />
         </button>
 
         <button
           type="button"
           className="header-btn"
-          title="Open AI Assistant Panel (Shortcut: A)"
+          data-tooltip="AI Assistant · A"
           aria-label="Open AI Assistant"
           onClick={onAssistantOpen}
         >
-          <span>🤖</span>
+          <Bot size={18} />
         </button>
 
         <button
           type="button"
           className="header-btn"
-          title="Open Daily Briefing Report (Shortcut: D)"
+          data-tooltip="Daily Briefing · D"
           aria-label="Open Daily Briefing"
           onClick={onBriefingOpen}
         >
-          <span>📋</span>
+          <ClipboardList size={18} />
           <span className="notification-dot" />
         </button>
       </div>

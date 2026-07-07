@@ -4,7 +4,6 @@ import { useState } from 'react';
 import { useFeeds } from '@/hooks/use-feeds';
 import { NewsCard } from '@/components/cards/news-card';
 import { ImportanceScore } from '@/components/ui/importance-score';
-import { useBriefing } from '@/components/providers/briefing-provider';
 import { formatDistanceToNow } from 'date-fns';
 import type { Category, NewsItem } from '@/types';
 
@@ -131,8 +130,6 @@ export function ModulePageLayout({ config }: { config: ModulePageConfig }) {
     .filter((item) => item.id !== featured?.id)
     .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
 
-  const { openBriefing } = useBriefing();
-
   return (
     <>
       <div className="module-header animate-fade-in">
@@ -176,11 +173,6 @@ export function ModulePageLayout({ config }: { config: ModulePageConfig }) {
               </div>
               <p>{config.subtitle}</p>
             </div>
-          </div>
-          <div className="module-actions">
-            <button type="button" className="btn btn-primary" onClick={openBriefing}>
-              Daily Briefing
-            </button>
           </div>
         </div>
         <div className="category-tabs" style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'flex-start', width: '100%' }}>

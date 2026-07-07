@@ -2,11 +2,10 @@
 
 import { useFeeds, useCryptoMarket } from '@/hooks/use-feeds';
 import { NewsCard } from '@/components/cards/news-card';
-import { WeatherWidget } from '@/components/ui/weather-widget';
-import { TelemetryRadarPanel } from '@/components/ui/telemetry-radar-panel';
 import { FrameworkRadarPanel } from '@/components/ui/framework-radar-panel';
 import { HotTrendsPanel } from '@/components/ui/hot-trends-panel';
 import { TimelinePanel } from '@/components/ui/timeline-panel';
+import { ControlCenterSyncLoader } from '@/components/ui/control-center-sync-loader';
 import { formatDistanceToNow } from 'date-fns';
 import type { NewsItem } from '@/types';
 
@@ -65,7 +64,7 @@ function sortHomeFeed(items: NewsItem[]): NewsItem[] {
 
 export function ControlCenterHome() {
   const { data: globalData, isLoading } = useFeeds(undefined, 50);
-  const { data: cryptoMarket } = useCryptoMarket();
+  useCryptoMarket(); // keep market data warm for the header ticker
 
   const items = globalData?.items ?? [];
   const sorted = sortHomeFeed(items);
@@ -81,17 +80,22 @@ export function ControlCenterHome() {
     .sort((a, b) => (b.significance || 5) - (a.significance || 5))
     .slice(0, 5);
 
+  if (isLoading && items.length === 0) {
+    return (
+      <div className="dashboard-home animate-fade-in">
+        <ControlCenterSyncLoader />
+      </div>
+    );
+  }
+
   return (
     <div className="dashboard-home animate-fade-in">
       <div className="control-center-hero">
-        <WeatherWidget />
         <div className="welcome-section">
           <h1>Technology Control Center</h1>
           <p>Real-time AI, security, developer and research signal — prioritized by importance, not just recency.</p>
         </div>
       </div>
-
-      <TelemetryRadarPanel assets={cryptoMarket?.assets ?? []} />
 
       <div className="home-grid">
         {breaking && <BreakingCard item={breaking} />}

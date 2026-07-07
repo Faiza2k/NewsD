@@ -2,13 +2,14 @@ import { NextRequest } from 'next/server';
 export const dynamic = 'force-dynamic';
 import { getCached, setCache } from '@/lib/feeds/cache';
 import { FEED_SOURCES } from '@/lib/feeds/registry';
+import { getAllFeedItems } from '@/lib/feeds/fetch-all-feeds';
 import { getFeedsForModule, isIntelligenceModule } from '@/lib/feeds/module-feeds';
 import { scoreSignificance, deduplicateByUrl, deduplicateByTitle } from '@/lib/utils/relevance-scorer';
 import type { NewsItem, Category } from '@/types';
 import Parser from 'rss-parser';
 
 const parser = new Parser({
-  timeout: 8000,
+  timeout: 6000,
   headers: {
     'User-Agent': 'NewsDash/1.0 Intelligence Dashboard',
     'Accept': 'application/rss+xml, application/xml, text/xml, application/atom+xml',
@@ -17,8 +18,26 @@ const parser = new Parser({
 });
 
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const BATCH_SIZE = 5;
+const BOOTSTRAP_CACHE_TTL = 60 * 1000; // fast first paint, then full cache overwrites
+const BATCH_SIZE = 8;
 const MAX_ITEMS_PER_FEED = 8;
+const FEED_TIMEOUT_MS = 3500;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
 
 interface RSSItem {
   title?: string;
@@ -33,7 +52,7 @@ interface RSSItem {
 
 async function fetchSingleFeed(source: typeof FEED_SOURCES[number]): Promise<NewsItem[]> {
   try {
-    const feed = await parser.parseURL(source.url);
+    const feed = await withTimeout(parser.parseURL(source.url), FEED_TIMEOUT_MS);
     const items: NewsItem[] = [];
 
     for (const item of (feed.items || []).slice(0, MAX_ITEMS_PER_FEED)) {
@@ -89,6 +108,21 @@ async function fetchFeedsBatch(sources: typeof FEED_SOURCES): Promise<NewsItem[]
   return allItems;
 }
 
+async function fetchFeedsUntil(sources: typeof FEED_SOURCES, targetItemCount: number): Promise<NewsItem[]> {
+  const allItems: NewsItem[] = [];
+
+  for (let i = 0; i < sources.length; i += BATCH_SIZE) {
+    const batch = sources.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(batch.map(fetchSingleFeed));
+    for (const result of results) {
+      if (result.status === 'fulfilled') allItems.push(...result.value);
+    }
+    if (allItems.length >= targetItemCount) break;
+  }
+
+  return allItems;
+}
+
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const category = searchParams.get('category') as Category | null;
@@ -109,6 +143,10 @@ export async function GET(request: NextRequest) {
     });
   }
 
+  // Warm full cache in the background so future loads are fast.
+  // This avoids a "long synchronizing" experience on the very first run.
+  void getAllFeedItems();
+
   // Filter sources by module or category
   let sources = FEED_SOURCES;
   if (moduleId && isIntelligenceModule(moduleId)) {
@@ -117,7 +155,13 @@ export async function GET(request: NextRequest) {
     sources = FEED_SOURCES.filter((s) => s.category === category);
   }
 
-  const allItems = await fetchFeedsBatch(sources);
+  // Prioritize higher-signal sources first to return quickly.
+  sources = [...sources].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+
+  // Fetch only what we need for a quick first paint, then let background warming
+  // populate the full cache (which will overwrite this key).
+  const target = Math.min(Math.max((offset + limit) * 4, 80), 320);
+  const allItems = await fetchFeedsUntil(sources, target);
 
   // Deduplicate and sort
   let processed = deduplicateByUrl(allItems);
@@ -129,7 +173,7 @@ export async function GET(request: NextRequest) {
     return b.significance - a.significance;
   });
 
-  setCache(cacheKey, processed, CACHE_TTL);
+  setCache(cacheKey, processed, BOOTSTRAP_CACHE_TTL);
 
   const paginated = processed.slice(offset, offset + limit);
 

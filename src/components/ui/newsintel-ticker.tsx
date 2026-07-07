@@ -1,6 +1,7 @@
 'use client';
 
 import { useCryptoMarket } from '@/hooks/use-feeds';
+import { WeatherWidget } from '@/components/ui/weather-widget';
 
 export function NewsIntelTicker() {
   const { data } = useCryptoMarket();
@@ -16,9 +17,8 @@ export function NewsIntelTicker() {
 
   return (
     <div className="market-ticker">
-      <div className="ticker-label">
-        <span className="pulse-dot" />
-        MARKETS
+      <div className="ticker-left">
+        <WeatherWidget />
       </div>
       <div className="ticker-scroll" id="ticker-scroll">
         <div className="ticker-track">
@@ -26,22 +26,25 @@ export function NewsIntelTicker() {
             if (!asset) return null;
             const isUp = (asset.price_change_percentage_24h || 0) >= 0;
             const price = asset.current_price;
-            const priceFormatted = `$${price.toLocaleString(undefined, {
-              minimumFractionDigits: price < 10 ? 2 : 0,
-              maximumFractionDigits: price < 10 ? 2 : 0,
-            })}`;
+            const decimals = price < 10 ? (price < 2 ? 4 : 2) : 0;
             return (
               <div
                 key={`${asset.id}-${i}`}
-                className="ticker-item"
-                title={`${asset.symbol} • Real-Time 24h Trajectory`}
+                className={`market-pulse-card ticker-telemetry-card ${isUp ? 'is-up' : 'is-down'}`}
+                title={`${asset.name} (${asset.symbol.toUpperCase()}) • 24h change`}
               >
-                <span className="ticker-item-name">{asset.symbol.toUpperCase()}</span>
-                <span className="ticker-item-price">{priceFormatted}</span>
-                <span className={`ticker-item-change ${isUp ? 'up' : 'down'}`}>
+                <div className="telemetry-card-header">
+                  <span className="telemetry-card-label">{asset.symbol.toUpperCase()}</span>
+                  <span className={`pulse-dot ${isUp ? 'is-up' : 'is-down'}`} aria-hidden="true" />
+                </div>
+                <div className="telemetry-price">
+                  ${price.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}
+                </div>
+                <div className={`telemetry-change ${isUp ? 'text-up' : 'text-down'}`}>
                   {isUp ? '▲' : '▼'} {isUp ? '+' : ''}
                   {(asset.price_change_percentage_24h || 0).toFixed(2)}%
-                </span>
+                </div>
+                <div className="telemetry-sparkline" aria-hidden="true" />
               </div>
             );
           })}
