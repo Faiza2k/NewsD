@@ -71,7 +71,7 @@ async function fetchSingleFeed(source: typeof FEED_SOURCES[number]): Promise<New
       const url = rssItem.link || '';
 
       // Never fabricate freshness: require a real, verifiable publish date.
-      const publishedAt = extractValidDate(item as Record<string, unknown>);
+      const publishedAt = extractValidDate(item as unknown as Record<string, unknown>);
       if (!title || !url || !publishedAt || !isFresh(publishedAt)) continue;
 
       const significance = scoreSignificance(title, description, source.category, publishedAt, source.category);
