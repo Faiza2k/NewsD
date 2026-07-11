@@ -34,10 +34,12 @@ type LinkPreview = {
 
 const STOP_WORDS = new Set([
   'tell', 'me', 'about', 'the', 'a', 'an', 'and', 'or', 'of', 'to', 'for', 'in', 'on', 'at',
-  'is', 'are', 'was', 'were', 'be', 'been', 'what', 'whats', "what's", 'who', 'when', 'where',
-  'why', 'how', 'please', 'give', 'show', 'get', 'latest', 'news', 'update', 'updates',
+  'is', 'are', 'was', 'were', 'be', 'news', 'what', 'whats', "what's", 'who', 'when', 'where',
+  'why', 'how', 'please', 'give', 'show', 'get', 'latest', 'update', 'updates',
   'today', 'now', 'some', 'any', 'info', 'information', 'regarding', 'related', 'something',
   'everything', 'thing', 'things', 'from', 'with', 'into', 'over', 'under', 'again',
+  'can', 'you', 'could', 'would', 'need', 'want', 'looking', 'know', 'explain', 'describe',
+  'detail', 'details', 'summary', 'brief', 'quick', 'currently', 'happening',
 ]);
 
 /** Optional boosts only — any other word still searches the full dashboard. */
@@ -52,6 +54,21 @@ const TOPIC_SYNONYMS: Record<string, string[]> = {
   nvidia: ['nvidia', 'nvda', 'gpu'],
   forex: ['forex', 'fx'],
   stocks: ['stocks', 'equities', 'shares', 'nasdaq'],
+  iran: ['iran', 'iranian', 'tehran'],
+  america: ['america', 'american', 'usa', 'united states'],
+  conflict: ['conflict', 'war', 'fight', 'fighting', 'tensions', 'strike', 'attack'],
+};
+
+/** Normalize chat shorthand before search. */
+const TOKEN_ALIASES: Record<string, string> = {
+  btc: 'bitcoin',
+  eth: 'ethereum',
+  ml: 'ai',
+  usa: 'america',
+  us: 'america',
+  war: 'conflict',
+  fight: 'conflict',
+  fighting: 'conflict',
 };
 
 const WA_SUMMARY_MAX = 420;
@@ -65,12 +82,34 @@ function cleanQuery(q: string): string {
     .trim();
 }
 
+/** Strip chat phrasing so “Tell me about X” searches as X. */
+function extractTopicQuery(raw: string): string {
+  let q = String(raw || '').trim();
+  q = q.replace(/^["'`]+|["'`]+$/g, '');
+  q = q.replace(/^(please\s+)?(can you|could you|would you)\s+/i, '');
+  q = q.replace(
+    /^(tell me|tell us|give me|show me|get me|i want|i need|looking for|explain|describe)\s+(about\s+|regarding\s+|on\s+|for\s+)?/i,
+    '',
+  );
+  q = q.replace(/^(what(?:'s| is| are)|whats)\s+(the\s+)?(latest\s+|current\s+)?/i, '');
+  q = q.replace(/^(any|some)\s+(news|updates?|info|information)\s+(on|about|regarding)\s+/i, '');
+  q = q.replace(/\?+$/g, '').trim();
+  return q || String(raw || '').trim();
+}
+
+function aliasToken(t: string): string {
+  return TOKEN_ALIASES[t] || t;
+}
+
 function tokenize(q: string): string[] {
   return cleanQuery(q)
     .split(/\s+/g)
     .map((t) => t.trim())
-    .filter((t) => t.length >= 2 && !STOP_WORDS.has(t));
+    .filter((t) => t.length >= 2 && !STOP_WORDS.has(t))
+    .map(aliasToken)
+    .filter((t, i, arr) => arr.indexOf(t) === i);
 }
+
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -99,6 +138,12 @@ function matchesAnyVariant(hay: string, term: string): boolean {
   return termVariants(term).some((v) => hasWord(hay, v));
 }
 
+function synonymHit(raw: string, syn: string): boolean {
+  if (!syn) return false;
+  if (syn.includes(' ')) return raw.includes(syn);
+  return raw === syn || hasWord(raw, syn);
+}
+
 function expandTerms(q: string): string[] {
   const base = tokenize(q);
   const expanded = new Set<string>(base);
@@ -110,13 +155,40 @@ function expandTerms(q: string): string[] {
     }
   }
   for (const [topic, syns] of Object.entries(TOPIC_SYNONYMS)) {
-    if (syns.some((s) => raw === s || hasWord(raw, s))) {
+    if (syns.some((s) => synonymHit(raw, s))) {
       for (const s of syns) expanded.add(s);
       expanded.add(topic);
     }
   }
 
   return [...expanded];
+}
+
+/** Prefer stronger keywords when a long chat question yields no hits. */
+function fallbackPrimary(primary: string[]): string[] {
+  if (primary.length <= 2) return primary;
+  const known = primary.filter(
+    (t) =>
+      Boolean(TOPIC_SYNONYMS[t]) ||
+      Object.values(TOPIC_SYNONYMS).some((syns) => syns.includes(t)),
+  );
+  if (known.length > 0) {
+    const rest = primary
+      .filter((t) => !known.includes(t))
+      .sort((a, b) => b.length - a.length);
+    return [...known, ...rest].slice(0, 2);
+  }
+  return [...primary].sort((a, b) => b.length - a.length).slice(0, 2);
+}
+
+/** If the phrase maps to a known topic (e.g. machine learning → ai), use that. */
+function topicFromPhrase(q: string): string | null {
+  const raw = cleanQuery(q);
+  for (const [topic, syns] of Object.entries(TOPIC_SYNONYMS)) {
+    if (raw === topic || hasWord(raw, topic)) return topic;
+    if (syns.some((s) => (s.includes(' ') ? raw.includes(s) : hasWord(raw, s)))) return topic;
+  }
+  return null;
 }
 
 function isWeatherIntent(q: string): boolean {
@@ -253,7 +325,7 @@ function buildBrief(
     if (poolSize === 0) {
       return `NewsDash feeds are still syncing. Open the dashboard once, wait a few seconds, then ask “${q}” again.`;
     }
-    return `No on-topic headline for “${q}” in the current NewsDash feeds (${poolSize} stories checked). Try a word that appears in a headline.`;
+    return `No matching headline for “${q}” in NewsDash right now (tech, markets, crypto & AI feeds · ${poolSize} stories checked). Try a simpler keyword like bitcoin, gold, or AI.`;
   }
   return `${items.length} matching stor${items.length === 1 ? 'y' : 'ies'} from NewsDash.`;
 }
@@ -353,10 +425,11 @@ export async function POST(request: Request) {
     return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
   }
 
-  const q = body.q.trim();
+  const rawQ = body.q.trim();
+  const q = extractTopicQuery(rawQ);
   const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT);
-  const primary = tokenize(q);
-  const expanded = expandTerms(q);
+  let primary = tokenize(q);
+  let expanded = expandTerms(q);
   const phrase = cleanQuery(q);
   const weatherIntent = isWeatherIntent(q);
 
@@ -364,6 +437,7 @@ export async function POST(request: Request) {
     const msg = 'Please ask with a clear keyword (any topic on your NewsDash feeds).';
     return Response.json({
       query: q,
+      rawQuery: rawQ,
       categories: [],
       brief: msg,
       items: [],
@@ -387,17 +461,37 @@ export async function POST(request: Request) {
     const fresh = await loadFreshItems();
     const poolSize = fresh.length;
 
-    const scored: QueryResultItem[] = fresh
-      .map((i) => {
-        const { matchScore, score } = scoreItem(i, primary, expanded, phrase);
-        return { ...i, score, matchScore };
-      })
-      .filter((i) => i.matchScore >= 10)
-      .sort((a, b) => {
+    const rank = (list: QueryResultItem[]) =>
+      list.sort((a, b) => {
         if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
         if (b.score !== a.score) return b.score - a.score;
         return new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime();
       });
+
+    const scorePool = (terms: string[], exp: string[]) =>
+      rank(
+        fresh
+          .map((i) => {
+            const { matchScore, score } = scoreItem(i, terms, exp, phrase);
+            return { ...i, score, matchScore };
+          })
+          .filter((i) => i.matchScore >= 10),
+      );
+
+    let scored = scorePool(primary, expanded);
+    if (scored.length === 0 && primary.length > 2) {
+      primary = fallbackPrimary(primary);
+      expanded = expandTerms(primary.join(' '));
+      scored = scorePool(primary, expanded);
+    }
+    if (scored.length === 0) {
+      const topic = topicFromPhrase(q);
+      if (topic) {
+        primary = [topic];
+        expanded = expandTerms(topic);
+        scored = scorePool(primary, expanded);
+      }
+    }
 
     scoredTotal = scored.length;
     items = scored.slice(0, limit);
@@ -418,6 +512,7 @@ export async function POST(request: Request) {
 
     return Response.json({
       query: q,
+      rawQuery: rawQ,
       categories: allowed,
       terms: { primary, expanded },
       weather: weather ?? undefined,
