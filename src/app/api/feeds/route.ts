@@ -27,7 +27,6 @@ const parser = new Parser({
 });
 
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const BOOTSTRAP_CACHE_TTL = 60 * 1000; // fast first paint, then full cache overwrites
 const BATCH_SIZE = 8;
 const MAX_ITEMS_PER_FEED = 8;
 const FEED_TIMEOUT_MS = 3500;
@@ -190,7 +189,7 @@ export async function GET(request: NextRequest) {
     return b.significance - a.significance;
   });
 
-  setCache(cacheKey, processed, BOOTSTRAP_CACHE_TTL);
+  setCache(cacheKey, processed, CACHE_TTL);
 
   const paginated = processed.slice(offset, offset + limit);
 

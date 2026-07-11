@@ -171,3 +171,37 @@ export async function getAllFeedItems(force = false): Promise<NewsItem[]> {
 
   return processed;
 }
+
+/**
+ * Fast path for WhatsApp /api/query.
+ * Prefer cache; if empty, do a short bootstrap so n8n does not get pool=0 / abort.
+ */
+export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
+  const cached = getCached<NewsItem[]>(ALL_FEEDS_CACHE_KEY);
+  if (cached && cached.length >= 5) return cached;
+
+  const merged = new Map<string, NewsItem>();
+  for (const cat of ['ai', 'crypto', 'trading', 'github', 'tech', 'research', 'startups', 'global'] as Category[]) {
+    const part = getCached<NewsItem[]>(`feeds_v5:${cat}`);
+    if (!part) continue;
+    for (const item of part) merged.set(item.id, item);
+  }
+  if (merged.size >= 5) return [...merged.values()];
+
+  const prioritized = [...FEED_SOURCES].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+  const bootstrap = await Promise.race([
+    fetchFeedsUntil(prioritized, 60).then((items) => processItems(items)),
+    new Promise<NewsItem[]>((resolve) => setTimeout(() => resolve([]), 15000)),
+  ]);
+
+  if (bootstrap.length > 0) {
+    setCache(ALL_FEEDS_CACHE_KEY, bootstrap, CACHE_TTL);
+    for (const cat of ['ai', 'crypto', 'trading', 'github', 'tech', 'research', 'startups', 'global'] as Category[]) {
+      const catItems = bootstrap.filter((i) => i.category === cat);
+      if (catItems.length) setCache(`feeds_v5:${cat}`, catItems, CACHE_TTL);
+    }
+    return bootstrap;
+  }
+
+  return getCached<NewsItem[]>(ALL_FEEDS_CACHE_KEY) || [];
+}
