@@ -535,7 +535,7 @@ function buildBrief(
     }
     return `No strong headline match for “${q}” right now (${poolSize} stories checked). Try a clearer topic like bitcoin, gold, AI, oil — or ask “bitcoin price” / “weather in Karachi” for live data.`;
   }
-  return `${items.length} matching stor${items.length === 1 ? 'y' : 'ies'} from NewsDash.`;
+  return `${items.length} matching stor${items.length === 1 ? 'y' : 'ies'} from NewsDash (source links included).`;
 }
 
 function buildWeatherBlock(weather: WeatherPayload): string {
@@ -547,9 +547,37 @@ function buildWeatherBlock(weather: WeatherPayload): string {
   ].join('\n');
 }
 
+function isValidArticleUrl(url: unknown): url is string {
+  if (typeof url !== 'string' || !url.trim()) return false;
+  try {
+    const u = new URL(url.trim());
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/** Always show outlet name + exact article URL so the user can verify the story. */
 function sourceHyperlink(source: string, url: string): string {
-  const label = source ? `*Source: ${source}*` : '*Source*';
-  return `${label}\n${url}`;
+  const outlet = source?.trim() || 'Publisher';
+  return [
+    `*Source:* ${outlet}`,
+    '*Open original article:*',
+    url.trim(),
+  ].join('\n');
+}
+
+function formatNewsStoryBlock(i: QueryResultItem, idx: number): string {
+  const when = formatTime(i.publishedAt);
+  const lines = [
+    `*${idx + 1}. ${i.title.trim()}*`,
+    when ? `_Published ${when}_` : '',
+    waSummary(i.description || ''),
+  ];
+  if (isValidArticleUrl(i.url)) {
+    lines.push(sourceHyperlink(i.source, i.url));
+  }
+  return lines.filter(Boolean).join('\n');
 }
 
 function buildWhatsAppText(
@@ -558,27 +586,17 @@ function buildWhatsAppText(
   items: QueryResultItem[],
   weather?: WeatherPayload | null,
 ): string {
+  const withUrls = items.filter((i) => isValidArticleUrl(i.url));
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief];
 
   if (weather && (weather.location || weather.error)) {
     parts.push('', buildWeatherBlock(weather));
   }
 
-  if (!items.length) return parts.join('\n');
+  if (!withUrls.length) return parts.join('\n');
 
-  const blocks = items.map((i, idx) => {
-    const when = formatTime(i.publishedAt);
-    return [
-      `*${idx + 1}. ${i.title.trim()}*`,
-      when ? `_Published ${when}_` : '',
-      waSummary(i.description || ''),
-      i.url ? sourceHyperlink(i.source, i.url) : '',
-    ]
-      .filter(Boolean)
-      .join('\n');
-  });
-
-  parts.push('', blocks.join('\n\n'));
+  parts.push('', withUrls.map((i, idx) => formatNewsStoryBlock(i, idx)).join('\n\n'));
+  parts.push('', '_Tap each link to open the original publisher page and confirm the story._');
   return parts.join('\n');
 }
 
@@ -612,20 +630,11 @@ function buildUnsupportedFuelWhatsApp(q: string, oilItems: QueryResultItem[]): s
   const brief =
     'Live Pakistan petrol/diesel pump prices are not wired yet. I will not invent a number.';
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief];
-  if (oilItems.length) {
+  const linkedOil = oilItems.filter((i) => isValidArticleUrl(i.url));
+  if (linkedOil.length) {
     parts.push('', '_Related oil coverage from NewsDash:_');
-    const blocks = oilItems.map((i, idx) => {
-      const when = formatTime(i.publishedAt);
-      return [
-        `*${idx + 1}. ${i.title.trim()}*`,
-        when ? `_Published ${when}_` : '',
-        waSummary(i.description || ''),
-        i.url ? sourceHyperlink(i.source, i.url) : '',
-      ]
-        .filter(Boolean)
-        .join('\n');
-    });
-    parts.push('', blocks.join('\n\n'));
+    parts.push('', linkedOil.map((i, idx) => formatNewsStoryBlock(i, idx)).join('\n\n'));
+    parts.push('', '_Tap the link to open the original publisher article._');
   } else {
     parts.push(
       '',
@@ -690,6 +699,23 @@ function assertReplyQuality(payload: QualityPayload): { ok: true } | { ok: false
           'No strong headline match right now. Try a clearer topic like bitcoin, gold, AI, or oil.',
       };
     }
+    const missingUrl = items.some((i) => !isValidArticleUrl(i.url));
+    if (missingUrl) {
+      return {
+        ok: false,
+        reason:
+          'Could not attach a verifiable source link. Please ask again or try another topic.',
+      };
+    }
+    for (const item of items) {
+      if (!whatsappText.includes(item.url.trim())) {
+        return {
+          ok: false,
+          reason:
+            'Could not attach a verifiable source link. Please ask again or try another topic.',
+        };
+      }
+    }
   }
 
   return { ok: true };
@@ -731,6 +757,7 @@ async function searchNews(
   const scorePool = (terms: string[], exp: string[]) =>
     rank(
       fresh
+        .filter((i) => isValidArticleUrl(i.url))
         .map((i) => {
           const { matchScore, score } = scoreItem(i, terms, exp, phrase);
           return { ...i, score, matchScore };
