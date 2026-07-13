@@ -1,5 +1,11 @@
 import { getFeedItemsForQuery } from '@/lib/feeds/fetch-all-feeds';
 import { isFresh } from '@/lib/feeds/date-utils';
+import { resolveArticleBodies } from '@/lib/feeds/article-body';
+import {
+  buildExtractiveAnswer,
+  buildGroundedAnswer,
+  type GroundedSource,
+} from '@/lib/query/grounded-answer';
 import type { Category, NewsItem } from '@/types';
 
 export const dynamic = 'force-dynamic';
@@ -74,6 +80,8 @@ const STOP_WORDS = new Set([
   'can', 'you', 'could', 'would', 'need', 'want', 'looking', 'know', 'explain', 'describe',
   'detail', 'details', 'summary', 'brief', 'quick', 'currently', 'happening', 'happens',
   'there', 'this', 'that', 'these', 'those', 'also', 'just', 'really', 'very',
+  'claiming', 'against', 'between', 'versus', 'vs', 'does', 'did', 'doing', 'been',
+  'have', 'has', 'had', 'will', 'should', 'their', 'they', 'them', 'its', 'into',
 ]);
 
 /** Light query expansion only — never the main brain. Unknown words still search feeds. */
@@ -103,6 +111,7 @@ const BOILERPLATE_RE =
 const WA_SUMMARY_MAX = 200;
 const WA_STORY_LIMIT = 2;
 const WA_STORY_LIMIT_MAX = 2;
+const WA_ANSWER_MIN = 40;
 const MIN_MATCH = 8;
 const GRAMS_PER_TROY_OZ = 31.1034768;
 const GRAMS_PER_TOLA = 11.6638038;
@@ -634,58 +643,75 @@ async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
   }
 }
 
-function formatStory(i: QueryResultItem, idx: number, showIndex: boolean): string {
+/** WhatsApp auto-linkifies the https URL inside markdown [label](url). */
+function sourceHyperlink(source: string, url: string): string {
+  const href = url.trim();
+  const label = (source || 'Open article').replace(/[\[\]]/g, '').trim() || 'Open article';
+  return `Go to: [${label}](${href})`;
+}
+
+function formatSourceLine(i: QueryResultItem, idx: number, showIndex: boolean): string {
   const when = formatTime(i.publishedAt);
-  const title = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
-  const terms = (i.matchedTerms || []).map(titleCase).filter(Boolean);
-  const matched = terms.length
-    ? `_Matched: ${terms.join(', ')} | ${i.source}_`
-    : `_Source feed: ${i.source}_`;
-  return [
-    title,
-    matched,
-    when ? `_Published ${when}_` : '',
-    waSummary(i.description || ''),
-    `*Source:* ${i.source || 'Publisher'}`,
-    i.url.trim(),
-  ]
+  const prefix = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
+  const meta = [i.source || 'Publisher', when].filter(Boolean).join(' · ');
+  return [prefix + (meta ? ` — ${meta}` : ''), sourceHyperlink(i.source || 'Publisher', i.url)]
     .filter(Boolean)
     .join('\n');
 }
 
-function buildNewsReply(
+async function enrichGroundedSources(items: QueryResultItem[]): Promise<GroundedSource[]> {
+  const bodies = await resolveArticleBodies(
+    items.map((i) => ({
+      url: i.url,
+      description: i.description || '',
+      title: i.title,
+    })),
+  );
+  return items.map((i, idx) => ({
+    title: i.title,
+    source: i.source || 'Publisher',
+    url: i.url,
+    publishedAt: i.publishedAt,
+    body: bodies[idx] || i.description || i.title,
+  }));
+}
+
+async function buildNewsReply(
+  question: string,
   topicLabel: string,
   items: QueryResultItem[],
   poolSize: number,
   note?: string,
-): string {
+): Promise<{ text: string; answer: string; sources: GroundedSource[] }> {
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`];
   if (note) parts.push(note);
 
   if (!items.length) {
-    parts.push(
+    const empty =
       poolSize === 0
         ? 'NewsDash feeds are still syncing. Please try again in a moment.'
-        : `No strong matching story for "${topicLabel}" in the current NewsDash window.`,
-    );
-    return parts.join('\n');
+        : `No strong matching story for "${topicLabel}" in the current NewsDash window.`;
+    parts.push(empty);
+    return { text: parts.join('\n'), answer: '', sources: [] };
   }
 
-  parts.push(
-    items.length === 1
-      ? 'Top matching story from NewsDash.'
-      : `${items.length} matching stories from NewsDash.`,
-  );
+  const sources = await enrichGroundedSources(items);
+  let answer = await buildGroundedAnswer(question, sources);
+  if (!answer || answer.length < WA_ANSWER_MIN) {
+    answer = buildExtractiveAnswer(question, sources);
+  }
+
+  parts.push('', '*Answer:*', answer, '', '*Sources*');
   const showIndex = items.length > 1;
-  parts.push('', items.map((i, idx) => formatStory(i, idx, showIndex)).join('\n\n'));
-  return parts.join('\n');
+  parts.push(items.map((i, idx) => formatSourceLine(i, idx, showIndex)).join('\n\n'));
+  return { text: parts.join('\n'), answer, sources };
 }
 
 function buildGreeting(): string {
   return [
     '*NewsDash Analyst*',
     '',
-    'Ask any news or market question. I search your NewsDash feeds and reply with source links.',
+    'Ask any news or market question (text or voice). I search NewsDash feeds and reply with a grounded answer plus source links.',
     '',
     'Examples: AI regulation, OpenAI, oil markets, Pakistan crypto, gold price now, weather in Karachi.',
   ].join('\n');
@@ -754,8 +780,9 @@ function assertQuality(args: {
   gold?: GoldQuote | null;
   crypto?: CryptoQuote | null;
   requestedCity?: string;
+  answer?: string;
 }): { ok: true } | { ok: false; reason: string } {
-  const { kind, text, items, weather, gold, crypto, requestedCity } = args;
+  const { kind, text, items, weather, gold, crypto, requestedCity, answer } = args;
   if (!text || text.length < 16) return { ok: false, reason: 'Empty reply. Please ask again.' };
 
   if (kind === 'weather' && !weather?.error) {
@@ -778,6 +805,15 @@ function assertQuality(args: {
   }
 
   if (kind === 'news' && items?.length) {
+    if (!text.includes('*Answer:*')) {
+      return { ok: false, reason: 'Could not build a grounded answer. Please ask again.' };
+    }
+    if (!answer || answer.length < WA_ANSWER_MIN) {
+      return { ok: false, reason: 'Could not build a grounded answer. Please ask again.' };
+    }
+    if (/open the source link for the full publisher article/i.test(answer)) {
+      return { ok: false, reason: 'Could not build a grounded answer. Please ask again.' };
+    }
     for (const item of items) {
       if (!isValidArticleUrl(item.url) || !text.includes(item.url.trim())) {
         return {
@@ -933,8 +969,14 @@ export async function POST(request: Request) {
     ? 'Live Pakistan pump prices are not wired yet. Showing related oil/fuel coverage from NewsDash.'
     : undefined;
 
-  let whatsappText = buildNewsReply(topicLabel, items, ranked.poolSize, note);
-  const gate = assertQuality({ kind: 'news', text: whatsappText, items });
+  const built = await buildNewsReply(rawQ, topicLabel, items, ranked.poolSize, note);
+  let whatsappText = built.text;
+  const gate = assertQuality({
+    kind: 'news',
+    text: whatsappText,
+    items,
+    answer: built.answer,
+  });
   if (!gate.ok && items.length) {
     whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
   }
@@ -947,7 +989,7 @@ export async function POST(request: Request) {
     displayTopic: topicLabel,
     intent: fuelAsk ? 'unsupported_live' : 'news',
     terms: { primary: ranked.tokens, expanded: ranked.expanded },
-    brief: note || (items.length ? 'Matching stories from NewsDash.' : 'No strong match.'),
+    brief: built.answer || note || (items.length ? 'Matching stories from NewsDash.' : 'No strong match.'),
     items,
     total: ranked.total,
     poolSize: ranked.poolSize,
