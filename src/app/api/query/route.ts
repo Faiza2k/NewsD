@@ -50,9 +50,16 @@ type CryptoQuote = {
   change24h?: number;
 };
 
-type IntentKind = 'weather' | 'gold_price' | 'crypto_price' | 'unsupported_live' | 'news';
+type IntentKind =
+  | 'greeting'
+  | 'weather'
+  | 'gold_price'
+  | 'crypto_price'
+  | 'unsupported_live'
+  | 'news';
 
 type ResolvedIntent =
+  | { kind: 'greeting' }
   | { kind: 'weather'; city: string; cityAsked: boolean }
   | { kind: 'gold_price' }
   | { kind: 'crypto_price'; cryptoId: string }
@@ -98,6 +105,7 @@ const TOPIC_SYNONYMS: Record<string, string[]> = {
   iran: ['iran', 'iranian', 'tehran'],
   america: ['america', 'american', 'usa', 'united states'],
   conflict: ['conflict', 'war', 'fight', 'fighting', 'tensions', 'strike', 'attack'],
+  tech: ['tech', 'technology', 'software', 'hardware', 'chip', 'semiconductor'],
   energy: ['energy', 'oil', 'gas', 'fuel', 'power', 'electricity'],
 };
 
@@ -126,7 +134,7 @@ const GRAMS_PER_TROY_OZ = 31.1034768;
 const GRAMS_PER_TOLA = 11.6638038;
 
 const TEASER_TITLE_RE =
-  /\b(latest (ai |tech )?news|updates? we announced|the download|round-?up|weekly roundup|daily digest|here('?s| are)|top \d+|things to know|what we announced|newsletter)\b/i;
+  /\b(latest (ai |tech )?news|updates? we announced|the download|round-?up|weekly roundup|daily digest|here('?s| are)|top \d+|things to know|what we announced|newsletter|here'?s what happened|what happened in|state of crypto|hodler'?s digest|signs of life\?|digest,? (jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec))\b/i;
 const NEWSLETTER_BOILERPLATE_RE =
   /this is today'?s edition|weekday newsletter|daily dose of what'?s going on|subscribe to|read more on our (site|blog)|sign up for/i;
 const CONCRETE_EVENT_RE =
@@ -260,8 +268,8 @@ function titleCaseWords(s: string): string {
     .join(' ');
 }
 
-/** Short label for WhatsApp *Topic:* line (not the raw user sentence). */
 function displayTopic(q: string, intent: ResolvedIntent): string {
+  if (intent.kind === 'greeting') return 'Help';
   if (intent.kind === 'weather') {
     return intent.cityAsked ? `${titleCaseWords(intent.city)} weather` : 'Weather';
   }
@@ -281,6 +289,19 @@ function displayTopic(q: string, intent: ResolvedIntent): string {
   const tokens = tokenize(q);
   if (tokens.length) return titleCaseWords(tokens.slice(0, 4).join(' '));
   return titleCaseWords(cleanQuery(q).slice(0, 40)) || 'News';
+}
+
+function isGreeting(q: string): boolean {
+  const s = cleanQuery(q);
+  return /^(hi|hello|hey|salam|assalamualaikum|hola|yo|thanks|thank you|ok|okay|help|start|menu)$/.test(
+    s,
+  );
+}
+
+function wantsLivePrice(q: string): boolean {
+  return /\b(price|prices|spot|rate|rates|cost|how much|worth|trading at|quote)\b/.test(
+    cleanQuery(q),
+  );
 }
 
 function extractWeatherLocation(q: string): { city: string; cityAsked: boolean } {
@@ -303,6 +324,8 @@ function isUnsupportedFuelIntent(q: string): boolean {
 function resolveIntent(q: string): ResolvedIntent {
   const s = cleanQuery(q);
 
+  if (isGreeting(s)) return { kind: 'greeting' };
+
   if (isUnsupportedFuelIntent(s)) {
     return { kind: 'unsupported_live', topic: 'petrol' };
   }
@@ -316,23 +339,18 @@ function resolveIntent(q: string): ResolvedIntent {
     return { kind: 'weather', city: loc.city, cityAsked: loc.cityAsked };
   }
 
-  if (/\b(gold|xau|bullion)\b/.test(s)) {
-    if (
-      /\b(price|prices|spot|rate|cost|how much|trading at)\b/.test(s) ||
-      /^(gold|xau|bullion)$/.test(s)
-    ) {
-      return { kind: 'gold_price' };
-    }
+  // Live prices only when the user explicitly asks for a price/quote.
+  if (/\b(gold|xau|bullion)\b/.test(s) && wantsLivePrice(s)) {
+    return { kind: 'gold_price' };
   }
 
-  const wantsCryptoPrice =
-    /\b(price|prices|spot|rate|cost|how much|worth|trading at)\b/.test(s) ||
-    /^(bitcoin|btc|ethereum|eth|solana|sol|crypto)$/.test(s);
-  if (wantsCryptoPrice) {
+  if (wantsLivePrice(s)) {
     if (/\b(bitcoin|btc)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
     if (/\b(ethereum|eth)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'ethereum' };
     if (/\b(solana|sol)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'solana' };
-    if (/\b(crypto|cryptocurrency)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
+    if (/\b(crypto|cryptocurrency)\b/.test(s) && !/\b(news|regulation|law|ban|etf)\b/.test(s)) {
+      return { kind: 'crypto_price', cryptoId: 'bitcoin' };
+    }
   }
 
   return { kind: 'news' };
@@ -513,7 +531,7 @@ function inferCategories(q: string): Category[] {
 
 function storyQualityAdjust(title: string, description: string): number {
   let adj = 0;
-  if (TEASER_TITLE_RE.test(title)) adj -= 12;
+  if (TEASER_TITLE_RE.test(title)) adj -= 20;
   if (NEWSLETTER_BOILERPLATE_RE.test(description)) adj -= 8;
   if (CONCRETE_EVENT_RE.test(title)) adj += 6;
   if (title.length < 28 && /updates?|news$/i.test(title)) adj -= 4;
@@ -600,12 +618,20 @@ function scoreItem(
     matchScore += storyQualityAdjust(item.title, item.description || '');
     if (matchScore < 10) return { matchScore: 0, score: 0, matchedTerms: [] };
   } else {
-    // Relaxed: any primary/expanded hit in title or description is enough.
-    if (anywhereHits < 1 && titleHits < 1) {
-      const softHit = expanded.some((t) => matchesAnyVariant(hayAll, t));
-      if (!softHit) return { matchScore: 0, score: 0, matchedTerms: [] };
-      matchScore += 4;
+    // Relaxed: require a specific entity in TITLE when we have one (gold/oil/ai/…).
+    const must = titleRequiredEntities(primary, phrase);
+    if (must.length) {
+      const titleHit = must.some((t) => matchesAnyVariant(hayTitle, t));
+      if (!titleHit) return { matchScore: 0, score: 0, matchedTerms: [] };
+    } else {
+      const titleHit =
+        primary.some((t) => matchesAnyVariant(hayTitle, t)) ||
+        expanded.some((t) => matchesAnyVariant(hayTitle, t));
+      if (!titleHit && anywhereHits < 1) {
+        return { matchScore: 0, score: 0, matchedTerms: [] };
+      }
     }
+    if (anywhereHits < 1 && titleHits < 1) matchScore += 4;
     matchScore += storyQualityAdjust(item.title, item.description || '');
     if (matchScore < 4) return { matchScore: 0, score: 0, matchedTerms: [] };
   }
@@ -760,12 +786,26 @@ function buildWhatsAppText(
   brief: string,
   items: QueryResultItem[],
   weather?: WeatherPayload | null,
+  liveGold?: GoldQuote | null,
 ): string {
   const withUrls = items.filter((i) => isValidArticleUrl(i.url));
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief];
 
   if (weather && (weather.location || weather.error)) {
     parts.push('', buildWeatherBlock(weather));
+  }
+
+  if (liveGold && liveGold.price > 0) {
+    const goldLines = [
+      '*Live gold context*',
+      `*XAU/USD* - $${liveGold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} / oz`,
+    ];
+    if (liveGold.pkrPerTolaApprox && liveGold.usdPkrRate) {
+      goldLines.push(
+        `*Approx PKR/tola* - Rs ${liveGold.pkrPerTolaApprox.toLocaleString('en-PK')} (converted @ ${liveGold.usdPkrRate.toFixed(2)} PKR/USD)`,
+      );
+    }
+    parts.push('', goldLines.join('\n'));
   }
 
   if (!withUrls.length) return parts.join('\n');
@@ -820,8 +860,8 @@ function isUsefulFuelHeadline(item: NewsItem): boolean {
 function buildFuelNewsWhatsApp(topicLabel: string, oilItems: QueryResultItem[]): string {
   const withUrls = oilItems.filter((i) => isValidArticleUrl(i.url));
   const brief = withUrls.length
-    ? 'Live Pakistan pump prices are not wired yet. Here is the latest oil/fuel coverage from NewsDash (with source links).'
-    : 'Live Pakistan pump prices are not wired yet, and no fresh oil/fuel headline is in the current NewsDash window.';
+    ? 'Live Pakistan pump prices are not wired yet. Here is the latest oil/fuel coverage from NewsDash.'
+    : 'Live Pakistan pump prices are not wired yet. No oil/fuel headline is in the current NewsDash window — try again after feeds refresh.';
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief];
   if (withUrls.length) {
     const showIndex = withUrls.length > 1;
@@ -919,6 +959,67 @@ function titlesTooSimilar(a: string, b: string): boolean {
   return overlap / tb.length >= 0.55;
 }
 
+function titleHasAnyTerm(title: string, terms: string[]): boolean {
+  const hay = title.toLowerCase();
+  return terms.some((t) => t && matchesAnyVariant(hay, t));
+}
+
+function strongTopicTerms(primary: string[], q: string): string[] {
+  const cats = new Set([
+    'ai',
+    'crypto',
+    'trading',
+    'tech',
+    'research',
+    'startups',
+    'global',
+    'github',
+  ]);
+  const fromSyn = primary.filter(
+    (t) =>
+      Boolean(TOPIC_SYNONYMS[t]) ||
+      cats.has(t) ||
+      Object.values(TOPIC_SYNONYMS).some((syns) => syns.includes(t)),
+  );
+  const topic = topicFromPhrase(q);
+  if (topic) fromSyn.unshift(topic);
+  for (const c of inferCategories(q)) fromSyn.push(c);
+  return Array.from(new Set(fromSyn));
+}
+
+/** Specific entities that must appear in titles (not broad section names). */
+function titleRequiredEntities(primary: string[], q: string): string[] {
+  const broad = new Set(['tech', 'trading', 'global', 'research', 'startups', 'github']);
+  return strongTopicTerms(primary, q).filter((t) => !broad.has(t));
+}
+
+function filterByTitleEntities(
+  items: QueryResultItem[],
+  primary: string[],
+  q = '',
+): QueryResultItem[] {
+  const entities = titleRequiredEntities(primary, q);
+  if (!entities.length || !items.length) return items;
+  const hit = items.filter((i) => titleHasAnyTerm(i.title, entities));
+  return hit.length ? hit : [];
+}
+
+function buildGreetingWhatsApp(): string {
+  return [
+    '*NewsDash Analyst*',
+    '',
+    'Hi — ask any news or market question and I will reply from your NewsDash feeds with source links.',
+    '',
+    '*Examples*',
+    '• AI news',
+    '• Gold price now',
+    '• Weather in Peshawar',
+    '• Petrol price',
+    '• Iran oil',
+    '• Bitcoin today',
+  ].join('\n');
+}
+
 function isTeaserStory(item: NewsItem): boolean {
   return (
     TEASER_TITLE_RE.test(item.title) ||
@@ -969,10 +1070,10 @@ async function searchNews(
   const allowed = categories && categories.length > 0 ? categories : inferred;
 
   // Fuel/petrol natural language → search oil/fuel cluster.
-  if (
+  const fuelAsk =
     /\b(petrol|diesel|gasoline|fuel|pump)\b/.test(phrase) ||
-    (/\bgas\b/.test(phrase) && /\b(price|prices|rate|cost)\b/.test(phrase))
-  ) {
+    (/\bgas\b/.test(phrase) && /\b(price|prices|rate|cost)\b/.test(phrase));
+  if (fuelAsk) {
     primary = Array.from(new Set(['petrol', 'oil', 'fuel', ...primary]));
     expanded = Array.from(
       new Set([
@@ -1036,35 +1137,44 @@ async function searchNews(
   // Tier: category browse from inferred/dashboard categories.
   if (scored.length === 0 && allowed.length) {
     soft = true;
+    const entities = titleRequiredEntities(primary, q);
     scored = rank(
       fresh
-        .filter((i) => isValidArticleUrl(i.url) && allowed.includes(i.category))
+        .filter((i) => {
+          if (!isValidArticleUrl(i.url) || !allowed.includes(i.category)) return false;
+          if (entities.length) return titleHasAnyTerm(i.title, entities);
+          return true;
+        })
         .map((i) => ({
           ...i,
           matchScore: 6,
           score: Math.min(8, i.significance) + 2,
-          matchedTerms: allowed.slice(0, 2),
+          matchedTerms: (entities.length ? entities : allowed).slice(0, 2),
         })),
     );
   }
 
-  // Do NOT invent relevance for gibberish: only browse globally when we know the topic family.
-  if (scored.length === 0 && (topicFromPhrase(q) || allowed.length > 0)) {
+  // Global browse for known specific entities only.
+  if (scored.length === 0 && titleRequiredEntities(primary, q).length) {
     soft = true;
+    const entities = titleRequiredEntities(primary, q);
     scored = rank(
       fresh
-        .filter((i) => isValidArticleUrl(i.url))
+        .filter((i) => isValidArticleUrl(i.url) && titleHasAnyTerm(i.title, entities))
         .map((i) => ({
           ...i,
           matchScore: 5,
           score: Math.min(8, i.significance),
-          matchedTerms: primary.slice(0, 2),
+          matchedTerms: entities.slice(0, 2),
         })),
     );
   }
 
+  let items = filterByTitleEntities(pickStories(scored, limit), primary, q);
+  if (fuelAsk) items = items.filter(isUsefulFuelHeadline);
+
   return {
-    items: pickStories(scored, limit),
+    items,
     total: scored.length,
     poolSize,
     primary,
@@ -1099,6 +1209,22 @@ export async function POST(request: Request) {
   const intent = resolveIntent(q);
   const topicLabel = displayTopic(q, intent);
   const now = new Date().toISOString();
+
+  if (intent.kind === 'greeting') {
+    const whatsappText = buildGreetingWhatsApp();
+    return Response.json({
+      query: q,
+      displayTopic: topicLabel,
+      rawQuery: rawQ,
+      intent: intent.kind,
+      categories: [],
+      brief: 'Greeting',
+      items: [],
+      total: 0,
+      whatsappText,
+      lastUpdated: now,
+    });
+  }
 
   if (intent.kind === 'weather') {
     const weather = await fetchDashboardWeather(intent.city, intent.cityAsked);
@@ -1183,8 +1309,7 @@ export async function POST(request: Request) {
   if (intent.kind === 'unsupported_live') {
     // Never invent pump prices — but always answer with real oil/fuel news + source links.
     const oil = await searchNews('petrol oil fuel crude petroleum pakistan', 8, ['trading']);
-    const fuelish = oil.items.filter(isUsefulFuelHeadline);
-    const chosen = (fuelish.length ? fuelish : oil.items).slice(0, 2);
+    const chosen = oil.items.filter(isUsefulFuelHeadline).slice(0, 2);
     const whatsappText = buildFuelNewsWhatsApp(topicLabel, chosen);
     return Response.json({
       query: q,
@@ -1243,7 +1368,19 @@ export async function POST(request: Request) {
     searched.poolSize,
     searched.soft,
   );
-  let whatsappText = buildWhatsAppText(topicLabel, brief, searched.items);
+  const liveGold =
+    /\b(gold|xau|bullion)\b/i.test(newsQ) ? await fetchLiveGoldPrice() : null;
+  const briefFinal =
+    liveGold && searched.items.length === 0
+      ? 'No fresh gold headline in NewsDash right now. Live spot context is below.'
+      : brief;
+  let whatsappText = buildWhatsAppText(
+    topicLabel,
+    briefFinal,
+    searched.items,
+    null,
+    liveGold,
+  );
   const gate = assertReplyQuality({
     intent: 'news',
     whatsappText,
@@ -1267,6 +1404,7 @@ export async function POST(request: Request) {
     total: searched.total,
     poolSize: searched.poolSize,
     soft: searched.soft,
+    goldPrice: liveGold || undefined,
     whatsappText,
     linkPreview: preview,
     linkPreviewEnabled: Boolean(preview),
