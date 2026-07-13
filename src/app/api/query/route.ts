@@ -84,7 +84,10 @@ const STOP_WORDS = new Set([
 const TOPIC_SYNONYMS: Record<string, string[]> = {
   weather: ['weather', 'forecast', 'temperature', 'rainfall', 'heatwave', 'snowfall', 'monsoon'],
   gold: ['gold', 'bullion', 'xau'],
-  oil: ['oil', 'crude', 'brent', 'wti', 'petroleum'],
+  oil: ['oil', 'crude', 'brent', 'wti', 'petroleum', 'petrol', 'diesel', 'fuel', 'gasoline', 'opec'],
+  petrol: ['petrol', 'diesel', 'gasoline', 'fuel', 'oil', 'crude', 'petroleum'],
+  fuel: ['fuel', 'petrol', 'diesel', 'gasoline', 'oil', 'crude', 'petroleum'],
+  pakistan: ['pakistan', 'pakistani', 'karachi', 'islamabad', 'lahore', 'pkr'],
   bitcoin: ['bitcoin', 'btc'],
   crypto: ['crypto', 'cryptocurrency', 'bitcoin', 'ethereum', 'btc', 'eth', 'defi'],
   ethereum: ['ethereum', 'eth'],
@@ -95,6 +98,7 @@ const TOPIC_SYNONYMS: Record<string, string[]> = {
   iran: ['iran', 'iranian', 'tehran'],
   america: ['america', 'american', 'usa', 'united states'],
   conflict: ['conflict', 'war', 'fight', 'fighting', 'tensions', 'strike', 'attack'],
+  energy: ['energy', 'oil', 'gas', 'fuel', 'power', 'electricity'],
 };
 
 /** Tokens that must not match longer lookalikes (gold ≠ Goldman). */
@@ -111,10 +115,12 @@ const TOKEN_ALIASES: Record<string, string> = {
   war: 'conflict',
   fight: 'conflict',
   fighting: 'conflict',
+  gasoline: 'petrol',
+  diesel: 'petrol',
 };
 
 const WA_SUMMARY_MAX = 220;
-const WA_STORY_LIMIT = 1;
+const WA_STORY_LIMIT = 2;
 const WA_STORY_LIMIT_MAX = 2;
 const GRAMS_PER_TROY_OZ = 31.1034768;
 const GRAMS_PER_TOLA = 11.6638038;
@@ -543,6 +549,7 @@ function scoreItem(
   primary: string[],
   expanded: string[],
   phrase: string,
+  mode: 'strict' | 'relaxed' = 'strict',
 ): { matchScore: number; score: number; matchedTerms: string[] } {
   const hayTitle = item.title.toLowerCase();
   const hayDesc = (item.description || '').toLowerCase();
@@ -579,25 +586,46 @@ function scoreItem(
   const n = primary.length;
   if (n === 0) return { matchScore: 0, score: 0, matchedTerms: [] };
 
-  if (n === 1) {
-    if (titleHits < 1) return { matchScore: 0, score: 0, matchedTerms: [] };
-  } else if (n === 2) {
-    if (anywhereHits < 2 || titleHits < 1) return { matchScore: 0, score: 0, matchedTerms: [] };
+  if (mode === 'strict') {
+    if (n === 1) {
+      if (titleHits < 1) return { matchScore: 0, score: 0, matchedTerms: [] };
+    } else if (n === 2) {
+      if (anywhereHits < 2 || titleHits < 1) return { matchScore: 0, score: 0, matchedTerms: [] };
+    } else {
+      const need = Math.ceil(n * 0.6);
+      const phraseInTitle = phrase.length >= 4 && hayTitle.includes(phrase);
+      if (anywhereHits < need) return { matchScore: 0, score: 0, matchedTerms: [] };
+      if (titleHits < 1 && !phraseInTitle) return { matchScore: 0, score: 0, matchedTerms: [] };
+    }
+    matchScore += storyQualityAdjust(item.title, item.description || '');
+    if (matchScore < 10) return { matchScore: 0, score: 0, matchedTerms: [] };
   } else {
-    const need = Math.ceil(n * 0.6);
-    const phraseInTitle = phrase.length >= 4 && hayTitle.includes(phrase);
-    if (anywhereHits < need) return { matchScore: 0, score: 0, matchedTerms: [] };
-    if (titleHits < 1 && !phraseInTitle) return { matchScore: 0, score: 0, matchedTerms: [] };
+    // Relaxed: any primary/expanded hit in title or description is enough.
+    if (anywhereHits < 1 && titleHits < 1) {
+      const softHit = expanded.some((t) => matchesAnyVariant(hayAll, t));
+      if (!softHit) return { matchScore: 0, score: 0, matchedTerms: [] };
+      matchScore += 4;
+    }
+    matchScore += storyQualityAdjust(item.title, item.description || '');
+    if (matchScore < 4) return { matchScore: 0, score: 0, matchedTerms: [] };
   }
-
-  matchScore += storyQualityAdjust(item.title, item.description || '');
-  if (matchScore < 10) return { matchScore: 0, score: 0, matchedTerms: [] };
 
   let score = matchScore;
   const ageMs = Date.now() - new Date(item.publishedAt).getTime();
   if (ageMs < 6 * 60 * 60 * 1000) score += 2;
   else if (ageMs < 24 * 60 * 60 * 1000) score += 1;
   score += Math.min(2, Math.max(0, item.significance / 5));
+
+  // Prefer Pakistan-relevant fuel/oil coverage when user asked about petrol/fuel.
+  if (
+    primary.some((t) => ['petrol', 'diesel', 'fuel', 'gasoline', 'oil'].includes(t)) ||
+    expanded.includes('petrol')
+  ) {
+    if (/\b(pakistan|karachi|islamabad|lahore|ogra|pkr)\b/i.test(hayAll)) score += 8;
+    if (/\b(crude|brent|wti|opec|petroleum|oil price|fuel)\b/i.test(hayTitle)) score += 4;
+    // Demote US retail-gas betting/election noise for petrol asks.
+    if (/\b(kalshi|election day|governors ball)\b/i.test(hayAll)) score -= 10;
+  }
 
   return {
     matchScore,
@@ -659,6 +687,7 @@ function buildBrief(
   topicLabel: string,
   weather?: WeatherPayload | null,
   poolSize = 0,
+  soft = false,
 ): string {
   if (weather?.error) return weather.error;
   if (weather && !weather.error && weather.location) {
@@ -666,9 +695,14 @@ function buildBrief(
   }
   if (items.length === 0) {
     if (poolSize === 0) {
-      return `NewsDash feeds are still syncing. Open the dashboard once, wait a few seconds, then ask "${topicLabel}" again.`;
+      return `NewsDash feeds are still syncing. Open the dashboard once, wait a few seconds, then ask again.`;
     }
-    return `No strong headline match for "${topicLabel}" right now (${poolSize} stories checked). Try bitcoin, gold, AI, oil — or "bitcoin price" / "weather in Karachi".`;
+    return `No fresh matching story for "${topicLabel}" in the current NewsDash feed window.`;
+  }
+  if (soft) {
+    return items.length === 1
+      ? 'Closest matching story from NewsDash.'
+      : 'Closest matching stories from NewsDash.';
   }
   return items.length === 1
     ? 'Top matching story from NewsDash.'
@@ -775,32 +809,23 @@ function buildCryptoWhatsApp(topicLabel: string, quote: CryptoQuote): string {
   return ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief, '', block].join('\n');
 }
 
-/** Oil headline must be about crude/markets — not a random country story that mentions oil. */
-function isStrongOilHeadline(item: NewsItem): boolean {
+/** Prefer market/fuel coverage in the title — not a weak description mention. */
+function isUsefulFuelHeadline(item: NewsItem): boolean {
   const title = item.title.toLowerCase();
-  if (!/\b(oil|crude|brent|wti|petroleum|opec)\b/.test(title)) return false;
-  // Prefer market/price/supply language
-  if (/\b(price|prices|crude|brent|wti|opec|barrel|supply|demand|inventory|futures|benchmark)\b/.test(title)) {
-    return true;
-  }
-  // Pakistan-relevant fuel/oil still OK
-  if (/\b(pakistan|pkr|karachi|islamabad)\b/.test(title)) return true;
-  return false;
+  const hay = `${item.title} ${item.description || ''}`.toLowerCase();
+  if (/\b(kalshi|election day)\b/.test(hay) && /\bgas prices?\b/.test(hay)) return false;
+  return /\b(oil|crude|brent|wti|petroleum|petrol|diesel|fuel|gasoline|opec)\b/.test(title);
 }
 
-function buildUnsupportedFuelWhatsApp(topicLabel: string, oilItems: QueryResultItem[]): string {
-  const brief =
-    'Live Pakistan petrol/diesel pump prices are not wired yet. I will not invent a number.';
+function buildFuelNewsWhatsApp(topicLabel: string, oilItems: QueryResultItem[]): string {
+  const withUrls = oilItems.filter((i) => isValidArticleUrl(i.url));
+  const brief = withUrls.length
+    ? 'Live Pakistan pump prices are not wired yet. Here is the latest oil/fuel coverage from NewsDash (with source links).'
+    : 'Live Pakistan pump prices are not wired yet, and no fresh oil/fuel headline is in the current NewsDash window.';
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief];
-  const linkedOil = oilItems.filter((i) => isValidArticleUrl(i.url) && isStrongOilHeadline(i));
-  if (linkedOil.length) {
-    parts.push('', '_Related crude/oil market story:_');
-    parts.push('', formatNewsStoryBlock(linkedOil[0], 0, false));
-  } else {
-    parts.push(
-      '',
-      'Ask "oil news" for crude/market headlines, or "gold price" / "bitcoin price" for live quotes.',
-    );
+  if (withUrls.length) {
+    const showIndex = withUrls.length > 1;
+    parts.push('', withUrls.map((i, idx) => formatNewsStoryBlock(i, idx, showIndex)).join('\n\n'));
   }
   return parts.join('\n');
 }
@@ -852,14 +877,6 @@ function assertReplyQuality(payload: QualityPayload): { ok: true } | { ok: false
   }
 
   if (intent === 'news' && items && items.length > 0) {
-    const weak = items.every((i) => i.matchScore < 10);
-    if (weak) {
-      return {
-        ok: false,
-        reason:
-          'No strong headline match right now. Try a clearer topic like bitcoin, gold, AI, or oil.',
-      };
-    }
     const missingUrl = items.some((i) => !isValidArticleUrl(i.url));
     if (missingUrl) {
       return {
@@ -914,21 +931,22 @@ function pickStories(scored: QueryResultItem[], limit: number): QueryResultItem[
   if (!scored.length || limit <= 0) return [];
   const preferred = scored.filter((i) => !isTeaserStory(i));
   const pool = preferred.length ? preferred : scored;
-  const first = pool[0];
-  if (limit === 1) return [first];
-
-  const second = pool.slice(1).find((cand) => {
-    if (
-      cand.source &&
-      first.source &&
-      cand.source === first.source &&
-      titlesTooSimilar(first.title, cand.title)
-    ) {
-      return false;
-    }
-    return !titlesTooSimilar(first.title, cand.title);
-  });
-  return second ? [first, second] : [first];
+  const out: QueryResultItem[] = [pool[0]];
+  for (const cand of pool.slice(1)) {
+    if (out.length >= limit) break;
+    const tooClose = out.some(
+      (prev) =>
+        titlesTooSimilar(prev.title, cand.title) ||
+        (prev.source && cand.source && prev.source === cand.source && titlesTooSimilar(prev.title, cand.title)),
+    );
+    if (!tooClose) out.push(cand);
+  }
+  // If diversity filter was too aggressive, fill remaining slots.
+  for (const cand of pool.slice(1)) {
+    if (out.length >= limit) break;
+    if (!out.some((p) => p.id === cand.id)) out.push(cand);
+  }
+  return out;
 }
 
 async function searchNews(
@@ -942,6 +960,7 @@ async function searchNews(
   primary: string[];
   expanded: string[];
   allowed: Category[];
+  soft: boolean;
 }> {
   let primary = tokenize(q);
   let expanded = expandTerms(q);
@@ -949,40 +968,99 @@ async function searchNews(
   const inferred = inferCategories(q);
   const allowed = categories && categories.length > 0 ? categories : inferred;
 
+  // Fuel/petrol natural language → search oil/fuel cluster.
+  if (
+    /\b(petrol|diesel|gasoline|fuel|pump)\b/.test(phrase) ||
+    (/\bgas\b/.test(phrase) && /\b(price|prices|rate|cost)\b/.test(phrase))
+  ) {
+    primary = Array.from(new Set(['petrol', 'oil', 'fuel', ...primary]));
+    expanded = Array.from(
+      new Set([
+        ...expanded,
+        ...expandTerms('petrol oil fuel crude petroleum'),
+        'pakistan',
+      ]),
+    );
+  }
+
   const fresh = await loadFreshItems();
   const poolSize = fresh.length;
 
   const rank = (list: QueryResultItem[]) =>
     list.sort((a, b) => {
-      if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
       if (b.score !== a.score) return b.score - a.score;
+      if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
       return new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime();
     });
 
-  const scorePool = (terms: string[], exp: string[]) =>
+  const scorePool = (terms: string[], exp: string[], mode: 'strict' | 'relaxed', minScore: number) =>
     rank(
       fresh
         .filter((i) => isValidArticleUrl(i.url))
         .map((i) => {
-          const { matchScore, score, matchedTerms } = scoreItem(i, terms, exp, phrase);
+          const { matchScore, score, matchedTerms } = scoreItem(i, terms, exp, phrase, mode);
           return { ...i, score, matchScore, matchedTerms };
         })
-        .filter((i) => i.matchScore >= 10),
+        .filter((i) => i.matchScore >= minScore),
     );
 
-  let scored = primary.length ? scorePool(primary, expanded) : [];
+  let soft = false;
+  let scored = primary.length ? scorePool(primary, expanded, 'strict', 10) : [];
+
   if (scored.length === 0 && primary.length > 2) {
     primary = fallbackPrimary(primary);
     expanded = expandTerms(primary.join(' '));
-    scored = scorePool(primary, expanded);
+    scored = scorePool(primary, expanded, 'strict', 10);
   }
+
   if (scored.length === 0) {
     const topic = topicFromPhrase(q);
     if (topic) {
-      primary = [topic];
-      expanded = expandTerms(topic);
-      scored = scorePool(primary, expanded);
+      primary = Array.from(new Set([topic, ...primary]));
+      expanded = expandTerms([...primary, topic].join(' '));
+      scored = scorePool(primary, expanded, 'strict', 10);
     }
+  }
+
+  // Tier: relaxed matching so natural questions still get sourced news.
+  if (scored.length === 0 && (primary.length || expanded.length)) {
+    soft = true;
+    scored = scorePool(
+      primary.length ? primary : expanded.slice(0, 3),
+      expanded,
+      'relaxed',
+      4,
+    );
+  }
+
+  // Tier: category browse from inferred/dashboard categories.
+  if (scored.length === 0 && allowed.length) {
+    soft = true;
+    scored = rank(
+      fresh
+        .filter((i) => isValidArticleUrl(i.url) && allowed.includes(i.category))
+        .map((i) => ({
+          ...i,
+          matchScore: 6,
+          score: Math.min(8, i.significance) + 2,
+          matchedTerms: allowed.slice(0, 2),
+        })),
+    );
+  }
+
+  // Do NOT invent relevance for gibberish: only browse globally when we know the topic family.
+  if (scored.length === 0 && (topicFromPhrase(q) || allowed.length > 0)) {
+    soft = true;
+    scored = rank(
+      fresh
+        .filter((i) => isValidArticleUrl(i.url))
+        .map((i) => ({
+          ...i,
+          matchScore: 5,
+          score: Math.min(8, i.significance),
+          matchedTerms: primary.slice(0, 2),
+        })),
+    );
   }
 
   return {
@@ -992,6 +1070,7 @@ async function searchNews(
     primary,
     expanded,
     allowed,
+    soft,
   };
 }
 
@@ -1102,22 +1181,26 @@ export async function POST(request: Request) {
   }
 
   if (intent.kind === 'unsupported_live') {
-    const oil = await searchNews('oil crude brent', 3, ['trading']);
-    const oilItems = oil.items.filter(isStrongOilHeadline).slice(0, 1);
-    const whatsappText = buildUnsupportedFuelWhatsApp(topicLabel, oilItems);
+    // Never invent pump prices — but always answer with real oil/fuel news + source links.
+    const oil = await searchNews('petrol oil fuel crude petroleum pakistan', 8, ['trading']);
+    const fuelish = oil.items.filter(isUsefulFuelHeadline);
+    const chosen = (fuelish.length ? fuelish : oil.items).slice(0, 2);
+    const whatsappText = buildFuelNewsWhatsApp(topicLabel, chosen);
     return Response.json({
       query: q,
       displayTopic: topicLabel,
       rawQuery: rawQ,
       intent: intent.kind,
       categories: ['trading'],
-      brief: 'Live Pakistan petrol/diesel pump prices are not wired yet.',
-      items: oilItems,
-      total: oilItems.length ? 1 : 0,
+      brief:
+        'Live Pakistan pump prices are not wired yet. Latest oil/fuel coverage from NewsDash.',
+      items: chosen,
+      total: chosen.length,
       poolSize: oil.poolSize,
+      soft: oil.soft,
       whatsappText,
-      linkPreview: linkPreviewFromItems(oilItems),
-      linkPreviewEnabled: oilItems.length > 0,
+      linkPreview: linkPreviewFromItems(chosen),
+      linkPreviewEnabled: chosen.length > 0,
       lastUpdated: now,
     });
   }
@@ -1131,7 +1214,8 @@ export async function POST(request: Request) {
         : q;
 
   if (tokenize(newsQ).length === 0 && !topicFromPhrase(newsQ)) {
-    const msg = 'Please ask with a clear keyword (any topic on your NewsDash feeds).';
+    const msg =
+      'Please ask about a topic (for example AI, oil, bitcoin, Pakistan markets, or a company name).';
     return Response.json({
       query: q,
       displayTopic: topicLabel,
@@ -1152,7 +1236,13 @@ export async function POST(request: Request) {
     body.categories && body.categories.length > 0 ? body.categories : undefined,
   );
 
-  const brief = buildBrief(searched.items, topicLabel, null, searched.poolSize);
+  const brief = buildBrief(
+    searched.items,
+    topicLabel,
+    null,
+    searched.poolSize,
+    searched.soft,
+  );
   let whatsappText = buildWhatsAppText(topicLabel, brief, searched.items);
   const gate = assertReplyQuality({
     intent: 'news',
@@ -1176,6 +1266,7 @@ export async function POST(request: Request) {
     items: searched.items,
     total: searched.total,
     poolSize: searched.poolSize,
+    soft: searched.soft,
     whatsappText,
     linkPreview: preview,
     linkPreviewEnabled: Boolean(preview),
