@@ -87,6 +87,8 @@ const STOP_WORDS = new Set([
 /** Light query expansion only — never the main brain. Unknown words still search feeds. */
 const LIGHT_EXPAND: Record<string, string[]> = {
   tech: ['technology', 'software', 'hardware'],
+  technology: ['tech', 'software', 'hardware', 'ai'],
+  technologies: ['tech', 'technology', 'software'],
   btc: ['bitcoin'],
   eth: ['ethereum'],
   sol: ['solana'],
@@ -97,6 +99,16 @@ const LIGHT_EXPAND: Record<string, string[]> = {
   ml: ['ai', 'machine learning'],
   llm: ['ai'],
   gpt: ['openai', 'ai'],
+  war: ['conflict', 'strike', 'attack', 'military', 'invasion', 'bombing'],
+  wars: ['war', 'conflict', 'strike', 'attack'],
+  lebanon: ['lebanese', 'hezbollah', 'beirut', 'israel'],
+  lebanese: ['lebanon', 'hezbollah', 'beirut'],
+  iran: ['iranian', 'tehran', 'strike', 'israel'],
+  iranian: ['iran', 'tehran'],
+  israel: ['israeli', 'gaza', 'hezbollah', 'iran', 'lebanon'],
+  gaza: ['israel', 'palestinian', 'hamas'],
+  ukraine: ['ukrainian', 'russia', 'kyiv'],
+  russia: ['russian', 'ukraine', 'moscow'],
 };
 
 const ENTITY_BLOCKLIST: Record<string, string[]> = {
@@ -305,7 +317,7 @@ function scoreAgainstQuery(
   const title = item.title.toLowerCase();
   const desc = (item.description || '').toLowerCase();
   const tags = (item.tags || []).join(' ').toLowerCase();
-  const all = `${title} ${desc} ${tags}`;
+  const all = `${title} ${desc} ${tags} ${item.category} ${item.source}`.toLowerCase();
 
   let matchScore = 0;
   let titleHits = 0;
@@ -317,49 +329,64 @@ function scoreAgainstQuery(
     else if (desc.includes(phrase)) matchScore += 8;
   }
 
-  for (const t of tokens) {
-    if (hasWord(title, t)) {
-      matchScore += 14;
+  const consider = (t: string, weightTitle: number, weightOther: number) => {
+    if (!t) return;
+    if (hasWord(title, t) || (t.length >= 4 && title.includes(t))) {
+      matchScore += weightTitle;
       titleHits += 1;
       anywhereHits += 1;
       matched.push(t);
-    } else if (hasWord(desc, t) || hasWord(tags, t)) {
-      matchScore += 5;
+      return;
+    }
+    if (hasWord(desc, t) || hasWord(tags, t) || hasWord(all, t) || (t.length >= 4 && all.includes(t))) {
+      matchScore += weightOther;
       anywhereHits += 1;
       matched.push(t);
     }
-  }
+  };
+
+  for (const t of tokens) consider(t, 14, 6);
 
   for (const t of expanded) {
     if (tokens.includes(t)) continue;
-    if (hasWord(title, t)) matchScore += 3;
-    else if (hasWord(all, t)) matchScore += 1;
+    consider(t, 8, 3);
+  }
+
+  // Category boost for broad tech asks.
+  if (
+    tokens.some((t) => ['tech', 'technology', 'technologies', 'ai'].includes(t)) &&
+    (item.category === 'tech' || item.category === 'ai' || item.category === 'github')
+  ) {
+    matchScore += 10;
+    if (titleHits < 1) titleHits = 1;
+    if (anywhereHits < 1) anywhereHits = 1;
+    matched.push('tech');
   }
 
   if (!tokens.length) return { matchScore: 0, score: 0, matchedTerms: [] };
 
-  // Single-token asks must hit the title (keeps gold≠Goldman / random body matches out).
+  // Single-token: require a title/category signal (synonyms count via expanded).
   if (tokens.length === 1 && titleHits < 1) {
     return { matchScore: 0, score: 0, matchedTerms: [] };
   }
 
-  // Two-token asks need both terms somewhere and at least one title hit.
+  // Two-token: at least one title hit and one term anywhere (not both required everywhere).
   if (tokens.length === 2) {
-    if (anywhereHits < 2 || titleHits < 1) {
+    if (titleHits < 1 || anywhereHits < 1) {
       return { matchScore: 0, score: 0, matchedTerms: [] };
     }
   }
 
-  // Longer asks: majority of terms + a title hit.
+  // Longer asks: at least one title hit and ~half the terms.
   if (tokens.length > 2) {
-    const need = Math.ceil(tokens.length * 0.6);
+    const need = Math.max(1, Math.ceil(tokens.length * 0.5));
     if (anywhereHits < need || titleHits < 1) {
       return { matchScore: 0, score: 0, matchedTerms: [] };
     }
   }
 
   if (isTeaser(item)) matchScore -= 10;
-  if (/\b(announce[sd]?|launch|sue[sd]?|ban[s]?|strike|acquire|ipo|surge|crash)\b/i.test(item.title)) {
+  if (/\b(announce[sd]?|launch|sue[sd]?|ban[s]?|strike|acquire|ipo|surge|crash|attack|war)\b/i.test(item.title)) {
     matchScore += 4;
   }
 
@@ -460,24 +487,28 @@ async function retrieveAndRank(
       .sort((a, b) => b.score - a.score);
   }
 
-  // Pass 3: soft title-only fallback for remaining tokens
+  // Pass 3: soft title/category fallback for remaining tokens
   if (!scored.length) {
     const focus = tokens.filter((t) => t.length >= 3);
     const use = focus.length ? focus : tokens;
+    const exp = expandTokens(use);
     scored = fresh
       .map((i) => {
         const title = i.title.toLowerCase();
         const desc = (i.description || '').toLowerCase();
-        const hit = use.find((t) => hasWord(title, t));
-        // Only broad expandable tokens (e.g. tech→technology) may soft-match description.
+        const hay = `${title} ${desc} ${i.category} ${i.source}`.toLowerCase();
+        const hit =
+          use.find((t) => hasWord(title, t) || (t.length >= 4 && title.includes(t))) ||
+          exp.find((t) => hasWord(title, t) || (t.length >= 4 && title.includes(t)));
         const softHit =
           !hit &&
-          use.length === 1 &&
-          Boolean(LIGHT_EXPAND[use[0]]) &&
-          expandTokens(use).some((t) => hasWord(title, t) || hasWord(desc, t));
+          (use.some((t) => hay.includes(t)) ||
+            exp.some((t) => hay.includes(t)) ||
+            (use.some((t) => ['tech', 'technology', 'technologies'].includes(t)) &&
+              (i.category === 'tech' || i.category === 'ai')));
         if (!hit && !softHit) return null;
         const term = hit || use[0];
-        const matchScore = hit ? 10 + hit.length : 8;
+        const matchScore = hit ? 10 + Math.min(8, term.length) : 8;
         return {
           ...i,
           matchScore,
@@ -486,6 +517,23 @@ async function retrieveAndRank(
         } as QueryResultItem;
       })
       .filter((i): i is QueryResultItem => Boolean(i))
+      .sort((a, b) => b.score - a.score);
+  }
+
+  // Pass 4: broad category fallback for tech/technology asks
+  if (
+    !scored.length &&
+    tokens.some((t) => ['tech', 'technology', 'technologies', 'ai'].includes(t))
+  ) {
+    scored = fresh
+      .filter((i) => i.category === 'tech' || i.category === 'ai' || i.category === 'github')
+      .slice(0, 40)
+      .map((i) => ({
+        ...i,
+        matchScore: 9,
+        score: 9 + Math.min(2, i.significance / 5),
+        matchedTerms: ['tech'],
+      }))
       .sort((a, b) => b.score - a.score);
   }
 
@@ -690,7 +738,7 @@ async function buildNewsReply(
     const empty =
       poolSize === 0
         ? 'NewsDash feeds are still syncing. Please try again in a moment.'
-        : `No strong matching story for "${topicLabel}" in the current NewsDash window.`;
+        : `No strong matching story for "${topicLabel}" in your NewsDash feeds right now. Try another keyword, or add an RSS source that covers that topic.`;
     parts.push(empty);
     return { text: parts.join('\n'), answer: '', sources: [] };
   }

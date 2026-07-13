@@ -174,34 +174,62 @@ export async function getAllFeedItems(force = false): Promise<NewsItem[]> {
 
 /**
  * Fast path for WhatsApp /api/query.
- * Prefer cache; if empty, do a short bootstrap so n8n does not get pool=0 / abort.
+ * Keep the request path fast: use cache when possible, otherwise a bounded
+ * bootstrap that prioritizes global + high-priority feeds. Never block on a
+ * full catalog refresh inside the request.
  */
 export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
+  const MIN_HEALTHY = 120;
   const cached = getCached<NewsItem[]>(ALL_FEEDS_CACHE_KEY);
-  if (cached && cached.length >= 5) return cached;
+  if (cached && cached.length >= MIN_HEALTHY) return cached;
 
   const merged = new Map<string, NewsItem>();
-  for (const cat of ['ai', 'crypto', 'trading', 'github', 'tech', 'research', 'startups', 'global'] as Category[]) {
+  if (cached) for (const item of cached) merged.set(item.id, item);
+  for (const cat of ['global', 'ai', 'crypto', 'trading', 'tech', 'research', 'startups', 'github'] as Category[]) {
     const part = getCached<NewsItem[]>(`feeds_v5:${cat}`);
     if (!part) continue;
     for (const item of part) merged.set(item.id, item);
   }
-  if (merged.size >= 5) return [...merged.values()];
-
-  const prioritized = [...FEED_SOURCES].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
-  const bootstrap = await Promise.race([
-    fetchFeedsUntil(prioritized, 60).then((items) => processItems(items)),
-    new Promise<NewsItem[]>((resolve) => setTimeout(() => resolve([]), 15000)),
-  ]);
-
-  if (bootstrap.length > 0) {
-    setCache(ALL_FEEDS_CACHE_KEY, bootstrap, CACHE_TTL);
-    for (const cat of ['ai', 'crypto', 'trading', 'github', 'tech', 'research', 'startups', 'global'] as Category[]) {
-      const catItems = bootstrap.filter((i) => i.category === cat);
-      if (catItems.length) setCache(`feeds_v5:${cat}`, catItems, CACHE_TTL);
-    }
-    return bootstrap;
+  if (merged.size >= MIN_HEALTHY) {
+    const items = processItems([...merged.values()]);
+    setCache(ALL_FEEDS_CACHE_KEY, items, CACHE_TTL);
+    return items;
   }
 
+  const globalFirst = FEED_SOURCES.filter((s) => s.category === 'global')
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
+    .slice(0, 18);
+  const rest = FEED_SOURCES.filter((s) => s.category !== 'global')
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
+    .slice(0, 24);
+  const prioritized = [...globalFirst, ...rest];
+
+  let bootstrap: NewsItem[] = [];
+  try {
+    bootstrap = await Promise.race([
+      fetchFeedsUntil(prioritized, 160).then((items) => processItems(items)),
+      new Promise<NewsItem[]>((resolve) => setTimeout(() => resolve([]), 12000)),
+    ]);
+  } catch {
+    bootstrap = [];
+  }
+
+  if (bootstrap.length > 0) {
+    // Merge with whatever we already had so refreshes don't shrink the pool.
+    for (const item of bootstrap) merged.set(item.id, item);
+    const items = processItems([...merged.values()]);
+    setCache(ALL_FEEDS_CACHE_KEY, items, CACHE_TTL);
+    for (const cat of ['ai', 'crypto', 'trading', 'github', 'tech', 'research', 'startups', 'global'] as Category[]) {
+      const catItems = items.filter((i) => i.category === cat);
+      if (catItems.length) setCache(`feeds_v5:${cat}`, catItems, CACHE_TTL);
+    }
+    void getAllFeedItems(true).catch(() => undefined);
+    return items;
+  }
+
+  if (merged.size > 0) return processItems([...merged.values()]);
+
+  // Absolute last resort: short sync bootstrap via shared loader (also capped).
+  void getAllFeedItems(false).catch(() => undefined);
   return getCached<NewsItem[]>(ALL_FEEDS_CACHE_KEY) || [];
 }
