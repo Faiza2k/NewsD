@@ -24,12 +24,42 @@ type WeatherPayload = {
   condition?: string;
   updatedAt?: string;
   error?: string;
+  requestedCity?: string;
 };
 
 type LinkPreview = {
   url: string;
   title: string;
   description: string;
+};
+
+type GoldQuote = { price: number; currency: string; symbol: string };
+
+type CryptoQuote = {
+  id: string;
+  symbol: string;
+  name: string;
+  usd: number;
+  change24h?: number;
+};
+
+type IntentKind = 'weather' | 'gold_price' | 'crypto_price' | 'unsupported_live' | 'news';
+
+type ResolvedIntent =
+  | { kind: 'weather'; city: string; cityAsked: boolean }
+  | { kind: 'gold_price' }
+  | { kind: 'crypto_price'; cryptoId: string }
+  | { kind: 'unsupported_live'; topic: 'petrol' }
+  | { kind: 'news' };
+
+type QualityPayload = {
+  intent: IntentKind;
+  whatsappText: string;
+  weather?: WeatherPayload | null;
+  goldPrice?: GoldQuote | null;
+  cryptoPrice?: CryptoQuote | null;
+  items?: QueryResultItem[];
+  requestedCity?: string;
 };
 
 const STOP_WORDS = new Set([
@@ -60,7 +90,11 @@ const TOPIC_SYNONYMS: Record<string, string[]> = {
   conflict: ['conflict', 'war', 'fight', 'fighting', 'tensions', 'strike', 'attack'],
 };
 
-/** Normalize chat shorthand before search. */
+/** Tokens that must not match longer lookalikes (gold ≠ Goldman). */
+const STRICT_ENTITY_BLOCKLIST: Record<string, string[]> = {
+  gold: ['goldman', 'golden', 'goldberg', 'goldstein'],
+};
+
 const TOKEN_ALIASES: Record<string, string> = {
   btc: 'bitcoin',
   eth: 'ethereum',
@@ -83,7 +117,6 @@ function cleanQuery(q: string): string {
     .trim();
 }
 
-/** Strip chat phrasing so “Tell me about X” searches as X. */
 function extractTopicQuery(raw: string): string {
   let q = String(raw || '').trim();
   q = q.replace(/^["'`]+|["'`]+$/g, '');
@@ -111,19 +144,25 @@ function tokenize(q: string): string[] {
     .filter((t, i, arr) => arr.indexOf(t) === i);
 }
 
-
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function hasWord(hay: string, term: string): boolean {
   if (!term) return false;
-  // ASCII-safe word boundary (more reliable than \\p{L} in all runtimes)
   const re = new RegExp(`(^|[^a-z0-9_+-])${escapeRegex(term)}([^a-z0-9_+-]|$)`, 'i');
-  return re.test(hay);
+  if (!re.test(hay)) return false;
+  const blocked = STRICT_ENTITY_BLOCKLIST[term.toLowerCase()];
+  if (blocked?.length) {
+    const withoutBlocked = blocked.reduce(
+      (acc, b) => acc.replace(new RegExp(escapeRegex(b), 'gi'), ' '),
+      hay,
+    );
+    return re.test(withoutBlocked);
+  }
+  return true;
 }
 
-/** Simple plural / singular variants so “chip” matches “chips”, etc. */
 function termVariants(term: string): string[] {
   const t = term.toLowerCase();
   const out = new Set<string>([t]);
@@ -165,7 +204,6 @@ function expandTerms(q: string): string[] {
   return [...expanded];
 }
 
-/** Prefer stronger keywords when a long chat question yields no hits. */
 function fallbackPrimary(primary: string[]): string[] {
   if (primary.length <= 2) return primary;
   const known = primary.filter(
@@ -182,7 +220,6 @@ function fallbackPrimary(primary: string[]): string[] {
   return [...primary].sort((a, b) => b.length - a.length).slice(0, 2);
 }
 
-/** If the phrase maps to a known topic (e.g. machine learning → ai), use that. */
 function topicFromPhrase(q: string): string | null {
   const raw = cleanQuery(q);
   for (const [topic, syns] of Object.entries(TOPIC_SYNONYMS)) {
@@ -192,43 +229,152 @@ function topicFromPhrase(q: string): string | null {
   return null;
 }
 
-function isWeatherIntent(q: string): boolean {
+function extractWeatherLocation(q: string): { city: string; cityAsked: boolean } {
+  let s = cleanQuery(q);
+  s = s.replace(
+    /\b(weather|forecast|temperature|humidity|today|now|current|please|tell|me|about|of|in|for|the|a|an)\b/g,
+    ' ',
+  );
+  s = s.replace(/\s+/g, ' ').trim();
+  if (!s) return { city: 'London', cityAsked: false };
+  return { city: s, cityAsked: true };
+}
+
+function isUnsupportedFuelIntent(q: string): boolean {
   const s = cleanQuery(q);
-  if (/^(weather|forecast|temperature|humidity)$/.test(s)) return true;
-  if (/\b(weather|forecast|temperature|humidity)\b/.test(s)) {
-    if (/\b(lng|gas price|oil|stock|market|bitcoin|crypto|gold|ai|nvidia)\b/.test(s)) return false;
-    return true;
+  return /\b(petrol|diesel|gasoline|pump\s*price|fuel\s*price)\b/.test(s);
+}
+
+/** Single entrypoint for intent routing. */
+function resolveIntent(q: string): ResolvedIntent {
+  const s = cleanQuery(q);
+
+  if (isUnsupportedFuelIntent(s)) {
+    return { kind: 'unsupported_live', topic: 'petrol' };
   }
-  return false;
-}
 
-function isGoldPriceIntent(q: string): boolean {
-  const s = cleanQuery(q);
-  if (!/\b(gold|xau|bullion)\b/.test(s)) return false;
-  if (/\b(price|prices|spot|rate|cost|xau|how much|trading at)\b/.test(s)) return true;
-  if (/^(gold|xau|bullion)$/.test(s)) return true;
-  return false;
-}
+  if (
+    /^(weather|forecast|temperature|humidity)$/.test(s) ||
+    (/\b(weather|forecast|temperature|humidity)\b/.test(s) &&
+      !/\b(lng|gas price|oil|stock|market|bitcoin|crypto|gold|ai|nvidia)\b/.test(s))
+  ) {
+    const loc = extractWeatherLocation(q);
+    return { kind: 'weather', city: loc.city, cityAsked: loc.cityAsked };
+  }
 
-type CryptoQuote = {
-  id: string;
-  symbol: string;
-  name: string;
-  usd: number;
-  change24h?: number;
-};
+  if (/\b(gold|xau|bullion)\b/.test(s)) {
+    if (
+      /\b(price|prices|spot|rate|cost|how much|trading at)\b/.test(s) ||
+      /^(gold|xau|bullion)$/.test(s)
+    ) {
+      return { kind: 'gold_price' };
+    }
+  }
 
-function detectCryptoPriceIntent(q: string): CryptoQuote['id'] | null {
-  const s = cleanQuery(q);
-  const wantsPrice =
+  const wantsCryptoPrice =
     /\b(price|prices|spot|rate|cost|how much|worth|trading at)\b/.test(s) ||
     /^(bitcoin|btc|ethereum|eth|solana|sol|crypto)$/.test(s);
-  if (!wantsPrice) return null;
-  if (/\b(bitcoin|btc)\b/.test(s)) return 'bitcoin';
-  if (/\b(ethereum|eth)\b/.test(s)) return 'ethereum';
-  if (/\b(solana|sol)\b/.test(s)) return 'solana';
-  if (/\b(crypto|cryptocurrency)\b/.test(s)) return 'bitcoin';
-  return null;
+  if (wantsCryptoPrice) {
+    if (/\b(bitcoin|btc)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
+    if (/\b(ethereum|eth)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'ethereum' };
+    if (/\b(solana|sol)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'solana' };
+    if (/\b(crypto|cryptocurrency)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
+  }
+
+  return { kind: 'news' };
+}
+
+async function geocodeLocation(
+  name: string,
+): Promise<{ lat: number; lon: number; label: string } | null> {
+  try {
+    const url =
+      'https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name=' +
+      encodeURIComponent(name);
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const hit = Array.isArray(data?.results) ? data.results[0] : null;
+    if (!hit) return null;
+    const parts = [hit.name, hit.admin1, hit.country].filter(Boolean);
+    return {
+      lat: Number(hit.latitude),
+      lon: Number(hit.longitude),
+      label: parts.join(', '),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchDashboardWeather(
+  locationHint: string,
+  cityAsked: boolean,
+): Promise<WeatherPayload | null> {
+  try {
+    const geo = await geocodeLocation(locationHint);
+    if (cityAsked && !geo) {
+      return {
+        error: `Could not find location “${locationHint}”. Try a clearer city name.`,
+        requestedCity: locationHint,
+      };
+    }
+    const lat = geo?.lat ?? 51.5074;
+    const lon = geo?.lon ?? -0.1278;
+    const label = geo?.label ?? 'London, UK';
+    const forecastUrl =
+      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+      '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day' +
+      '&timezone=auto';
+    const wxRes = await fetch(forecastUrl, { headers: { Accept: 'application/json' } });
+    if (!wxRes.ok) return null;
+    const payload = await wxRes.json();
+    const current = payload.current ?? {};
+    const code = Number(current.weather_code ?? 3);
+    const labels: Record<number, string> = {
+      0: 'Clear sky',
+      1: 'Mainly clear',
+      2: 'Partly cloudy',
+      3: 'Overcast',
+      45: 'Foggy',
+      61: 'Slight rain',
+      63: 'Moderate rain',
+      65: 'Heavy rain',
+      80: 'Rain showers',
+      95: 'Thunderstorm',
+    };
+    return {
+      location: label,
+      requestedCity: cityAsked ? locationHint : undefined,
+      temperature: Math.round(Number(current.temperature_2m ?? 0)),
+      feelsLike: Math.round(Number(current.apparent_temperature ?? 0)),
+      humidity: Math.round(Number(current.relative_humidity_2m ?? 0)),
+      windKmh: Math.round(Number(current.wind_speed_10m ?? 0)),
+      condition: labels[code] ?? 'Variable',
+      updatedAt: current.time ?? new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchLiveGoldPrice(): Promise<GoldQuote | null> {
+  try {
+    const res = await fetch('https://api.gold-api.com/price/XAU', {
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const price = Number(data.price ?? data.ask ?? data.bid);
+    if (!Number.isFinite(price) || price <= 0) return null;
+    return {
+      price,
+      currency: String(data.currency || 'USD'),
+      symbol: 'XAU',
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function fetchCryptoPrice(id: string): Promise<CryptoQuote | null> {
@@ -262,59 +408,14 @@ async function fetchCryptoPrice(id: string): Promise<CryptoQuote | null> {
   }
 }
 
-function extractWeatherLocation(q: string): string {
-  let s = cleanQuery(q);
-  s = s.replace(/\b(weather|forecast|temperature|humidity|today|now|current|please|tell|me|about|of|in|for|the|a|an)\b/g, ' ');
-  s = s.replace(/\s+/g, ' ').trim();
-  return s || 'London';
-}
-
-async function geocodeLocation(name: string): Promise<{ lat: number; lon: number; label: string } | null> {
-  try {
-    const url =
-      'https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name=' +
-      encodeURIComponent(name);
-    const res = await fetch(url, { headers: { Accept: 'application/json' } });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const hit = Array.isArray(data?.results) ? data.results[0] : null;
-    if (!hit) return null;
-    const parts = [hit.name, hit.admin1, hit.country].filter(Boolean);
-    return {
-      lat: Number(hit.latitude),
-      lon: Number(hit.longitude),
-      label: parts.join(', '),
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function fetchLiveGoldPrice(): Promise<{ price: number; currency: string; symbol: string } | null> {
-  try {
-    const res = await fetch('https://api.gold-api.com/price/XAU', {
-      headers: { Accept: 'application/json' },
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const price = Number(data.price ?? data.ask ?? data.bid);
-    if (!Number.isFinite(price) || price <= 0) return null;
-    return {
-      price,
-      currency: String(data.currency || 'USD'),
-      symbol: 'XAU',
-    };
-  } catch {
-    return null;
-  }
-}
-
 function inferCategories(q: string): Category[] {
   const s = cleanQuery(q);
   const out = new Set<Category>();
   if (/\b(ai|llm|gpt|claude|gemini|model|agent|ml|machine learning)\b/.test(s)) out.add('ai');
   if (/\b(crypto|bitcoin|btc|ethereum|eth|solana|defi|token)\b/.test(s)) out.add('crypto');
-  if (/\b(trading|stocks?|markets?|forex|fx|gold|oil|commodit|futures|options|earnings)\b/.test(s)) out.add('trading');
+  if (/\b(trading|stocks?|markets?|forex|fx|gold|oil|commodit|futures|options|earnings)\b/.test(s)) {
+    out.add('trading');
+  }
   if (/\b(github|open source|repo|repository|library|framework)\b/.test(s)) out.add('github');
   if (/\b(research|paper|arxiv|preprint|study)\b/.test(s)) out.add('research');
   if (/\b(startup|funding|vc|venture|ipo)\b/.test(s)) out.add('startups');
@@ -323,12 +424,6 @@ function inferCategories(q: string): Category[] {
   return [...out];
 }
 
-/**
- * Accurate relevance for ANY user topic:
- * - 1 word  → must appear in the TITLE
- * - 2 words → both must appear somewhere; at least one in TITLE
- * - 3+     → majority of terms; at least one in TITLE (or full phrase in title)
- */
 function scoreItem(
   item: NewsItem,
   primary: string[],
@@ -413,7 +508,11 @@ function waSummary(desc: string): string {
   if (!clean) return 'No summary was available from the NewsDash feed for this story.';
   if (clean.length <= WA_SUMMARY_MAX) return clean;
   const sliced = clean.slice(0, WA_SUMMARY_MAX);
-  const lastStop = Math.max(sliced.lastIndexOf('. '), sliced.lastIndexOf('! '), sliced.lastIndexOf('? '));
+  const lastStop = Math.max(
+    sliced.lastIndexOf('. '),
+    sliced.lastIndexOf('! '),
+    sliced.lastIndexOf('? '),
+  );
   if (lastStop > 160) return sliced.slice(0, lastStop + 1);
   return sliced.trimEnd() + '…';
 }
@@ -424,6 +523,7 @@ function buildBrief(
   weather?: WeatherPayload | null,
   poolSize = 0,
 ): string {
+  if (weather?.error) return weather.error;
   if (weather && !weather.error && weather.location) {
     return items.length
       ? `Live conditions for ${weather.location}, plus ${items.length} related stor${items.length === 1 ? 'y' : 'ies'}.`
@@ -439,6 +539,7 @@ function buildBrief(
 }
 
 function buildWeatherBlock(weather: WeatherPayload): string {
+  if (weather.error) return `*Live weather*\n${weather.error}`;
   return [
     '*Live weather*',
     `*${weather.location || 'Unknown'}* — ${weather.condition || '—'}`,
@@ -446,7 +547,6 @@ function buildWeatherBlock(weather: WeatherPayload): string {
   ].join('\n');
 }
 
-/** URL alone on its own line → WhatsApp blue tappable hyperlink. */
 function sourceHyperlink(source: string, url: string): string {
   const label = source ? `*Source: ${source}*` : '*Source*';
   return `${label}\n${url}`;
@@ -460,7 +560,7 @@ function buildWhatsAppText(
 ): string {
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief];
 
-  if (weather && !weather.error && weather.location) {
+  if (weather && (weather.location || weather.error)) {
     parts.push('', buildWeatherBlock(weather));
   }
 
@@ -482,51 +582,195 @@ function buildWhatsAppText(
   return parts.join('\n');
 }
 
-/** Search the same feed pool the dashboard uses. */
+function buildGoldWhatsApp(q: string, gold: GoldQuote): string {
+  const brief = 'Live gold spot price from NewsDash market data.';
+  const block = [
+    '*Live gold price*',
+    `*XAU/USD* — $${gold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} per oz`,
+    `_Updated just now_`,
+  ].join('\n');
+  return ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief, '', block].join('\n');
+}
+
+function buildCryptoWhatsApp(q: string, quote: CryptoQuote): string {
+  const ch =
+    quote.change24h == null
+      ? ''
+      : ` · 24h ${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}%`;
+  const brief = `Live ${quote.name} price from NewsDash market data.`;
+  const block = [
+    `*Live ${quote.name} price*`,
+    `*${quote.symbol}/USD* — $${quote.usd.toLocaleString('en-US', {
+      maximumFractionDigits: quote.usd >= 100 ? 2 : 4,
+    })}${ch}`,
+    `_Updated just now_`,
+  ].join('\n');
+  return ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief, '', block].join('\n');
+}
+
+function buildUnsupportedFuelWhatsApp(q: string, oilItems: QueryResultItem[]): string {
+  const brief =
+    'Live Pakistan petrol/diesel pump prices are not wired yet. I will not invent a number.';
+  const parts = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief];
+  if (oilItems.length) {
+    parts.push('', '_Related oil coverage from NewsDash:_');
+    const blocks = oilItems.map((i, idx) => {
+      const when = formatTime(i.publishedAt);
+      return [
+        `*${idx + 1}. ${i.title.trim()}*`,
+        when ? `_Published ${when}_` : '',
+        waSummary(i.description || ''),
+        i.url ? sourceHyperlink(i.source, i.url) : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    });
+    parts.push('', blocks.join('\n\n'));
+  } else {
+    parts.push(
+      '',
+      'Ask “oil news” for crude/market headlines, or “gold price” / “bitcoin price” for live quotes.',
+    );
+  }
+  return parts.join('\n');
+}
+
+function fallbackWhatsApp(q: string, reason: string): string {
+  return ['*NewsDash Analyst*', '', `*Topic:* ${q}`, reason].join('\n');
+}
+
+/** Quality gate: never send wrong-city weather or empty “successful” prices. */
+function assertReplyQuality(payload: QualityPayload): { ok: true } | { ok: false; reason: string } {
+  const { intent, whatsappText, weather, goldPrice, cryptoPrice, items, requestedCity } = payload;
+
+  if (!whatsappText || whatsappText.length < 20) {
+    return { ok: false, reason: 'Reply was empty. Please ask again.' };
+  }
+
+  if (intent === 'weather') {
+    if (weather?.error) return { ok: true };
+    if (!weather?.location || weather.temperature == null) {
+      return { ok: false, reason: 'Could not fetch live weather right now. Please try again.' };
+    }
+    if (requestedCity) {
+      const cityToken = requestedCity.toLowerCase().split(/\s+/)[0];
+      if (cityToken && cityToken.length >= 3) {
+        const loc = (weather.location || '').toLowerCase();
+        if (!loc.includes(cityToken)) {
+          return {
+            ok: false,
+            reason: `Could not confirm weather for “${requestedCity}”. Try a clearer city name.`,
+          };
+        }
+      }
+    }
+  }
+
+  if (intent === 'gold_price') {
+    if (!goldPrice || !(goldPrice.price > 0)) {
+      return { ok: false, reason: 'Live gold price is temporarily unavailable. Please try again.' };
+    }
+    if (!/\$|usd|xau/i.test(whatsappText)) {
+      return { ok: false, reason: 'Live gold price is temporarily unavailable. Please try again.' };
+    }
+  }
+
+  if (intent === 'crypto_price') {
+    if (!cryptoPrice || !(cryptoPrice.usd > 0)) {
+      return { ok: false, reason: 'Live crypto price is temporarily unavailable. Please try again.' };
+    }
+  }
+
+  if (intent === 'news' && items && items.length > 0) {
+    const weak = items.every((i) => i.matchScore < 10);
+    if (weak) {
+      return {
+        ok: false,
+        reason:
+          'No strong headline match right now. Try a clearer topic like bitcoin, gold, AI, or oil.',
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
 async function loadFreshItems(): Promise<NewsItem[]> {
   const all = await getFeedItemsForQuery().catch(() => [] as NewsItem[]);
   return all.filter((item) => item?.id && isFresh(item.publishedAt));
 }
 
-async function fetchDashboardWeather(locationHint = 'London'): Promise<WeatherPayload | null> {
-  try {
-    const geo = await geocodeLocation(locationHint);
-    const lat = geo?.lat ?? 51.5074;
-    const lon = geo?.lon ?? -0.1278;
-    const label = geo?.label ?? 'London, UK';
-    const forecastUrl =
-      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-      '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day' +
-      '&timezone=auto';
-    const wxRes = await fetch(forecastUrl, { headers: { Accept: 'application/json' } });
-    if (!wxRes.ok) return null;
-    const payload = await wxRes.json();
-    const current = payload.current ?? {};
-    const code = Number(current.weather_code ?? 3);
-    const labels: Record<number, string> = {
-      0: 'Clear sky',
-      1: 'Mainly clear',
-      2: 'Partly cloudy',
-      3: 'Overcast',
-      45: 'Foggy',
-      61: 'Slight rain',
-      63: 'Moderate rain',
-      65: 'Heavy rain',
-      80: 'Rain showers',
-      95: 'Thunderstorm',
-    };
-    return {
-      location: label,
-      temperature: Math.round(Number(current.temperature_2m ?? 0)),
-      feelsLike: Math.round(Number(current.apparent_temperature ?? 0)),
-      humidity: Math.round(Number(current.relative_humidity_2m ?? 0)),
-      windKmh: Math.round(Number(current.wind_speed_10m ?? 0)),
-      condition: labels[code] ?? 'Variable',
-      updatedAt: current.time ?? new Date().toISOString(),
-    };
-  } catch {
-    return null;
+async function searchNews(
+  q: string,
+  limit: number,
+  categories?: Category[],
+): Promise<{
+  items: QueryResultItem[];
+  total: number;
+  poolSize: number;
+  primary: string[];
+  expanded: string[];
+  allowed: Category[];
+}> {
+  let primary = tokenize(q);
+  let expanded = expandTerms(q);
+  const phrase = cleanQuery(q);
+  const inferred = inferCategories(q);
+  const allowed = categories && categories.length > 0 ? categories : inferred;
+
+  const fresh = await loadFreshItems();
+  const poolSize = fresh.length;
+
+  const rank = (list: QueryResultItem[]) =>
+    list.sort((a, b) => {
+      if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+      if (b.score !== a.score) return b.score - a.score;
+      return new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime();
+    });
+
+  const scorePool = (terms: string[], exp: string[]) =>
+    rank(
+      fresh
+        .map((i) => {
+          const { matchScore, score } = scoreItem(i, terms, exp, phrase);
+          return { ...i, score, matchScore };
+        })
+        .filter((i) => i.matchScore >= 10),
+    );
+
+  let scored = primary.length ? scorePool(primary, expanded) : [];
+  if (scored.length === 0 && primary.length > 2) {
+    primary = fallbackPrimary(primary);
+    expanded = expandTerms(primary.join(' '));
+    scored = scorePool(primary, expanded);
   }
+  if (scored.length === 0) {
+    const topic = topicFromPhrase(q);
+    if (topic) {
+      primary = [topic];
+      expanded = expandTerms(topic);
+      scored = scorePool(primary, expanded);
+    }
+  }
+
+  return {
+    items: scored.slice(0, limit),
+    total: scored.length,
+    poolSize,
+    primary,
+    expanded,
+    allowed,
+  };
+}
+
+function linkPreviewFromItems(items: QueryResultItem[]): LinkPreview | undefined {
+  const top = items[0];
+  if (!top?.url) return undefined;
+  return {
+    url: top.url,
+    title: top.title.slice(0, 100),
+    description: waSummary(top.description || '').slice(0, 140),
+  };
 }
 
 export async function POST(request: Request) {
@@ -538,190 +782,161 @@ export async function POST(request: Request) {
   const rawQ = body.q.trim();
   const q = extractTopicQuery(rawQ);
   const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT);
-  let primary = tokenize(q);
-  let expanded = expandTerms(q);
-  const phrase = cleanQuery(q);
-  const weatherIntent = isWeatherIntent(q);
-  const goldPriceIntent = isGoldPriceIntent(q);
-  const cryptoId = detectCryptoPriceIntent(q);
+  const intent = resolveIntent(q);
+  const now = new Date().toISOString();
 
-  if (primary.length === 0 && !weatherIntent && !goldPriceIntent && !cryptoId) {
+  if (intent.kind === 'weather') {
+    const weather = await fetchDashboardWeather(intent.city, intent.cityAsked);
+    const brief = buildBrief([], q, weather, 0);
+    let whatsappText = buildWhatsAppText(q, brief, [], weather);
+    const gate = assertReplyQuality({
+      intent: 'weather',
+      whatsappText,
+      weather,
+      requestedCity: intent.cityAsked ? intent.city : undefined,
+    });
+    if (!gate.ok) {
+      whatsappText = fallbackWhatsApp(q, gate.reason);
+    }
+    return Response.json({
+      query: q,
+      rawQuery: rawQ,
+      intent: intent.kind,
+      categories: [],
+      weather: weather ?? undefined,
+      brief,
+      items: [],
+      total: weather && !weather.error ? 1 : 0,
+      whatsappText,
+      lastUpdated: now,
+    });
+  }
+
+  if (intent.kind === 'gold_price') {
+    const gold = await fetchLiveGoldPrice();
+    if (gold) {
+      let whatsappText = buildGoldWhatsApp(q, gold);
+      const gate = assertReplyQuality({
+        intent: 'gold_price',
+        whatsappText,
+        goldPrice: gold,
+      });
+      if (!gate.ok) whatsappText = fallbackWhatsApp(q, gate.reason);
+      return Response.json({
+        query: q,
+        rawQuery: rawQ,
+        intent: intent.kind,
+        categories: ['trading'],
+        brief: 'Live gold spot price from NewsDash market data.',
+        items: [],
+        total: 1,
+        whatsappText,
+        goldPrice: gold,
+        lastUpdated: now,
+      });
+    }
+  }
+
+  if (intent.kind === 'crypto_price') {
+    const quote = await fetchCryptoPrice(intent.cryptoId);
+    if (quote) {
+      let whatsappText = buildCryptoWhatsApp(q, quote);
+      const gate = assertReplyQuality({
+        intent: 'crypto_price',
+        whatsappText,
+        cryptoPrice: quote,
+      });
+      if (!gate.ok) whatsappText = fallbackWhatsApp(q, gate.reason);
+      return Response.json({
+        query: q,
+        rawQuery: rawQ,
+        intent: intent.kind,
+        categories: ['crypto'],
+        brief: `Live ${quote.name} price from NewsDash market data.`,
+        items: [],
+        total: 1,
+        whatsappText,
+        cryptoPrice: quote,
+        lastUpdated: now,
+      });
+    }
+  }
+
+  if (intent.kind === 'unsupported_live') {
+    const oil = await searchNews('oil crude', 1, ['trading']);
+    const oilItems = oil.items.filter((i) =>
+      /\b(oil|crude|brent|wti|petroleum)\b/i.test(i.title),
+    );
+    const whatsappText = buildUnsupportedFuelWhatsApp(q, oilItems.slice(0, 1));
+    return Response.json({
+      query: q,
+      rawQuery: rawQ,
+      intent: intent.kind,
+      categories: ['trading'],
+      brief: 'Live Pakistan petrol/diesel pump prices are not wired yet.',
+      items: oilItems.slice(0, 1),
+      total: oilItems.length ? 1 : 0,
+      poolSize: oil.poolSize,
+      whatsappText,
+      lastUpdated: now,
+    });
+  }
+
+  // News from NewsDash dashboard feeds (also gold/crypto fallback if live quote failed)
+  const newsQ =
+    intent.kind === 'gold_price'
+      ? 'gold'
+      : intent.kind === 'crypto_price'
+        ? intent.cryptoId
+        : q;
+
+  if (tokenize(newsQ).length === 0 && !topicFromPhrase(newsQ)) {
     const msg = 'Please ask with a clear keyword (any topic on your NewsDash feeds).';
     return Response.json({
       query: q,
       rawQuery: rawQ,
+      intent: 'news',
       categories: [],
       brief: msg,
       items: [],
       total: 0,
       whatsappText: buildWhatsAppText(q, msg, []),
-      lastUpdated: new Date().toISOString(),
+      lastUpdated: now,
     });
   }
 
-  // Live crypto spot (fast path for price questions)
-  if (cryptoId) {
-    const quote = await fetchCryptoPrice(cryptoId);
-    if (quote) {
-      const ch =
-        quote.change24h == null
-          ? ''
-          : ` · 24h ${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}%`;
-      const brief = `Live ${quote.name} price from NewsDash market data.`;
-      const block = [
-        `*Live ${quote.name} price*`,
-        `*${quote.symbol}/USD* — $${quote.usd.toLocaleString('en-US', { maximumFractionDigits: quote.usd >= 100 ? 2 : 4 })}${ch}`,
-        `_Updated just now_`,
-      ].join('\n');
-      const whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief, '', block].join('\n');
-      return Response.json({
-        query: q,
-        rawQuery: rawQ,
-        categories: ['crypto'],
-        brief,
-        items: [],
-        total: 1,
-        whatsappText,
-        cryptoPrice: quote,
-        lastUpdated: new Date().toISOString(),
-      });
-    }
+  const searched = await searchNews(
+    newsQ,
+    limit,
+    body.categories && body.categories.length > 0 ? body.categories : undefined,
+  );
+
+  const brief = buildBrief(searched.items, q, null, searched.poolSize);
+  let whatsappText = buildWhatsAppText(q, brief, searched.items);
+  const gate = assertReplyQuality({
+    intent: 'news',
+    whatsappText,
+    items: searched.items,
+  });
+  if (!gate.ok && searched.items.length > 0) {
+    whatsappText = fallbackWhatsApp(q, gate.reason);
   }
 
-  // Live gold spot price (same source as Market Telemetry)
-  if (goldPriceIntent) {
-    const gold = await fetchLiveGoldPrice();
-    if (gold) {
-      const brief = `Live gold spot price from NewsDash market data.`;
-      const block = [
-        '*Live gold price*',
-        `*XAU/USD* — $${gold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} per oz`,
-        `_Updated just now_`,
-      ].join('\n');
-      const whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief, '', block].join('\n');
-      return Response.json({
-        query: q,
-        rawQuery: rawQ,
-        categories: ['trading'],
-        brief,
-        items: [],
-        total: 1,
-        whatsappText,
-        goldPrice: gold,
-        lastUpdated: new Date().toISOString(),
-      });
-    }
-  }
-
-  const locationHint = weatherIntent ? extractWeatherLocation(q) : 'London';
-  const weatherPromise = weatherIntent ? fetchDashboardWeather(locationHint) : Promise.resolve(null);
-  const pureWeather =
-    weatherIntent &&
-    (/^(weather|forecast|temperature|humidity)$/.test(phrase) ||
-      Boolean(extractWeatherLocation(q)));
-
-  let items: QueryResultItem[] = [];
-  let scoredTotal = 0;
-  let allowed: Category[] = body.categories && body.categories.length > 0 ? body.categories : [];
-
-  if (!pureWeather) {
-    const inferred = inferCategories(q);
-    allowed = body.categories && body.categories.length > 0 ? body.categories : inferred;
-
-    const fresh = await loadFreshItems();
-    const poolSize = fresh.length;
-
-    const rank = (list: QueryResultItem[]) =>
-      list.sort((a, b) => {
-        if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
-        if (b.score !== a.score) return b.score - a.score;
-        return new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime();
-      });
-
-    const scorePool = (terms: string[], exp: string[]) =>
-      rank(
-        fresh
-          .map((i) => {
-            const { matchScore, score } = scoreItem(i, terms, exp, phrase);
-            return { ...i, score, matchScore };
-          })
-          .filter((i) => i.matchScore >= 10),
-      );
-
-    let scored = scorePool(primary, expanded);
-    if (scored.length === 0 && primary.length > 2) {
-      primary = fallbackPrimary(primary);
-      expanded = expandTerms(primary.join(' '));
-      scored = scorePool(primary, expanded);
-    }
-    if (scored.length === 0) {
-      const topic = topicFromPhrase(q);
-      if (topic) {
-        primary = [topic];
-        expanded = expandTerms(topic);
-        scored = scorePool(primary, expanded);
-      }
-    }
-
-    scoredTotal = scored.length;
-    items = scored.slice(0, limit);
-
-    const weather = await weatherPromise;
-    const brief = buildBrief(items, q, weather, poolSize);
-    const whatsappText = buildWhatsAppText(q, brief, items, weather);
-
-    const top = items[0];
-    const preview: LinkPreview | undefined =
-      top?.url
-        ? {
-            url: top.url,
-            title: top.title.slice(0, 100),
-            description: waSummary(top.description || '').slice(0, 140),
-          }
-        : undefined;
-
-    return Response.json({
-      query: q,
-      rawQuery: rawQ,
-      categories: allowed,
-      terms: { primary, expanded },
-      weather: weather ?? undefined,
-      brief,
-      items,
-      total: scoredTotal,
-      poolSize,
-      whatsappText,
-      linkPreview: preview,
-      linkPreviewEnabled: true,
-      lastUpdated: new Date().toISOString(),
-    });
-  }
-
-  const weather = await weatherPromise;
-  const brief = buildBrief(items, q, weather, 0);
-  const whatsappText = buildWhatsAppText(q, brief, items, weather);
-
-  const top = items[0];
-  const preview: LinkPreview | undefined =
-    top?.url
-      ? {
-          url: top.url,
-          title: top.title.slice(0, 100),
-          description: waSummary(top.description || '').slice(0, 140),
-        }
-      : undefined;
+  const preview = linkPreviewFromItems(searched.items);
 
   return Response.json({
     query: q,
-    categories: allowed,
-    terms: { primary, expanded },
-    weather: weather ?? undefined,
+    rawQuery: rawQ,
+    intent: 'news',
+    categories: searched.allowed,
+    terms: { primary: searched.primary, expanded: searched.expanded },
     brief,
-    items,
-    total: scoredTotal,
+    items: searched.items,
+    total: searched.total,
+    poolSize: searched.poolSize,
     whatsappText,
     linkPreview: preview,
     linkPreviewEnabled: true,
-    lastUpdated: new Date().toISOString(),
+    lastUpdated: now,
   });
 }
