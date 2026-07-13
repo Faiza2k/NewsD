@@ -228,7 +228,7 @@ function detectPlugin(q: string): Plugin {
       .replace(/\s+/g, ' ')
       .trim();
     if (!city) return { kind: 'weather', city: 'London', cityAsked: false };
-    return { kind: 'weather', city, cityAsked: true };
+    return { kind: 'weather', city: normalizeCityQuery(city), cityAsked: true };
   }
 
   if (isPriceClarifyQuery(s)) {
