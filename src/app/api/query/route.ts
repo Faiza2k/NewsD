@@ -290,7 +290,7 @@ function extractWeatherLocation(q: string): { city: string; cityAsked: boolean }
 
 function isUnsupportedFuelIntent(q: string): boolean {
   const s = cleanQuery(q);
-  return /\b(petrol|diesel|gasoline|pump\s*price|fuel\s*price)\b/.test(s);
+  return /\b(petrol|diesel|gasoline|gas\s*price|pump\s*price|fuel\s*price)\b/.test(s);
 }
 
 /** Single entrypoint for intent routing. */
