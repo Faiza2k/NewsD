@@ -13,6 +13,7 @@ type QueryRequest = {
 type QueryResultItem = NewsItem & {
   score: number;
   matchScore: number;
+  matchedTerms?: string[];
 };
 
 type WeatherPayload = {
@@ -33,7 +34,13 @@ type LinkPreview = {
   description: string;
 };
 
-type GoldQuote = { price: number; currency: string; symbol: string };
+type GoldQuote = {
+  price: number;
+  currency: string;
+  symbol: string;
+  pkrPerTolaApprox?: number;
+  usdPkrRate?: number;
+};
 
 type CryptoQuote = {
   id: string;
@@ -106,8 +113,18 @@ const TOKEN_ALIASES: Record<string, string> = {
   fighting: 'conflict',
 };
 
-const WA_SUMMARY_MAX = 420;
-const WA_STORY_LIMIT = 2;
+const WA_SUMMARY_MAX = 220;
+const WA_STORY_LIMIT = 1;
+const WA_STORY_LIMIT_MAX = 2;
+const GRAMS_PER_TROY_OZ = 31.1034768;
+const GRAMS_PER_TOLA = 11.6638038;
+
+const TEASER_TITLE_RE =
+  /\b(latest (ai |tech )?news|updates? we announced|the download|round-?up|weekly roundup|daily digest|here('?s| are)|top \d+|things to know|what we announced|newsletter)\b/i;
+const NEWSLETTER_BOILERPLATE_RE =
+  /this is today'?s edition|weekday newsletter|daily dose of what'?s going on|subscribe to|read more on our (site|blog)|sign up for/i;
+const CONCRETE_EVENT_RE =
+  /\b(announce[sd]?|launch(es|ed)?|rais(es|ed)|cut[s]?|sue[sd]?|ban[s]?|approv(es|ed)|beat[s]?|miss(es|ed)?|surge[sd]?|crash(es|ed)?|acquire[sd]?|ipo|partners?|wins?|loses?|warns?|halts?|resumes?|strikes?|attacks?|signs?|passes?|rejects?)\b/i;
 
 function cleanQuery(q: string): string {
   return q
@@ -229,6 +246,37 @@ function topicFromPhrase(q: string): string | null {
   return null;
 }
 
+function titleCaseWords(s: string): string {
+  return s
+    .split(/\s+/g)
+    .filter(Boolean)
+    .map((w) => (w.length <= 3 && /^(ai|btc|eth|usd|pkr|fx)$/i.test(w) ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)))
+    .join(' ');
+}
+
+/** Short label for WhatsApp *Topic:* line (not the raw user sentence). */
+function displayTopic(q: string, intent: ResolvedIntent): string {
+  if (intent.kind === 'weather') {
+    return intent.cityAsked ? `${titleCaseWords(intent.city)} weather` : 'Weather';
+  }
+  if (intent.kind === 'gold_price') return 'Gold price';
+  if (intent.kind === 'crypto_price') {
+    const names: Record<string, string> = {
+      bitcoin: 'Bitcoin price',
+      ethereum: 'Ethereum price',
+      solana: 'Solana price',
+    };
+    return names[intent.cryptoId] || 'Crypto price';
+  }
+  if (intent.kind === 'unsupported_live') return 'Petrol price';
+
+  const topic = topicFromPhrase(q);
+  if (topic) return titleCaseWords(topic);
+  const tokens = tokenize(q);
+  if (tokens.length) return titleCaseWords(tokens.slice(0, 4).join(' '));
+  return titleCaseWords(cleanQuery(q).slice(0, 40)) || 'News';
+}
+
 function extractWeatherLocation(q: string): { city: string; cityAsked: boolean } {
   let s = cleanQuery(q);
   s = s.replace(
@@ -315,7 +363,7 @@ async function fetchDashboardWeather(
     const geo = await geocodeLocation(locationHint);
     if (cityAsked && !geo) {
       return {
-        error: `Could not find location “${locationHint}”. Try a clearer city name.`,
+        error: `Could not find location "${locationHint}". Try a clearer city name.`,
         requestedCity: locationHint,
       };
     }
@@ -358,20 +406,53 @@ async function fetchDashboardWeather(
   }
 }
 
+async function fetchUsdPkrRate(): Promise<number | null> {
+  const endpoints = [
+    'https://open.er-api.com/v6/latest/USD',
+    'https://api.exchangerate-api.com/v4/latest/USD',
+  ];
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, { headers: { Accept: 'application/json' } });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const rate = Number(data?.rates?.PKR);
+      if (Number.isFinite(rate) && rate > 0) return rate;
+    } catch {
+      // try next endpoint
+    }
+  }
+  return null;
+}
+
+function approxPkrPerTola(usdPerOz: number, usdPkr: number): number {
+  const usdPerGram = usdPerOz / GRAMS_PER_TROY_OZ;
+  const usdPerTola = usdPerGram * GRAMS_PER_TOLA;
+  return usdPerTola * usdPkr;
+}
+
 async function fetchLiveGoldPrice(): Promise<GoldQuote | null> {
   try {
-    const res = await fetch('https://api.gold-api.com/price/XAU', {
-      headers: { Accept: 'application/json' },
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
+    const [goldRes, usdPkr] = await Promise.all([
+      fetch('https://api.gold-api.com/price/XAU', {
+        headers: { Accept: 'application/json' },
+      }),
+      fetchUsdPkrRate(),
+    ]);
+    if (!goldRes.ok) return null;
+    const data = await goldRes.json();
     const price = Number(data.price ?? data.ask ?? data.bid);
     if (!Number.isFinite(price) || price <= 0) return null;
-    return {
+    const quote: GoldQuote = {
       price,
       currency: String(data.currency || 'USD'),
       symbol: 'XAU',
     };
+    if (usdPkr) {
+      quote.usdPkrRate = usdPkr;
+      quote.pkrPerTolaApprox = Math.round(approxPkrPerTola(price, usdPkr));
+    }
+    return quote;
   } catch {
     return null;
   }
@@ -424,12 +505,45 @@ function inferCategories(q: string): Category[] {
   return [...out];
 }
 
+function storyQualityAdjust(title: string, description: string): number {
+  let adj = 0;
+  if (TEASER_TITLE_RE.test(title)) adj -= 12;
+  if (NEWSLETTER_BOILERPLATE_RE.test(description)) adj -= 8;
+  if (CONCRETE_EVENT_RE.test(title)) adj += 6;
+  if (title.length < 28 && /updates?|news$/i.test(title)) adj -= 4;
+  // Prefer specific headlines over vague blog indexes
+  if (/\b(we announced|our blog|our latest)\b/i.test(title)) adj -= 6;
+  return adj;
+}
+
+function collectMatchedTerms(
+  item: NewsItem,
+  primary: string[],
+  expanded: string[],
+): string[] {
+  const hayTitle = item.title.toLowerCase();
+  const hayDesc = (item.description || '').toLowerCase();
+  const hits: string[] = [];
+  for (const t of primary) {
+    if (matchesAnyVariant(hayTitle, t) || matchesAnyVariant(hayDesc, t)) hits.push(t);
+  }
+  if (!hits.length) {
+    for (const t of expanded) {
+      if (matchesAnyVariant(hayTitle, t)) {
+        hits.push(t);
+        break;
+      }
+    }
+  }
+  return hits.slice(0, 3);
+}
+
 function scoreItem(
   item: NewsItem,
   primary: string[],
   expanded: string[],
   phrase: string,
-): { matchScore: number; score: number } {
+): { matchScore: number; score: number; matchedTerms: string[] } {
   const hayTitle = item.title.toLowerCase();
   const hayDesc = (item.description || '').toLowerCase();
   const hayTags = (item.tags || []).join(' ').toLowerCase();
@@ -463,20 +577,21 @@ function scoreItem(
   }
 
   const n = primary.length;
-  if (n === 0) return { matchScore: 0, score: 0 };
+  if (n === 0) return { matchScore: 0, score: 0, matchedTerms: [] };
 
   if (n === 1) {
-    if (titleHits < 1) return { matchScore: 0, score: 0 };
+    if (titleHits < 1) return { matchScore: 0, score: 0, matchedTerms: [] };
   } else if (n === 2) {
-    if (anywhereHits < 2 || titleHits < 1) return { matchScore: 0, score: 0 };
+    if (anywhereHits < 2 || titleHits < 1) return { matchScore: 0, score: 0, matchedTerms: [] };
   } else {
     const need = Math.ceil(n * 0.6);
     const phraseInTitle = phrase.length >= 4 && hayTitle.includes(phrase);
-    if (anywhereHits < need) return { matchScore: 0, score: 0 };
-    if (titleHits < 1 && !phraseInTitle) return { matchScore: 0, score: 0 };
+    if (anywhereHits < need) return { matchScore: 0, score: 0, matchedTerms: [] };
+    if (titleHits < 1 && !phraseInTitle) return { matchScore: 0, score: 0, matchedTerms: [] };
   }
 
-  if (matchScore < 10) return { matchScore: 0, score: 0 };
+  matchScore += storyQualityAdjust(item.title, item.description || '');
+  if (matchScore < 10) return { matchScore: 0, score: 0, matchedTerms: [] };
 
   let score = matchScore;
   const ageMs = Date.now() - new Date(item.publishedAt).getTime();
@@ -484,28 +599,48 @@ function scoreItem(
   else if (ageMs < 24 * 60 * 60 * 1000) score += 1;
   score += Math.min(2, Math.max(0, item.significance / 5));
 
-  return { matchScore, score };
+  return {
+    matchScore,
+    score,
+    matchedTerms: collectMatchedTerms(item, primary, expanded),
+  };
 }
 
 function formatTime(iso: string): string {
   try {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return '';
-    return d.toLocaleString('en-GB', {
+    const stamp = d.toLocaleString('en-GB', {
+      timeZone: 'Asia/Karachi',
       day: '2-digit',
       month: 'short',
       hour: '2-digit',
       minute: '2-digit',
       hour12: false,
     });
+    return `${stamp} PKT`;
   } catch {
     return '';
   }
 }
 
+function stripBoilerplate(desc: string): string {
+  let s = desc.replace(/\s+/g, ' ').trim();
+  s = s.replace(NEWSLETTER_BOILERPLATE_RE, ' ');
+  s = s.replace(/^(this is today'?s edition[^.]*\.\s*)+/i, '');
+  s = s.replace(
+    /^our weekday newsletter that provides a daily dose of what'?s going on in the world of technology\.?\s*/i,
+    '',
+  );
+  s = s.replace(/\|\s*Photo:[^.]*\.?/gi, ' ');
+  s = s.replace(/Photo:\s*[^.]*\.\s*/gi, ' ');
+  s = s.replace(/\s+/g, ' ').trim();
+  return s;
+}
+
 function waSummary(desc: string): string {
-  const clean = desc.replace(/\s+/g, ' ').trim();
-  if (!clean) return 'No summary was available from the NewsDash feed for this story.';
+  const clean = stripBoilerplate(desc);
+  if (!clean) return 'Open the source link for the full publisher article.';
   if (clean.length <= WA_SUMMARY_MAX) return clean;
   const sliced = clean.slice(0, WA_SUMMARY_MAX);
   const lastStop = Math.max(
@@ -513,37 +648,39 @@ function waSummary(desc: string): string {
     sliced.lastIndexOf('! '),
     sliced.lastIndexOf('? '),
   );
-  if (lastStop > 160) return sliced.slice(0, lastStop + 1);
-  return sliced.trimEnd() + '…';
+  if (lastStop > 80) return sliced.slice(0, lastStop + 1);
+  const lastSpace = sliced.lastIndexOf(' ');
+  if (lastSpace > 80) return sliced.slice(0, lastSpace).trimEnd() + '...';
+  return sliced.trimEnd() + '...';
 }
 
 function buildBrief(
   items: QueryResultItem[],
-  q: string,
+  topicLabel: string,
   weather?: WeatherPayload | null,
   poolSize = 0,
 ): string {
   if (weather?.error) return weather.error;
   if (weather && !weather.error && weather.location) {
-    return items.length
-      ? `Live conditions for ${weather.location}, plus ${items.length} related stor${items.length === 1 ? 'y' : 'ies'}.`
-      : `Live conditions for ${weather.location} from NewsDash.`;
+    return `Live conditions for ${weather.location}.`;
   }
   if (items.length === 0) {
     if (poolSize === 0) {
-      return `NewsDash feeds are still syncing. Open the dashboard once, wait a few seconds, then ask “${q}” again.`;
+      return `NewsDash feeds are still syncing. Open the dashboard once, wait a few seconds, then ask "${topicLabel}" again.`;
     }
-    return `No strong headline match for “${q}” right now (${poolSize} stories checked). Try a clearer topic like bitcoin, gold, AI, oil — or ask “bitcoin price” / “weather in Karachi” for live data.`;
+    return `No strong headline match for "${topicLabel}" right now (${poolSize} stories checked). Try bitcoin, gold, AI, oil — or "bitcoin price" / "weather in Karachi".`;
   }
-  return `${items.length} matching stor${items.length === 1 ? 'y' : 'ies'} from NewsDash (source links included).`;
+  return items.length === 1
+    ? 'Top matching story from NewsDash.'
+    : `${items.length} matching stories from NewsDash.`;
 }
 
 function buildWeatherBlock(weather: WeatherPayload): string {
   if (weather.error) return `*Live weather*\n${weather.error}`;
   return [
     '*Live weather*',
-    `*${weather.location || 'Unknown'}* — ${weather.condition || '—'}`,
-    `${weather.temperature ?? '—'}°C (feels ${weather.feelsLike ?? '—'}°C) · Humidity ${weather.humidity ?? '—'}% · Wind ${weather.windKmh ?? '—'} km/h`,
+    `*${weather.location || 'Unknown'}* - ${weather.condition || '-'}`,
+    `${weather.temperature ?? '-'} C (feels ${weather.feelsLike ?? '-'} C) | Humidity ${weather.humidity ?? '-'}% | Wind ${weather.windKmh ?? '-'} km/h`,
   ].join('\n');
 }
 
@@ -557,20 +694,24 @@ function isValidArticleUrl(url: unknown): url is string {
   }
 }
 
-/** Always show outlet name + exact article URL so the user can verify the story. */
 function sourceHyperlink(source: string, url: string): string {
   const outlet = source?.trim() || 'Publisher';
-  return [
-    `*Source:* ${outlet}`,
-    '*Open original article:*',
-    url.trim(),
-  ].join('\n');
+  return [`*Source:* ${outlet}`, url.trim()].join('\n');
 }
 
-function formatNewsStoryBlock(i: QueryResultItem, idx: number): string {
+function matchMetaLine(i: QueryResultItem): string {
+  const terms = (i.matchedTerms || []).map((t) => titleCaseWords(t)).filter(Boolean);
+  const left = terms.length ? terms.join(', ') : 'topic';
+  const outlet = i.source?.trim() || 'NewsDash';
+  return `_Matched: ${left} | ${outlet}_`;
+}
+
+function formatNewsStoryBlock(i: QueryResultItem, idx: number, showIndex: boolean): string {
   const when = formatTime(i.publishedAt);
+  const title = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
   const lines = [
-    `*${idx + 1}. ${i.title.trim()}*`,
+    title,
+    matchMetaLine(i),
     when ? `_Published ${when}_` : '',
     waSummary(i.description || ''),
   ];
@@ -581,13 +722,13 @@ function formatNewsStoryBlock(i: QueryResultItem, idx: number): string {
 }
 
 function buildWhatsAppText(
-  q: string,
+  topicLabel: string,
   brief: string,
   items: QueryResultItem[],
   weather?: WeatherPayload | null,
 ): string {
   const withUrls = items.filter((i) => isValidArticleUrl(i.url));
-  const parts = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief];
+  const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief];
 
   if (weather && (weather.location || weather.error)) {
     parts.push('', buildWeatherBlock(weather));
@@ -595,60 +736,80 @@ function buildWhatsAppText(
 
   if (!withUrls.length) return parts.join('\n');
 
-  parts.push('', withUrls.map((i, idx) => formatNewsStoryBlock(i, idx)).join('\n\n'));
-  parts.push('', '_Tap each link to open the original publisher page and confirm the story._');
+  const showIndex = withUrls.length > 1;
+  parts.push('', withUrls.map((i, idx) => formatNewsStoryBlock(i, idx, showIndex)).join('\n\n'));
   return parts.join('\n');
 }
 
-function buildGoldWhatsApp(q: string, gold: GoldQuote): string {
-  const brief = 'Live gold spot price from NewsDash market data.';
-  const block = [
+function buildGoldWhatsApp(topicLabel: string, gold: GoldQuote): string {
+  const brief = 'Live gold spot (international).';
+  const lines = [
     '*Live gold price*',
-    `*XAU/USD* — $${gold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} per oz`,
-    `_Updated just now_`,
-  ].join('\n');
-  return ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief, '', block].join('\n');
+    `*XAU/USD* - $${gold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} / oz`,
+  ];
+  if (gold.pkrPerTolaApprox && gold.usdPkrRate) {
+    lines.push(
+      `*Approx PKR/tola* - Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} (converted @ ${gold.usdPkrRate.toFixed(2)} PKR/USD)`,
+      '_Converted estimate — local jewellery rates may differ._',
+    );
+  }
+  lines.push('_Updated just now_');
+  return ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief, '', lines.join('\n')].join(
+    '\n',
+  );
 }
 
-function buildCryptoWhatsApp(q: string, quote: CryptoQuote): string {
+function buildCryptoWhatsApp(topicLabel: string, quote: CryptoQuote): string {
   const ch =
     quote.change24h == null
       ? ''
-      : ` · 24h ${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}%`;
-  const brief = `Live ${quote.name} price from NewsDash market data.`;
+      : ` | 24h ${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}%`;
+  const brief = `Live ${quote.name} price.`;
   const block = [
     `*Live ${quote.name} price*`,
-    `*${quote.symbol}/USD* — $${quote.usd.toLocaleString('en-US', {
+    `*${quote.symbol}/USD* - $${quote.usd.toLocaleString('en-US', {
       maximumFractionDigits: quote.usd >= 100 ? 2 : 4,
     })}${ch}`,
-    `_Updated just now_`,
+    '_Updated just now_',
   ].join('\n');
-  return ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief, '', block].join('\n');
+  return ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief, '', block].join('\n');
 }
 
-function buildUnsupportedFuelWhatsApp(q: string, oilItems: QueryResultItem[]): string {
+/** Oil headline must be about crude/markets — not a random country story that mentions oil. */
+function isStrongOilHeadline(item: NewsItem): boolean {
+  const title = item.title.toLowerCase();
+  if (!/\b(oil|crude|brent|wti|petroleum|opec)\b/.test(title)) return false;
+  // Prefer market/price/supply language
+  if (/\b(price|prices|crude|brent|wti|opec|barrel|supply|demand|inventory|futures|benchmark)\b/.test(title)) {
+    return true;
+  }
+  // Pakistan-relevant fuel/oil still OK
+  if (/\b(pakistan|pkr|karachi|islamabad)\b/.test(title)) return true;
+  return false;
+}
+
+function buildUnsupportedFuelWhatsApp(topicLabel: string, oilItems: QueryResultItem[]): string {
   const brief =
     'Live Pakistan petrol/diesel pump prices are not wired yet. I will not invent a number.';
-  const parts = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief];
-  const linkedOil = oilItems.filter((i) => isValidArticleUrl(i.url));
+  const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief];
+  const linkedOil = oilItems.filter((i) => isValidArticleUrl(i.url) && isStrongOilHeadline(i));
   if (linkedOil.length) {
-    parts.push('', '_Related oil coverage from NewsDash:_');
-    parts.push('', linkedOil.map((i, idx) => formatNewsStoryBlock(i, idx)).join('\n\n'));
-    parts.push('', '_Tap the link to open the original publisher article._');
+    parts.push('', '_Related crude/oil market story:_');
+    parts.push('', formatNewsStoryBlock(linkedOil[0], 0, false));
   } else {
     parts.push(
       '',
-      'Ask “oil news” for crude/market headlines, or “gold price” / “bitcoin price” for live quotes.',
+      'Ask "oil news" for crude/market headlines, or "gold price" / "bitcoin price" for live quotes.',
     );
   }
   return parts.join('\n');
 }
 
-function fallbackWhatsApp(q: string, reason: string): string {
-  return ['*NewsDash Analyst*', '', `*Topic:* ${q}`, reason].join('\n');
+function fallbackWhatsApp(topicLabel: string, reason: string): string {
+  return ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, reason].join('\n');
 }
 
-/** Quality gate: never send wrong-city weather or empty “successful” prices. */
+/** Quality gate: never send wrong-city weather or empty "successful" prices. */
 function assertReplyQuality(payload: QualityPayload): { ok: true } | { ok: false; reason: string } {
   const { intent, whatsappText, weather, goldPrice, cryptoPrice, items, requestedCity } = payload;
 
@@ -668,7 +829,7 @@ function assertReplyQuality(payload: QualityPayload): { ok: true } | { ok: false
         if (!loc.includes(cityToken)) {
           return {
             ok: false,
-            reason: `Could not confirm weather for “${requestedCity}”. Try a clearer city name.`,
+            reason: `Could not confirm weather for "${requestedCity}". Try a clearer city name.`,
           };
         }
       }
@@ -726,6 +887,50 @@ async function loadFreshItems(): Promise<NewsItem[]> {
   return all.filter((item) => item?.id && isFresh(item.publishedAt));
 }
 
+function titlesTooSimilar(a: string, b: string): boolean {
+  const ta = new Set(
+    cleanQuery(a)
+      .split(/\s+/g)
+      .filter((w) => w.length > 3),
+  );
+  const tb = cleanQuery(b)
+    .split(/\s+/g)
+    .filter((w) => w.length > 3);
+  if (!tb.length) return false;
+  let overlap = 0;
+  for (const w of tb) if (ta.has(w)) overlap += 1;
+  return overlap / tb.length >= 0.55;
+}
+
+function isTeaserStory(item: NewsItem): boolean {
+  return (
+    TEASER_TITLE_RE.test(item.title) ||
+    NEWSLETTER_BOILERPLATE_RE.test(item.description || '') ||
+    /\b(we announced|our latest)\b/i.test(item.title)
+  );
+}
+
+function pickStories(scored: QueryResultItem[], limit: number): QueryResultItem[] {
+  if (!scored.length || limit <= 0) return [];
+  const preferred = scored.filter((i) => !isTeaserStory(i));
+  const pool = preferred.length ? preferred : scored;
+  const first = pool[0];
+  if (limit === 1) return [first];
+
+  const second = pool.slice(1).find((cand) => {
+    if (
+      cand.source &&
+      first.source &&
+      cand.source === first.source &&
+      titlesTooSimilar(first.title, cand.title)
+    ) {
+      return false;
+    }
+    return !titlesTooSimilar(first.title, cand.title);
+  });
+  return second ? [first, second] : [first];
+}
+
 async function searchNews(
   q: string,
   limit: number,
@@ -759,8 +964,8 @@ async function searchNews(
       fresh
         .filter((i) => isValidArticleUrl(i.url))
         .map((i) => {
-          const { matchScore, score } = scoreItem(i, terms, exp, phrase);
-          return { ...i, score, matchScore };
+          const { matchScore, score, matchedTerms } = scoreItem(i, terms, exp, phrase);
+          return { ...i, score, matchScore, matchedTerms };
         })
         .filter((i) => i.matchScore >= 10),
     );
@@ -781,7 +986,7 @@ async function searchNews(
   }
 
   return {
-    items: scored.slice(0, limit),
+    items: pickStories(scored, limit),
     total: scored.length,
     poolSize,
     primary,
@@ -808,14 +1013,18 @@ export async function POST(request: Request) {
 
   const rawQ = body.q.trim();
   const q = extractTopicQuery(rawQ);
-  const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT);
+  const limit = Math.min(
+    Math.max(body.limit ?? WA_STORY_LIMIT, 1),
+    WA_STORY_LIMIT_MAX,
+  );
   const intent = resolveIntent(q);
+  const topicLabel = displayTopic(q, intent);
   const now = new Date().toISOString();
 
   if (intent.kind === 'weather') {
     const weather = await fetchDashboardWeather(intent.city, intent.cityAsked);
-    const brief = buildBrief([], q, weather, 0);
-    let whatsappText = buildWhatsAppText(q, brief, [], weather);
+    const brief = buildBrief([], topicLabel, weather, 0);
+    let whatsappText = buildWhatsAppText(topicLabel, brief, [], weather);
     const gate = assertReplyQuality({
       intent: 'weather',
       whatsappText,
@@ -823,10 +1032,11 @@ export async function POST(request: Request) {
       requestedCity: intent.cityAsked ? intent.city : undefined,
     });
     if (!gate.ok) {
-      whatsappText = fallbackWhatsApp(q, gate.reason);
+      whatsappText = fallbackWhatsApp(topicLabel, gate.reason);
     }
     return Response.json({
       query: q,
+      displayTopic: topicLabel,
       rawQuery: rawQ,
       intent: intent.kind,
       categories: [],
@@ -842,19 +1052,20 @@ export async function POST(request: Request) {
   if (intent.kind === 'gold_price') {
     const gold = await fetchLiveGoldPrice();
     if (gold) {
-      let whatsappText = buildGoldWhatsApp(q, gold);
+      let whatsappText = buildGoldWhatsApp(topicLabel, gold);
       const gate = assertReplyQuality({
         intent: 'gold_price',
         whatsappText,
         goldPrice: gold,
       });
-      if (!gate.ok) whatsappText = fallbackWhatsApp(q, gate.reason);
+      if (!gate.ok) whatsappText = fallbackWhatsApp(topicLabel, gate.reason);
       return Response.json({
         query: q,
+        displayTopic: topicLabel,
         rawQuery: rawQ,
         intent: intent.kind,
         categories: ['trading'],
-        brief: 'Live gold spot price from NewsDash market data.',
+        brief: 'Live gold spot (international).',
         items: [],
         total: 1,
         whatsappText,
@@ -867,19 +1078,20 @@ export async function POST(request: Request) {
   if (intent.kind === 'crypto_price') {
     const quote = await fetchCryptoPrice(intent.cryptoId);
     if (quote) {
-      let whatsappText = buildCryptoWhatsApp(q, quote);
+      let whatsappText = buildCryptoWhatsApp(topicLabel, quote);
       const gate = assertReplyQuality({
         intent: 'crypto_price',
         whatsappText,
         cryptoPrice: quote,
       });
-      if (!gate.ok) whatsappText = fallbackWhatsApp(q, gate.reason);
+      if (!gate.ok) whatsappText = fallbackWhatsApp(topicLabel, gate.reason);
       return Response.json({
         query: q,
+        displayTopic: topicLabel,
         rawQuery: rawQ,
         intent: intent.kind,
         categories: ['crypto'],
-        brief: `Live ${quote.name} price from NewsDash market data.`,
+        brief: `Live ${quote.name} price.`,
         items: [],
         total: 1,
         whatsappText,
@@ -890,21 +1102,22 @@ export async function POST(request: Request) {
   }
 
   if (intent.kind === 'unsupported_live') {
-    const oil = await searchNews('oil crude', 1, ['trading']);
-    const oilItems = oil.items.filter((i) =>
-      /\b(oil|crude|brent|wti|petroleum)\b/i.test(i.title),
-    );
-    const whatsappText = buildUnsupportedFuelWhatsApp(q, oilItems.slice(0, 1));
+    const oil = await searchNews('oil crude brent', 3, ['trading']);
+    const oilItems = oil.items.filter(isStrongOilHeadline).slice(0, 1);
+    const whatsappText = buildUnsupportedFuelWhatsApp(topicLabel, oilItems);
     return Response.json({
       query: q,
+      displayTopic: topicLabel,
       rawQuery: rawQ,
       intent: intent.kind,
       categories: ['trading'],
       brief: 'Live Pakistan petrol/diesel pump prices are not wired yet.',
-      items: oilItems.slice(0, 1),
+      items: oilItems,
       total: oilItems.length ? 1 : 0,
       poolSize: oil.poolSize,
       whatsappText,
+      linkPreview: linkPreviewFromItems(oilItems),
+      linkPreviewEnabled: oilItems.length > 0,
       lastUpdated: now,
     });
   }
@@ -921,13 +1134,14 @@ export async function POST(request: Request) {
     const msg = 'Please ask with a clear keyword (any topic on your NewsDash feeds).';
     return Response.json({
       query: q,
+      displayTopic: topicLabel,
       rawQuery: rawQ,
       intent: 'news',
       categories: [],
       brief: msg,
       items: [],
       total: 0,
-      whatsappText: buildWhatsAppText(q, msg, []),
+      whatsappText: buildWhatsAppText(topicLabel, msg, []),
       lastUpdated: now,
     });
   }
@@ -938,21 +1152,22 @@ export async function POST(request: Request) {
     body.categories && body.categories.length > 0 ? body.categories : undefined,
   );
 
-  const brief = buildBrief(searched.items, q, null, searched.poolSize);
-  let whatsappText = buildWhatsAppText(q, brief, searched.items);
+  const brief = buildBrief(searched.items, topicLabel, null, searched.poolSize);
+  let whatsappText = buildWhatsAppText(topicLabel, brief, searched.items);
   const gate = assertReplyQuality({
     intent: 'news',
     whatsappText,
     items: searched.items,
   });
   if (!gate.ok && searched.items.length > 0) {
-    whatsappText = fallbackWhatsApp(q, gate.reason);
+    whatsappText = fallbackWhatsApp(topicLabel, gate.reason);
   }
 
   const preview = linkPreviewFromItems(searched.items);
 
   return Response.json({
     query: q,
+    displayTopic: topicLabel,
     rawQuery: rawQ,
     intent: 'news',
     categories: searched.allowed,
@@ -963,7 +1178,7 @@ export async function POST(request: Request) {
     poolSize: searched.poolSize,
     whatsappText,
     linkPreview: preview,
-    linkPreviewEnabled: true,
+    linkPreviewEnabled: Boolean(preview),
     lastUpdated: now,
   });
 }
