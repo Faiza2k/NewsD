@@ -200,7 +200,15 @@ function isGreeting(q: string): boolean {
 }
 
 function wantsLivePrice(q: string): boolean {
-  return /\b(price|prices|spot|rate|rates|cost|how much|worth|trading at|quote)\b/.test(clean(q));
+  return /\b(price|prices|spot|rate|rates|cost|how much|worth|trading at|quote|increasing|decreasing|up or down|going up|going down|rose|fell|rally|dump)\b/.test(
+    clean(q),
+  );
+}
+
+/** e.g. "62899 or 62829 ?" after a BTC quote — treat as live bitcoin ask */
+function isPriceClarifyQuery(q: string): boolean {
+  const s = clean(q).replace(/\?/g, '').trim();
+  return /^\d{3,7}(\s*(or|vs|versus|to|-|\/)\s*\d{3,7})?$/.test(s);
 }
 
 function detectPlugin(q: string): Plugin {
@@ -223,7 +231,11 @@ function detectPlugin(q: string): Plugin {
     return { kind: 'weather', city, cityAsked: true };
   }
 
-  if (wantsLivePrice(s)) {
+  if (isPriceClarifyQuery(s)) {
+    return { kind: 'crypto_price', cryptoId: 'bitcoin' };
+  }
+
+  if (wantsLivePrice(s) || /\b(increasing|decreasing|up or down)\b/.test(s)) {
     if (/\b(gold|xau|bullion)\b/.test(s)) return { kind: 'gold_price' };
     if (/\b(bitcoin|btc)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
     if (/\b(ethereum|eth)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'ethereum' };
@@ -546,11 +558,33 @@ async function retrieveAndRank(
   };
 }
 
+/** Common Whisper/STT mishearings for cities we serve often */
+const CITY_ALIASES: Record<string, string> = {
+  'fish hour': 'Peshawar',
+  fishhour: 'Peshawar',
+  'fish our': 'Peshawar',
+  'pishawar': 'Peshawar',
+  'peshawar': 'Peshawar',
+  'peshwar': 'Peshawar',
+  'peshawer': 'Peshawar',
+  'islam abad': 'Islamabad',
+  'isloambad': 'Islamabad',
+  'rawal pindi': 'Rawalpindi',
+  'lahore': 'Lahore',
+  'karachi': 'Karachi',
+};
+
+function normalizeCityQuery(name: string): string {
+  const key = name.trim().toLowerCase().replace(/\s+/g, ' ');
+  return CITY_ALIASES[key] || name.trim();
+}
+
 async function geocode(name: string): Promise<{ lat: number; lon: number; label: string } | null> {
   try {
+    const q = normalizeCityQuery(name);
     const url =
       'https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name=' +
-      encodeURIComponent(name);
+      encodeURIComponent(q);
     const res = await fetch(url, { headers: { Accept: 'application/json' } });
     if (!res.ok) return null;
     const data = await res.json();
@@ -568,11 +602,12 @@ async function geocode(name: string): Promise<{ lat: number; lon: number; label:
 
 async function fetchWeather(city: string, cityAsked: boolean): Promise<WeatherPayload | null> {
   try {
-    const geo = await geocode(city);
+    const asked = normalizeCityQuery(city);
+    const geo = await geocode(asked);
     if (cityAsked && !geo) {
       return {
-        error: `Could not find location "${city}". Try a clearer city name.`,
-        requestedCity: city,
+        error: `Could not find location "${asked}". Try a clearer city name.`,
+        requestedCity: asked,
       };
     }
     const lat = geo?.lat ?? 51.5074;
@@ -602,7 +637,7 @@ async function fetchWeather(city: string, cityAsked: boolean): Promise<WeatherPa
     };
     return {
       location: label,
-      requestedCity: cityAsked ? city : undefined,
+      requestedCity: cityAsked ? asked : undefined,
       temperature: Math.round(Number(current.temperature_2m ?? 0)),
       feelsLike: Math.round(Number(current.apparent_temperature ?? 0)),
       humidity: Math.round(Number(current.relative_humidity_2m ?? 0)),

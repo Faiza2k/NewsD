@@ -26,6 +26,13 @@ function extFor(mime: string, urlHint = ''): string {
   return m?.[1]?.toLowerCase() || 'ogg';
 }
 
+function decodeDataUrlOrBase64(raw: string): Buffer {
+  const trimmed = raw.trim();
+  const dataUrl = trimmed.match(/^data:([^;]+);base64,(.+)$/i);
+  const b64 = dataUrl ? dataUrl[2] : trimmed.replace(/\s+/g, '');
+  return Buffer.from(b64, 'base64');
+}
+
 async function fetchMedia(url: string): Promise<{ buffer: Buffer; mime: string; filename: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -52,7 +59,8 @@ async function fetchMedia(url: string): Promise<{ buffer: Buffer; mime: string; 
 /**
  * POST /api/transcribe
  * - multipart: field `file` (or `audio`)
- * - JSON: { mediaUrl: string, mimeType?: string, filename?: string }
+ * - JSON: { audioBase64, mimeType?, filename? }  (preferred for n8n)
+ * - JSON: { mediaUrl, mimeType?, filename? }
  */
 export async function POST(request: Request) {
   try {
@@ -77,22 +85,29 @@ export async function POST(request: Request) {
     } else {
       const body = (await request.json().catch(() => null)) as {
         mediaUrl?: string;
+        audioBase64?: string;
         mimeType?: string;
         filename?: string;
       } | null;
-      if (!body?.mediaUrl || typeof body.mediaUrl !== 'string') {
+
+      if (body?.audioBase64 && typeof body.audioBase64 === 'string') {
+        buffer = decodeDataUrlOrBase64(body.audioBase64);
+        mime = body.mimeType || mime;
+        filename = body.filename || `voice.${extFor(mime)}`;
+      } else if (body?.mediaUrl && typeof body.mediaUrl === 'string') {
+        const media = await fetchMedia(body.mediaUrl);
+        buffer = media.buffer;
+        mime = body.mimeType || media.mime;
+        filename = body.filename || media.filename;
+      } else {
         return Response.json(
           {
             error:
-              'Provide JSON `{ mediaUrl }` or multipart `file`. Couldn’t hear that—please retry or type.',
+              'Provide JSON `{ audioBase64 }` / `{ mediaUrl }` or multipart `file`. Couldn’t hear that—please retry or type.',
           },
           { status: 400 },
         );
       }
-      const media = await fetchMedia(body.mediaUrl);
-      buffer = media.buffer;
-      mime = body.mimeType || media.mime;
-      filename = body.filename || media.filename;
     }
 
     if (!buffer || buffer.length < 64) {
