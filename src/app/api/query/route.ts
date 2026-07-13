@@ -4,6 +4,12 @@ import type { Category, NewsItem } from '@/types';
 
 export const dynamic = 'force-dynamic';
 
+/**
+ * Universal NewsDash query brain:
+ *   any question → retrieve from all feeds → rank → cite with source URLs
+ * Live weather/price are tiny plugins only when explicitly requested.
+ */
+
 type QueryRequest = {
   q: string;
   limit?: number;
@@ -13,7 +19,7 @@ type QueryRequest = {
 type QueryResultItem = NewsItem & {
   score: number;
   matchScore: number;
-  matchedTerms?: string[];
+  matchedTerms: string[];
 };
 
 type WeatherPayload = {
@@ -50,31 +56,14 @@ type CryptoQuote = {
   change24h?: number;
 };
 
-type IntentKind =
-  | 'greeting'
-  | 'weather'
-  | 'gold_price'
-  | 'crypto_price'
-  | 'unsupported_live'
-  | 'news';
+type PluginKind = 'greeting' | 'weather' | 'gold_price' | 'crypto_price' | 'news';
 
-type ResolvedIntent =
+type Plugin =
   | { kind: 'greeting' }
   | { kind: 'weather'; city: string; cityAsked: boolean }
   | { kind: 'gold_price' }
   | { kind: 'crypto_price'; cryptoId: string }
-  | { kind: 'unsupported_live'; topic: 'petrol' }
   | { kind: 'news' };
-
-type QualityPayload = {
-  intent: IntentKind;
-  whatsappText: string;
-  weather?: WeatherPayload | null;
-  goldPrice?: GoldQuote | null;
-  cryptoPrice?: CryptoQuote | null;
-  items?: QueryResultItem[];
-  requestedCity?: string;
-};
 
 const STOP_WORDS = new Set([
   'tell', 'me', 'about', 'the', 'a', 'an', 'and', 'or', 'of', 'to', 'for', 'in', 'on', 'at',
@@ -83,64 +72,42 @@ const STOP_WORDS = new Set([
   'today', 'now', 'some', 'any', 'info', 'information', 'regarding', 'related', 'something',
   'everything', 'thing', 'things', 'from', 'with', 'into', 'over', 'under', 'again',
   'can', 'you', 'could', 'would', 'need', 'want', 'looking', 'know', 'explain', 'describe',
-  'detail', 'details', 'summary', 'brief', 'quick', 'currently', 'happening',
-  'price', 'prices', 'cost', 'rate', 'rates', 'value', 'current', 'spot',
+  'detail', 'details', 'summary', 'brief', 'quick', 'currently', 'happening', 'happens',
+  'there', 'this', 'that', 'these', 'those', 'also', 'just', 'really', 'very',
 ]);
 
-/** Optional boosts only — any other word still searches the full dashboard. */
-const TOPIC_SYNONYMS: Record<string, string[]> = {
-  weather: ['weather', 'forecast', 'temperature', 'rainfall', 'heatwave', 'snowfall', 'monsoon'],
-  gold: ['gold', 'bullion', 'xau'],
-  oil: ['oil', 'crude', 'brent', 'wti', 'petroleum', 'petrol', 'diesel', 'fuel', 'gasoline', 'opec'],
-  petrol: ['petrol', 'diesel', 'gasoline', 'fuel', 'oil', 'crude', 'petroleum'],
-  fuel: ['fuel', 'petrol', 'diesel', 'gasoline', 'oil', 'crude', 'petroleum'],
-  pakistan: ['pakistan', 'pakistani', 'karachi', 'islamabad', 'lahore', 'pkr'],
-  bitcoin: ['bitcoin', 'btc'],
-  crypto: ['crypto', 'cryptocurrency', 'bitcoin', 'ethereum', 'btc', 'eth', 'defi'],
-  ethereum: ['ethereum', 'eth'],
-  ai: ['ai', 'artificial intelligence', 'llm', 'gpt', 'machine learning', 'openai', 'claude'],
-  nvidia: ['nvidia', 'nvda', 'gpu'],
-  forex: ['forex', 'fx'],
-  stocks: ['stocks', 'equities', 'shares', 'nasdaq'],
-  iran: ['iran', 'iranian', 'tehran'],
-  america: ['america', 'american', 'usa', 'united states'],
-  conflict: ['conflict', 'war', 'fight', 'fighting', 'tensions', 'strike', 'attack'],
-  tech: ['tech', 'technology', 'software', 'hardware', 'chip', 'semiconductor'],
-  energy: ['energy', 'oil', 'gas', 'fuel', 'power', 'electricity'],
+/** Light query expansion only — never the main brain. Unknown words still search feeds. */
+const LIGHT_EXPAND: Record<string, string[]> = {
+  tech: ['technology', 'software', 'hardware'],
+  btc: ['bitcoin'],
+  eth: ['ethereum'],
+  sol: ['solana'],
+  petrol: ['oil', 'crude', 'fuel', 'petroleum'],
+  diesel: ['oil', 'crude', 'fuel', 'petroleum'],
+  gasoline: ['oil', 'crude', 'fuel', 'petroleum'],
+  fuel: ['oil', 'crude', 'petroleum', 'petrol'],
+  ml: ['ai', 'machine learning'],
+  llm: ['ai'],
+  gpt: ['openai', 'ai'],
 };
 
-/** Tokens that must not match longer lookalikes (gold ≠ Goldman). */
-const STRICT_ENTITY_BLOCKLIST: Record<string, string[]> = {
+const ENTITY_BLOCKLIST: Record<string, string[]> = {
   gold: ['goldman', 'golden', 'goldberg', 'goldstein'],
 };
 
-const TOKEN_ALIASES: Record<string, string> = {
-  btc: 'bitcoin',
-  eth: 'ethereum',
-  ml: 'ai',
-  usa: 'america',
-  us: 'america',
-  war: 'conflict',
-  fight: 'conflict',
-  fighting: 'conflict',
-  gasoline: 'petrol',
-  diesel: 'petrol',
-};
+const TEASER_RE =
+  /\b(the download|round-?up|daily digest|weekly wrap|here'?s what happened|newsletter|hodler'?s digest|state of crypto|things to know|top \d+)\b/i;
+const BOILERPLATE_RE =
+  /this is today'?s edition|weekday newsletter|daily dose of what'?s going on|subscribe to|photo:/i;
 
-const WA_SUMMARY_MAX = 220;
+const WA_SUMMARY_MAX = 200;
 const WA_STORY_LIMIT = 2;
 const WA_STORY_LIMIT_MAX = 2;
+const MIN_MATCH = 8;
 const GRAMS_PER_TROY_OZ = 31.1034768;
 const GRAMS_PER_TOLA = 11.6638038;
 
-const TEASER_TITLE_RE =
-  /\b(latest (ai |tech )?news|updates? we announced|the download|round-?up|weekly roundup|daily digest|here('?s| are)|top \d+|things to know|what we announced|newsletter|here'?s what happened|what happened in|state of crypto|hodler'?s digest|signs of life\?|digest,? (jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec))\b/i;
-const NEWSLETTER_BOILERPLATE_RE =
-  /this is today'?s edition|weekday newsletter|daily dose of what'?s going on|subscribe to|read more on our (site|blog)|sign up for/i;
-const CONCRETE_EVENT_RE =
-  /\b(announce[sd]?|launch(es|ed)?|rais(es|ed)|cut[s]?|sue[sd]?|ban[s]?|approv(es|ed)|beat[s]?|miss(es|ed)?|surge[sd]?|crash(es|ed)?|acquire[sd]?|ipo|partners?|wins?|loses?|warns?|halts?|resumes?|strikes?|attacks?|signs?|passes?|rejects?)\b/i;
-
-function cleanQuery(q: string): string {
+function clean(q: string): string {
   return q
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s+-]/gu, ' ')
@@ -153,7 +120,7 @@ function extractTopicQuery(raw: string): string {
   q = q.replace(/^["'`]+|["'`]+$/g, '');
   q = q.replace(/^(please\s+)?(can you|could you|would you)\s+/i, '');
   q = q.replace(
-    /^(tell me|tell us|give me|show me|get me|i want|i need|looking for|explain|describe)\s+(about\s+|regarding\s+|on\s+|for\s+)?/i,
+    /^(tell me|tell us|give me|show me|get me|i want|i need|looking for|explain|describe)\s+(about\s+|regarding\s+|on\s+|for\s+|to know about\s+)?/i,
     '',
   );
   q = q.replace(/^(what(?:'s| is| are)|whats)\s+(the\s+)?(latest\s+|current\s+)?/i, '');
@@ -162,17 +129,20 @@ function extractTopicQuery(raw: string): string {
   return q || String(raw || '').trim();
 }
 
-function aliasToken(t: string): string {
-  return TOKEN_ALIASES[t] || t;
-}
-
 function tokenize(q: string): string[] {
-  return cleanQuery(q)
+  return clean(q)
     .split(/\s+/g)
     .map((t) => t.trim())
     .filter((t) => t.length >= 2 && !STOP_WORDS.has(t))
-    .map(aliasToken)
     .filter((t, i, arr) => arr.indexOf(t) === i);
+}
+
+function expandTokens(tokens: string[]): string[] {
+  const out = new Set(tokens);
+  for (const t of tokens) {
+    for (const x of LIGHT_EXPAND[t] || []) out.add(x);
+  }
+  return [...out];
 }
 
 function escapeRegex(s: string): string {
@@ -183,182 +153,343 @@ function hasWord(hay: string, term: string): boolean {
   if (!term) return false;
   const re = new RegExp(`(^|[^a-z0-9_+-])${escapeRegex(term)}([^a-z0-9_+-]|$)`, 'i');
   if (!re.test(hay)) return false;
-  const blocked = STRICT_ENTITY_BLOCKLIST[term.toLowerCase()];
-  if (blocked?.length) {
-    const withoutBlocked = blocked.reduce(
-      (acc, b) => acc.replace(new RegExp(escapeRegex(b), 'gi'), ' '),
-      hay,
-    );
-    return re.test(withoutBlocked);
-  }
-  return true;
-}
-
-function termVariants(term: string): string[] {
-  const t = term.toLowerCase();
-  const out = new Set<string>([t]);
-  if (t.endsWith('ies') && t.length > 4) out.add(`${t.slice(0, -3)}y`);
-  if (t.endsWith('es') && t.length > 4) out.add(t.slice(0, -2));
-  if (t.endsWith('s') && !t.endsWith('ss') && t.length > 3) out.add(t.slice(0, -1));
-  else if (!t.endsWith('s')) out.add(`${t}s`);
-  if (t.endsWith('y') && t.length > 3) out.add(`${t.slice(0, -1)}ies`);
-  return [...out];
-}
-
-function matchesAnyVariant(hay: string, term: string): boolean {
-  return termVariants(term).some((v) => hasWord(hay, v));
-}
-
-function synonymHit(raw: string, syn: string): boolean {
-  if (!syn) return false;
-  if (syn.includes(' ')) return raw.includes(syn);
-  return raw === syn || hasWord(raw, syn);
-}
-
-function expandTerms(q: string): string[] {
-  const base = tokenize(q);
-  const expanded = new Set<string>(base);
-  const raw = cleanQuery(q);
-
-  for (const [topic, syns] of Object.entries(TOPIC_SYNONYMS)) {
-    if (raw === topic || base.includes(topic) || hasWord(raw, topic)) {
-      for (const s of syns) expanded.add(s);
-    }
-  }
-  for (const [topic, syns] of Object.entries(TOPIC_SYNONYMS)) {
-    if (syns.some((s) => synonymHit(raw, s))) {
-      for (const s of syns) expanded.add(s);
-      expanded.add(topic);
-    }
-  }
-
-  return [...expanded];
-}
-
-function fallbackPrimary(primary: string[]): string[] {
-  if (primary.length <= 2) return primary;
-  const known = primary.filter(
-    (t) =>
-      Boolean(TOPIC_SYNONYMS[t]) ||
-      Object.values(TOPIC_SYNONYMS).some((syns) => syns.includes(t)),
+  const blocked = ENTITY_BLOCKLIST[term.toLowerCase()];
+  if (!blocked?.length) return true;
+  const scrubbed = blocked.reduce(
+    (acc, b) => acc.replace(new RegExp(escapeRegex(b), 'gi'), ' '),
+    hay,
   );
-  if (known.length > 0) {
-    const rest = primary
-      .filter((t) => !known.includes(t))
-      .sort((a, b) => b.length - a.length);
-    return [...known, ...rest].slice(0, 2);
-  }
-  return [...primary].sort((a, b) => b.length - a.length).slice(0, 2);
+  return re.test(scrubbed);
 }
 
-function topicFromPhrase(q: string): string | null {
-  const raw = cleanQuery(q);
-  for (const [topic, syns] of Object.entries(TOPIC_SYNONYMS)) {
-    if (raw === topic || hasWord(raw, topic)) return topic;
-    if (syns.some((s) => (s.includes(' ') ? raw.includes(s) : hasWord(raw, s)))) return topic;
+function isValidArticleUrl(url: unknown): url is string {
+  if (typeof url !== 'string' || !url.trim()) return false;
+  try {
+    const u = new URL(url.trim());
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
   }
-  return null;
-}
-
-function titleCaseWords(s: string): string {
-  return s
-    .split(/\s+/g)
-    .filter(Boolean)
-    .map((w) => (w.length <= 3 && /^(ai|btc|eth|usd|pkr|fx)$/i.test(w) ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)))
-    .join(' ');
-}
-
-function displayTopic(q: string, intent: ResolvedIntent): string {
-  if (intent.kind === 'greeting') return 'Help';
-  if (intent.kind === 'weather') {
-    return intent.cityAsked ? `${titleCaseWords(intent.city)} weather` : 'Weather';
-  }
-  if (intent.kind === 'gold_price') return 'Gold price';
-  if (intent.kind === 'crypto_price') {
-    const names: Record<string, string> = {
-      bitcoin: 'Bitcoin price',
-      ethereum: 'Ethereum price',
-      solana: 'Solana price',
-    };
-    return names[intent.cryptoId] || 'Crypto price';
-  }
-  if (intent.kind === 'unsupported_live') return 'Petrol price';
-
-  const topic = topicFromPhrase(q);
-  if (topic) return titleCaseWords(topic);
-  const tokens = tokenize(q);
-  if (tokens.length) return titleCaseWords(tokens.slice(0, 4).join(' '));
-  return titleCaseWords(cleanQuery(q).slice(0, 40)) || 'News';
 }
 
 function isGreeting(q: string): boolean {
-  const s = cleanQuery(q);
   return /^(hi|hello|hey|salam|assalamualaikum|hola|yo|thanks|thank you|ok|okay|help|start|menu)$/.test(
-    s,
+    clean(q),
   );
 }
 
 function wantsLivePrice(q: string): boolean {
-  return /\b(price|prices|spot|rate|rates|cost|how much|worth|trading at|quote)\b/.test(
-    cleanQuery(q),
-  );
+  return /\b(price|prices|spot|rate|rates|cost|how much|worth|trading at|quote)\b/.test(clean(q));
 }
 
-function extractWeatherLocation(q: string): { city: string; cityAsked: boolean } {
-  let s = cleanQuery(q);
-  s = s.replace(
-    /\b(weather|forecast|temperature|humidity|today|now|current|please|tell|me|about|of|in|for|the|a|an)\b/g,
-    ' ',
-  );
-  s = s.replace(/\s+/g, ' ').trim();
-  if (!s) return { city: 'London', cityAsked: false };
-  return { city: s, cityAsked: true };
-}
-
-function isUnsupportedFuelIntent(q: string): boolean {
-  const s = cleanQuery(q);
-  return /\b(petrol|diesel|gasoline|gas\s*price|pump\s*price|fuel\s*price)\b/.test(s);
-}
-
-/** Single entrypoint for intent routing. */
-function resolveIntent(q: string): ResolvedIntent {
-  const s = cleanQuery(q);
-
+function detectPlugin(q: string): Plugin {
+  const s = clean(q);
   if (isGreeting(s)) return { kind: 'greeting' };
-
-  if (isUnsupportedFuelIntent(s)) {
-    return { kind: 'unsupported_live', topic: 'petrol' };
-  }
 
   if (
     /^(weather|forecast|temperature|humidity)$/.test(s) ||
     (/\b(weather|forecast|temperature|humidity)\b/.test(s) &&
-      !/\b(lng|gas price|oil|stock|market|bitcoin|crypto|gold|ai|nvidia)\b/.test(s))
+      !/\b(oil|stock|market|bitcoin|crypto|gold|ai|nvidia|news)\b/.test(s))
   ) {
-    const loc = extractWeatherLocation(q);
-    return { kind: 'weather', city: loc.city, cityAsked: loc.cityAsked };
-  }
-
-  // Live prices only when the user explicitly asks for a price/quote.
-  if (/\b(gold|xau|bullion)\b/.test(s) && wantsLivePrice(s)) {
-    return { kind: 'gold_price' };
+    let city = s
+      .replace(
+        /\b(weather|forecast|temperature|humidity|today|now|current|please|tell|me|about|of|in|for|the|a|an)\b/g,
+        ' ',
+      )
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!city) return { kind: 'weather', city: 'London', cityAsked: false };
+    return { kind: 'weather', city, cityAsked: true };
   }
 
   if (wantsLivePrice(s)) {
+    if (/\b(gold|xau|bullion)\b/.test(s)) return { kind: 'gold_price' };
     if (/\b(bitcoin|btc)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
     if (/\b(ethereum|eth)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'ethereum' };
     if (/\b(solana|sol)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'solana' };
-    if (/\b(crypto|cryptocurrency)\b/.test(s) && !/\b(news|regulation|law|ban|etf)\b/.test(s)) {
-      return { kind: 'crypto_price', cryptoId: 'bitcoin' };
-    }
   }
 
   return { kind: 'news' };
 }
 
-async function geocodeLocation(
-  name: string,
-): Promise<{ lat: number; lon: number; label: string } | null> {
+function displayTopic(q: string, plugin: Plugin): string {
+  if (plugin.kind === 'greeting') return 'Help';
+  if (plugin.kind === 'weather') {
+    return plugin.cityAsked
+      ? `${titleCase(plugin.city)} weather`
+      : 'Weather';
+  }
+  if (plugin.kind === 'gold_price') return 'Gold price';
+  if (plugin.kind === 'crypto_price') {
+    const map: Record<string, string> = {
+      bitcoin: 'Bitcoin price',
+      ethereum: 'Ethereum price',
+      solana: 'Solana price',
+    };
+    return map[plugin.cryptoId] || 'Crypto price';
+  }
+  const tokens = tokenize(q);
+  if (!tokens.length) return 'News';
+  return titleCase(tokens.slice(0, 5).join(' '));
+}
+
+function titleCase(s: string): string {
+  return s
+    .split(/\s+/g)
+    .filter(Boolean)
+    .map((w) =>
+      /^(ai|btc|eth|usd|pkr|nft|gpu|ipo)$/i.test(w)
+        ? w.toUpperCase()
+        : w[0].toUpperCase() + w.slice(1),
+    )
+    .join(' ');
+}
+
+function formatTime(iso: string): string {
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return (
+      d.toLocaleString('en-GB', {
+        timeZone: 'Asia/Karachi',
+        day: '2-digit',
+        month: 'short',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }) + ' PKT'
+    );
+  } catch {
+    return '';
+  }
+}
+
+function stripBoilerplate(desc: string): string {
+  let s = desc.replace(/\s+/g, ' ').trim();
+  s = s.replace(BOILERPLATE_RE, ' ');
+  s = s.replace(/\|\s*Photo:[^.]*\.?/gi, ' ');
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+function waSummary(desc: string): string {
+  const cleanDesc = stripBoilerplate(desc);
+  if (!cleanDesc) return 'Open the source link for the full publisher article.';
+  if (cleanDesc.length <= WA_SUMMARY_MAX) return cleanDesc;
+  const sliced = cleanDesc.slice(0, WA_SUMMARY_MAX);
+  const stop = Math.max(sliced.lastIndexOf('. '), sliced.lastIndexOf('! '), sliced.lastIndexOf('? '));
+  if (stop > 80) return sliced.slice(0, stop + 1);
+  const space = sliced.lastIndexOf(' ');
+  return (space > 80 ? sliced.slice(0, space) : sliced).trimEnd() + '...';
+}
+
+function isTeaser(item: NewsItem): boolean {
+  return TEASER_RE.test(item.title) || BOILERPLATE_RE.test(item.description || '');
+}
+
+/** Core relevance scoring — works for any topic tokens from the user query. */
+function scoreAgainstQuery(
+  item: NewsItem,
+  tokens: string[],
+  expanded: string[],
+  phrase: string,
+): { matchScore: number; score: number; matchedTerms: string[] } {
+  const title = item.title.toLowerCase();
+  const desc = (item.description || '').toLowerCase();
+  const tags = (item.tags || []).join(' ').toLowerCase();
+  const all = `${title} ${desc} ${tags}`;
+
+  let matchScore = 0;
+  let titleHits = 0;
+  let anywhereHits = 0;
+  const matched: string[] = [];
+
+  if (phrase.length >= 4) {
+    if (title.includes(phrase)) matchScore += 22;
+    else if (desc.includes(phrase)) matchScore += 8;
+  }
+
+  for (const t of tokens) {
+    if (hasWord(title, t)) {
+      matchScore += 14;
+      titleHits += 1;
+      anywhereHits += 1;
+      matched.push(t);
+    } else if (hasWord(desc, t) || hasWord(tags, t)) {
+      matchScore += 5;
+      anywhereHits += 1;
+      matched.push(t);
+    }
+  }
+
+  for (const t of expanded) {
+    if (tokens.includes(t)) continue;
+    if (hasWord(title, t)) matchScore += 3;
+    else if (hasWord(all, t)) matchScore += 1;
+  }
+
+  if (!tokens.length) return { matchScore: 0, score: 0, matchedTerms: [] };
+
+  // Single-token asks must hit the title (keeps gold≠Goldman / random body matches out).
+  if (tokens.length === 1 && titleHits < 1) {
+    return { matchScore: 0, score: 0, matchedTerms: [] };
+  }
+
+  // Two-token asks need both terms somewhere and at least one title hit.
+  if (tokens.length === 2) {
+    if (anywhereHits < 2 || titleHits < 1) {
+      return { matchScore: 0, score: 0, matchedTerms: [] };
+    }
+  }
+
+  // Longer asks: majority of terms + a title hit.
+  if (tokens.length > 2) {
+    const need = Math.ceil(tokens.length * 0.6);
+    if (anywhereHits < need || titleHits < 1) {
+      return { matchScore: 0, score: 0, matchedTerms: [] };
+    }
+  }
+
+  if (isTeaser(item)) matchScore -= 10;
+  if (/\b(announce[sd]?|launch|sue[sd]?|ban[s]?|strike|acquire|ipo|surge|crash)\b/i.test(item.title)) {
+    matchScore += 4;
+  }
+
+  if (matchScore < MIN_MATCH) return { matchScore: 0, score: 0, matchedTerms: [] };
+
+  let score = matchScore;
+  const ageMs = Date.now() - new Date(item.publishedAt).getTime();
+  if (ageMs < 6 * 60 * 60 * 1000) score += 3;
+  else if (ageMs < 24 * 60 * 60 * 1000) score += 1;
+  score += Math.min(2, Math.max(0, item.significance / 5));
+
+  return {
+    matchScore,
+    score,
+    matchedTerms: matched.filter((t, i, a) => a.indexOf(t) === i).slice(0, 4),
+  };
+}
+
+function titlesTooSimilar(a: string, b: string): boolean {
+  const ta = new Set(clean(a).split(/\s+/g).filter((w) => w.length > 3));
+  const tb = clean(b).split(/\s+/g).filter((w) => w.length > 3);
+  if (!tb.length) return false;
+  let overlap = 0;
+  for (const w of tb) if (ta.has(w)) overlap += 1;
+  return overlap / tb.length >= 0.55;
+}
+
+function pickDiverse(items: QueryResultItem[], limit: number): QueryResultItem[] {
+  if (!items.length || limit <= 0) return [];
+  const preferred = items.filter((i) => !isTeaser(i));
+  const pool = preferred.length ? preferred : items;
+  const out: QueryResultItem[] = [pool[0]];
+  for (const cand of pool.slice(1)) {
+    if (out.length >= limit) break;
+    if (out.some((p) => titlesTooSimilar(p.title, cand.title))) continue;
+    out.push(cand);
+  }
+  for (const cand of pool.slice(1)) {
+    if (out.length >= limit) break;
+    if (!out.some((p) => p.id === cand.id)) out.push(cand);
+  }
+  return out;
+}
+
+/**
+ * Universal retrieve → rank over the entire NewsDash feed cache.
+ * No topic whitelist: any tokens from the user query can match.
+ */
+async function retrieveAndRank(
+  q: string,
+  limit: number,
+  categories?: Category[],
+): Promise<{
+  items: QueryResultItem[];
+  total: number;
+  poolSize: number;
+  tokens: string[];
+  expanded: string[];
+}> {
+  const tokens = tokenize(q);
+  const expanded = expandTokens(tokens);
+  const phrase = clean(q);
+
+  const all = await getFeedItemsForQuery().catch(() => [] as NewsItem[]);
+  let fresh = all.filter((i) => i?.id && isFresh(i.publishedAt) && isValidArticleUrl(i.url));
+  if (categories?.length) {
+    const scoped = fresh.filter((i) => categories.includes(i.category));
+    if (scoped.length) fresh = scoped;
+  }
+
+  if (!tokens.length) {
+    return { items: [], total: 0, poolSize: fresh.length, tokens, expanded };
+  }
+
+  // Pass 1: strict title-first ranking
+  let scored = fresh
+    .map((i) => {
+      const { matchScore, score, matchedTerms } = scoreAgainstQuery(i, tokens, expanded, phrase);
+      return { ...i, matchScore, score, matchedTerms };
+    })
+    .filter((i) => i.matchScore >= MIN_MATCH)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+      return new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime();
+    });
+
+  // Pass 2: if empty, try longest tokens only (natural language leftovers)
+  if (!scored.length && tokens.length > 2) {
+    const focus = [...tokens].sort((a, b) => b.length - a.length).slice(0, 2);
+    const exp = expandTokens(focus);
+    scored = fresh
+      .map((i) => {
+        const { matchScore, score, matchedTerms } = scoreAgainstQuery(i, focus, exp, phrase);
+        return { ...i, matchScore, score, matchedTerms };
+      })
+      .filter((i) => i.matchScore >= MIN_MATCH)
+      .sort((a, b) => b.score - a.score);
+  }
+
+  // Pass 3: soft title-only fallback for remaining tokens
+  if (!scored.length) {
+    const focus = tokens.filter((t) => t.length >= 3);
+    const use = focus.length ? focus : tokens;
+    scored = fresh
+      .map((i) => {
+        const title = i.title.toLowerCase();
+        const desc = (i.description || '').toLowerCase();
+        const hit = use.find((t) => hasWord(title, t));
+        // Only broad expandable tokens (e.g. tech→technology) may soft-match description.
+        const softHit =
+          !hit &&
+          use.length === 1 &&
+          Boolean(LIGHT_EXPAND[use[0]]) &&
+          expandTokens(use).some((t) => hasWord(title, t) || hasWord(desc, t));
+        if (!hit && !softHit) return null;
+        const term = hit || use[0];
+        const matchScore = hit ? 10 + hit.length : 8;
+        return {
+          ...i,
+          matchScore,
+          score: matchScore + Math.min(2, i.significance / 5),
+          matchedTerms: [term],
+        } as QueryResultItem;
+      })
+      .filter((i): i is QueryResultItem => Boolean(i))
+      .sort((a, b) => b.score - a.score);
+  }
+
+  return {
+    items: pickDiverse(scored, limit),
+    total: scored.length,
+    poolSize: fresh.length,
+    tokens,
+    expanded,
+  };
+}
+
+async function geocode(name: string): Promise<{ lat: number; lon: number; label: string } | null> {
   try {
     const url =
       'https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name=' +
@@ -368,37 +499,34 @@ async function geocodeLocation(
     const data = await res.json();
     const hit = Array.isArray(data?.results) ? data.results[0] : null;
     if (!hit) return null;
-    const parts = [hit.name, hit.admin1, hit.country].filter(Boolean);
     return {
       lat: Number(hit.latitude),
       lon: Number(hit.longitude),
-      label: parts.join(', '),
+      label: [hit.name, hit.admin1, hit.country].filter(Boolean).join(', '),
     };
   } catch {
     return null;
   }
 }
 
-async function fetchDashboardWeather(
-  locationHint: string,
-  cityAsked: boolean,
-): Promise<WeatherPayload | null> {
+async function fetchWeather(city: string, cityAsked: boolean): Promise<WeatherPayload | null> {
   try {
-    const geo = await geocodeLocation(locationHint);
+    const geo = await geocode(city);
     if (cityAsked && !geo) {
       return {
-        error: `Could not find location "${locationHint}". Try a clearer city name.`,
-        requestedCity: locationHint,
+        error: `Could not find location "${city}". Try a clearer city name.`,
+        requestedCity: city,
       };
     }
     const lat = geo?.lat ?? 51.5074;
     const lon = geo?.lon ?? -0.1278;
     const label = geo?.label ?? 'London, UK';
-    const forecastUrl =
+    const wxRes = await fetch(
       `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-      '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day' +
-      '&timezone=auto';
-    const wxRes = await fetch(forecastUrl, { headers: { Accept: 'application/json' } });
+        '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m' +
+        '&timezone=auto',
+      { headers: { Accept: 'application/json' } },
+    );
     if (!wxRes.ok) return null;
     const payload = await wxRes.json();
     const current = payload.current ?? {};
@@ -417,7 +545,7 @@ async function fetchDashboardWeather(
     };
     return {
       location: label,
-      requestedCity: cityAsked ? locationHint : undefined,
+      requestedCity: cityAsked ? city : undefined,
       temperature: Math.round(Number(current.temperature_2m ?? 0)),
       feelsLike: Math.round(Number(current.apparent_temperature ?? 0)),
       humidity: Math.round(Number(current.relative_humidity_2m ?? 0)),
@@ -430,12 +558,11 @@ async function fetchDashboardWeather(
   }
 }
 
-async function fetchUsdPkrRate(): Promise<number | null> {
-  const endpoints = [
+async function fetchUsdPkr(): Promise<number | null> {
+  for (const url of [
     'https://open.er-api.com/v6/latest/USD',
     'https://api.exchangerate-api.com/v4/latest/USD',
-  ];
-  for (const url of endpoints) {
+  ]) {
     try {
       const res = await fetch(url, { headers: { Accept: 'application/json' } });
       if (!res.ok) continue;
@@ -443,25 +570,17 @@ async function fetchUsdPkrRate(): Promise<number | null> {
       const rate = Number(data?.rates?.PKR);
       if (Number.isFinite(rate) && rate > 0) return rate;
     } catch {
-      // try next endpoint
+      // try next
     }
   }
   return null;
 }
 
-function approxPkrPerTola(usdPerOz: number, usdPkr: number): number {
-  const usdPerGram = usdPerOz / GRAMS_PER_TROY_OZ;
-  const usdPerTola = usdPerGram * GRAMS_PER_TOLA;
-  return usdPerTola * usdPkr;
-}
-
-async function fetchLiveGoldPrice(): Promise<GoldQuote | null> {
+async function fetchGold(): Promise<GoldQuote | null> {
   try {
     const [goldRes, usdPkr] = await Promise.all([
-      fetch('https://api.gold-api.com/price/XAU', {
-        headers: { Accept: 'application/json' },
-      }),
-      fetchUsdPkrRate(),
+      fetch('https://api.gold-api.com/price/XAU', { headers: { Accept: 'application/json' } }),
+      fetchUsdPkr(),
     ]);
     if (!goldRes.ok) return null;
     const data = await goldRes.json();
@@ -474,7 +593,9 @@ async function fetchLiveGoldPrice(): Promise<GoldQuote | null> {
     };
     if (usdPkr) {
       quote.usdPkrRate = usdPkr;
-      quote.pkrPerTolaApprox = Math.round(approxPkrPerTola(price, usdPkr));
+      quote.pkrPerTolaApprox = Math.round(
+        (price / GRAMS_PER_TROY_OZ) * GRAMS_PER_TOLA * usdPkr,
+      );
     }
     return quote;
   } catch {
@@ -482,7 +603,7 @@ async function fetchLiveGoldPrice(): Promise<GoldQuote | null> {
   }
 }
 
-async function fetchCryptoPrice(id: string): Promise<CryptoQuote | null> {
+async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
   try {
     const url =
       `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}` +
@@ -513,424 +634,155 @@ async function fetchCryptoPrice(id: string): Promise<CryptoQuote | null> {
   }
 }
 
-function inferCategories(q: string): Category[] {
-  const s = cleanQuery(q);
-  const out = new Set<Category>();
-  if (/\b(ai|llm|gpt|claude|gemini|model|agent|ml|machine learning)\b/.test(s)) out.add('ai');
-  if (/\b(crypto|bitcoin|btc|ethereum|eth|solana|defi|token)\b/.test(s)) out.add('crypto');
-  if (/\b(trading|stocks?|markets?|forex|fx|gold|oil|commodit|futures|options|earnings)\b/.test(s)) {
-    out.add('trading');
-  }
-  if (/\b(github|open source|repo|repository|library|framework)\b/.test(s)) out.add('github');
-  if (/\b(research|paper|arxiv|preprint|study)\b/.test(s)) out.add('research');
-  if (/\b(startup|funding|vc|venture|ipo)\b/.test(s)) out.add('startups');
-  if (/\b(geopolitic|global|world|policy|sanction)\b/.test(s)) out.add('global');
-  if (/\b(tech|technology|chip|hardware|cloud|apple|google|microsoft|nvidia)\b/.test(s)) out.add('tech');
-  return [...out];
-}
-
-function storyQualityAdjust(title: string, description: string): number {
-  let adj = 0;
-  if (TEASER_TITLE_RE.test(title)) adj -= 20;
-  if (NEWSLETTER_BOILERPLATE_RE.test(description)) adj -= 8;
-  if (CONCRETE_EVENT_RE.test(title)) adj += 6;
-  if (title.length < 28 && /updates?|news$/i.test(title)) adj -= 4;
-  // Prefer specific headlines over vague blog indexes
-  if (/\b(we announced|our blog|our latest)\b/i.test(title)) adj -= 6;
-  return adj;
-}
-
-function collectMatchedTerms(
-  item: NewsItem,
-  primary: string[],
-  expanded: string[],
-): string[] {
-  const hayTitle = item.title.toLowerCase();
-  const hayDesc = (item.description || '').toLowerCase();
-  const hits: string[] = [];
-  for (const t of primary) {
-    if (matchesAnyVariant(hayTitle, t) || matchesAnyVariant(hayDesc, t)) hits.push(t);
-  }
-  if (!hits.length) {
-    for (const t of expanded) {
-      if (matchesAnyVariant(hayTitle, t)) {
-        hits.push(t);
-        break;
-      }
-    }
-  }
-  return hits.slice(0, 3);
-}
-
-function scoreItem(
-  item: NewsItem,
-  primary: string[],
-  expanded: string[],
-  phrase: string,
-  mode: 'strict' | 'relaxed' = 'strict',
-): { matchScore: number; score: number; matchedTerms: string[] } {
-  const hayTitle = item.title.toLowerCase();
-  const hayDesc = (item.description || '').toLowerCase();
-  const hayTags = (item.tags || []).join(' ').toLowerCase();
-  const hayAll = `${hayTitle} ${hayDesc} ${hayTags}`;
-
-  let matchScore = 0;
-  let titleHits = 0;
-  let anywhereHits = 0;
-
-  if (phrase.length >= 3) {
-    if (hayTitle.includes(phrase)) matchScore += 20;
-    else if (hayDesc.includes(phrase)) matchScore += 8;
-  }
-
-  for (const t of primary) {
-    if (!t) continue;
-    if (matchesAnyVariant(hayTitle, t)) {
-      matchScore += 14;
-      titleHits += 1;
-      anywhereHits += 1;
-    } else if (matchesAnyVariant(hayDesc, t) || matchesAnyVariant(hayTags, t)) {
-      matchScore += 5;
-      anywhereHits += 1;
-    }
-  }
-
-  for (const t of expanded) {
-    if (!t || primary.includes(t)) continue;
-    if (matchesAnyVariant(hayTitle, t)) matchScore += 3;
-    else if (matchesAnyVariant(hayAll, t)) matchScore += 1;
-  }
-
-  const n = primary.length;
-  if (n === 0) return { matchScore: 0, score: 0, matchedTerms: [] };
-
-  if (mode === 'strict') {
-    if (n === 1) {
-      if (titleHits < 1) return { matchScore: 0, score: 0, matchedTerms: [] };
-    } else if (n === 2) {
-      if (anywhereHits < 2 || titleHits < 1) return { matchScore: 0, score: 0, matchedTerms: [] };
-    } else {
-      const need = Math.ceil(n * 0.6);
-      const phraseInTitle = phrase.length >= 4 && hayTitle.includes(phrase);
-      if (anywhereHits < need) return { matchScore: 0, score: 0, matchedTerms: [] };
-      if (titleHits < 1 && !phraseInTitle) return { matchScore: 0, score: 0, matchedTerms: [] };
-    }
-    matchScore += storyQualityAdjust(item.title, item.description || '');
-    if (matchScore < 10) return { matchScore: 0, score: 0, matchedTerms: [] };
-  } else {
-    // Relaxed: require a specific entity in TITLE when we have one (gold/oil/ai/…).
-    const must = titleRequiredEntities(primary, phrase);
-    if (must.length) {
-      const titleHit = must.some((t) => matchesAnyVariant(hayTitle, t));
-      if (!titleHit) return { matchScore: 0, score: 0, matchedTerms: [] };
-    } else {
-      const titleHit =
-        primary.some((t) => matchesAnyVariant(hayTitle, t)) ||
-        expanded.some((t) => matchesAnyVariant(hayTitle, t));
-      if (!titleHit && anywhereHits < 1) {
-        return { matchScore: 0, score: 0, matchedTerms: [] };
-      }
-    }
-    if (anywhereHits < 1 && titleHits < 1) matchScore += 4;
-    matchScore += storyQualityAdjust(item.title, item.description || '');
-    if (matchScore < 4) return { matchScore: 0, score: 0, matchedTerms: [] };
-  }
-
-  let score = matchScore;
-  const ageMs = Date.now() - new Date(item.publishedAt).getTime();
-  if (ageMs < 6 * 60 * 60 * 1000) score += 2;
-  else if (ageMs < 24 * 60 * 60 * 1000) score += 1;
-  score += Math.min(2, Math.max(0, item.significance / 5));
-
-  // Prefer Pakistan-relevant fuel/oil coverage when user asked about petrol/fuel.
-  if (
-    primary.some((t) => ['petrol', 'diesel', 'fuel', 'gasoline', 'oil'].includes(t)) ||
-    expanded.includes('petrol')
-  ) {
-    if (/\b(pakistan|karachi|islamabad|lahore|ogra|pkr)\b/i.test(hayAll)) score += 8;
-    if (/\b(crude|brent|wti|opec|petroleum|oil price|fuel)\b/i.test(hayTitle)) score += 4;
-    // Demote US retail-gas betting/election noise for petrol asks.
-    if (/\b(kalshi|election day|governors ball)\b/i.test(hayAll)) score -= 10;
-  }
-
-  return {
-    matchScore,
-    score,
-    matchedTerms: collectMatchedTerms(item, primary, expanded),
-  };
-}
-
-function formatTime(iso: string): string {
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return '';
-    const stamp = d.toLocaleString('en-GB', {
-      timeZone: 'Asia/Karachi',
-      day: '2-digit',
-      month: 'short',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    });
-    return `${stamp} PKT`;
-  } catch {
-    return '';
-  }
-}
-
-function stripBoilerplate(desc: string): string {
-  let s = desc.replace(/\s+/g, ' ').trim();
-  s = s.replace(NEWSLETTER_BOILERPLATE_RE, ' ');
-  s = s.replace(/^(this is today'?s edition[^.]*\.\s*)+/i, '');
-  s = s.replace(
-    /^our weekday newsletter that provides a daily dose of what'?s going on in the world of technology\.?\s*/i,
-    '',
-  );
-  s = s.replace(/\|\s*Photo:[^.]*\.?/gi, ' ');
-  s = s.replace(/Photo:\s*[^.]*\.\s*/gi, ' ');
-  s = s.replace(/\s+/g, ' ').trim();
-  return s;
-}
-
-function waSummary(desc: string): string {
-  const clean = stripBoilerplate(desc);
-  if (!clean) return 'Open the source link for the full publisher article.';
-  if (clean.length <= WA_SUMMARY_MAX) return clean;
-  const sliced = clean.slice(0, WA_SUMMARY_MAX);
-  const lastStop = Math.max(
-    sliced.lastIndexOf('. '),
-    sliced.lastIndexOf('! '),
-    sliced.lastIndexOf('? '),
-  );
-  if (lastStop > 80) return sliced.slice(0, lastStop + 1);
-  const lastSpace = sliced.lastIndexOf(' ');
-  if (lastSpace > 80) return sliced.slice(0, lastSpace).trimEnd() + '...';
-  return sliced.trimEnd() + '...';
-}
-
-function buildBrief(
-  items: QueryResultItem[],
-  topicLabel: string,
-  weather?: WeatherPayload | null,
-  poolSize = 0,
-  soft = false,
-): string {
-  if (weather?.error) return weather.error;
-  if (weather && !weather.error && weather.location) {
-    return `Live conditions for ${weather.location}.`;
-  }
-  if (items.length === 0) {
-    if (poolSize === 0) {
-      return `NewsDash feeds are still syncing. Open the dashboard once, wait a few seconds, then ask again.`;
-    }
-    return `No fresh matching story for "${topicLabel}" in the current NewsDash feed window.`;
-  }
-  if (soft) {
-    return items.length === 1
-      ? 'Closest matching story from NewsDash.'
-      : 'Closest matching stories from NewsDash.';
-  }
-  return items.length === 1
-    ? 'Top matching story from NewsDash.'
-    : `${items.length} matching stories from NewsDash.`;
-}
-
-function buildWeatherBlock(weather: WeatherPayload): string {
-  if (weather.error) return `*Live weather*\n${weather.error}`;
+function formatStory(i: QueryResultItem, idx: number, showIndex: boolean): string {
+  const when = formatTime(i.publishedAt);
+  const title = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
+  const terms = (i.matchedTerms || []).map(titleCase).filter(Boolean);
+  const matched = terms.length
+    ? `_Matched: ${terms.join(', ')} | ${i.source}_`
+    : `_Source feed: ${i.source}_`;
   return [
+    title,
+    matched,
+    when ? `_Published ${when}_` : '',
+    waSummary(i.description || ''),
+    `*Source:* ${i.source || 'Publisher'}`,
+    i.url.trim(),
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function buildNewsReply(
+  topicLabel: string,
+  items: QueryResultItem[],
+  poolSize: number,
+  note?: string,
+): string {
+  const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`];
+  if (note) parts.push(note);
+
+  if (!items.length) {
+    parts.push(
+      poolSize === 0
+        ? 'NewsDash feeds are still syncing. Please try again in a moment.'
+        : `No strong matching story for "${topicLabel}" in the current NewsDash window.`,
+    );
+    return parts.join('\n');
+  }
+
+  parts.push(
+    items.length === 1
+      ? 'Top matching story from NewsDash.'
+      : `${items.length} matching stories from NewsDash.`,
+  );
+  const showIndex = items.length > 1;
+  parts.push('', items.map((i, idx) => formatStory(i, idx, showIndex)).join('\n\n'));
+  return parts.join('\n');
+}
+
+function buildGreeting(): string {
+  return [
+    '*NewsDash Analyst*',
+    '',
+    'Ask any news or market question. I search your NewsDash feeds and reply with source links.',
+    '',
+    'Examples: AI regulation, OpenAI, oil markets, Pakistan crypto, gold price now, weather in Karachi.',
+  ].join('\n');
+}
+
+function buildWeatherReply(topicLabel: string, weather: WeatherPayload): string {
+  if (weather.error) {
+    return ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, weather.error].join('\n');
+  }
+  return [
+    '*NewsDash Analyst*',
+    '',
+    `*Topic:* ${topicLabel}`,
+    `Live conditions for ${weather.location}.`,
+    '',
     '*Live weather*',
-    `*${weather.location || 'Unknown'}* - ${weather.condition || '-'}`,
+    `*${weather.location}* - ${weather.condition || '-'}`,
     `${weather.temperature ?? '-'} C (feels ${weather.feelsLike ?? '-'} C) | Humidity ${weather.humidity ?? '-'}% | Wind ${weather.windKmh ?? '-'} km/h`,
   ].join('\n');
 }
 
-function isValidArticleUrl(url: unknown): url is string {
-  if (typeof url !== 'string' || !url.trim()) return false;
-  try {
-    const u = new URL(url.trim());
-    return u.protocol === 'http:' || u.protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
-
-function sourceHyperlink(source: string, url: string): string {
-  const outlet = source?.trim() || 'Publisher';
-  return [`*Source:* ${outlet}`, url.trim()].join('\n');
-}
-
-function matchMetaLine(i: QueryResultItem): string {
-  const terms = (i.matchedTerms || []).map((t) => titleCaseWords(t)).filter(Boolean);
-  const left = terms.length ? terms.join(', ') : 'topic';
-  const outlet = i.source?.trim() || 'NewsDash';
-  return `_Matched: ${left} | ${outlet}_`;
-}
-
-function formatNewsStoryBlock(i: QueryResultItem, idx: number, showIndex: boolean): string {
-  const when = formatTime(i.publishedAt);
-  const title = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
+function buildGoldReply(topicLabel: string, gold: GoldQuote): string {
   const lines = [
-    title,
-    matchMetaLine(i),
-    when ? `_Published ${when}_` : '',
-    waSummary(i.description || ''),
-  ];
-  if (isValidArticleUrl(i.url)) {
-    lines.push(sourceHyperlink(i.source, i.url));
-  }
-  return lines.filter(Boolean).join('\n');
-}
-
-function buildWhatsAppText(
-  topicLabel: string,
-  brief: string,
-  items: QueryResultItem[],
-  weather?: WeatherPayload | null,
-  liveGold?: GoldQuote | null,
-): string {
-  const withUrls = items.filter((i) => isValidArticleUrl(i.url));
-  const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief];
-
-  if (weather && (weather.location || weather.error)) {
-    parts.push('', buildWeatherBlock(weather));
-  }
-
-  if (liveGold && liveGold.price > 0) {
-    const goldLines = [
-      '*Live gold context*',
-      `*XAU/USD* - $${liveGold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} / oz`,
-    ];
-    if (liveGold.pkrPerTolaApprox && liveGold.usdPkrRate) {
-      goldLines.push(
-        `*Approx PKR/tola* - Rs ${liveGold.pkrPerTolaApprox.toLocaleString('en-PK')} (converted @ ${liveGold.usdPkrRate.toFixed(2)} PKR/USD)`,
-      );
-    }
-    parts.push('', goldLines.join('\n'));
-  }
-
-  if (!withUrls.length) return parts.join('\n');
-
-  const showIndex = withUrls.length > 1;
-  parts.push('', withUrls.map((i, idx) => formatNewsStoryBlock(i, idx, showIndex)).join('\n\n'));
-  return parts.join('\n');
-}
-
-function buildGoldWhatsApp(topicLabel: string, gold: GoldQuote): string {
-  const brief = 'Live gold spot (international).';
-  const lines = [
+    '*NewsDash Analyst*',
+    '',
+    `*Topic:* ${topicLabel}`,
+    'Live gold spot (international).',
+    '',
     '*Live gold price*',
     `*XAU/USD* - $${gold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} / oz`,
   ];
   if (gold.pkrPerTolaApprox && gold.usdPkrRate) {
     lines.push(
       `*Approx PKR/tola* - Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} (converted @ ${gold.usdPkrRate.toFixed(2)} PKR/USD)`,
-      '_Converted estimate — local jewellery rates may differ._',
+      '_Converted estimate - local jewellery rates may differ._',
     );
   }
   lines.push('_Updated just now_');
-  return ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief, '', lines.join('\n')].join(
-    '\n',
-  );
+  return lines.join('\n');
 }
 
-function buildCryptoWhatsApp(topicLabel: string, quote: CryptoQuote): string {
+function buildCryptoReply(topicLabel: string, quote: CryptoQuote): string {
   const ch =
     quote.change24h == null
       ? ''
       : ` | 24h ${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}%`;
-  const brief = `Live ${quote.name} price.`;
-  const block = [
+  return [
+    '*NewsDash Analyst*',
+    '',
+    `*Topic:* ${topicLabel}`,
+    `Live ${quote.name} price.`,
+    '',
     `*Live ${quote.name} price*`,
     `*${quote.symbol}/USD* - $${quote.usd.toLocaleString('en-US', {
       maximumFractionDigits: quote.usd >= 100 ? 2 : 4,
     })}${ch}`,
     '_Updated just now_',
   ].join('\n');
-  return ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief, '', block].join('\n');
 }
 
-/** Prefer market/fuel coverage in the title — not a weak description mention. */
-function isUsefulFuelHeadline(item: NewsItem): boolean {
-  const title = item.title.toLowerCase();
-  const hay = `${item.title} ${item.description || ''}`.toLowerCase();
-  if (/\b(kalshi|election day)\b/.test(hay) && /\bgas prices?\b/.test(hay)) return false;
-  return /\b(oil|crude|brent|wti|petroleum|petrol|diesel|fuel|gasoline|opec)\b/.test(title);
-}
+function assertQuality(args: {
+  kind: PluginKind;
+  text: string;
+  items?: QueryResultItem[];
+  weather?: WeatherPayload | null;
+  gold?: GoldQuote | null;
+  crypto?: CryptoQuote | null;
+  requestedCity?: string;
+}): { ok: true } | { ok: false; reason: string } {
+  const { kind, text, items, weather, gold, crypto, requestedCity } = args;
+  if (!text || text.length < 16) return { ok: false, reason: 'Empty reply. Please ask again.' };
 
-function buildFuelNewsWhatsApp(topicLabel: string, oilItems: QueryResultItem[]): string {
-  const withUrls = oilItems.filter((i) => isValidArticleUrl(i.url));
-  const brief = withUrls.length
-    ? 'Live Pakistan pump prices are not wired yet. Here is the latest oil/fuel coverage from NewsDash.'
-    : 'Live Pakistan pump prices are not wired yet. No oil/fuel headline is in the current NewsDash window — try again after feeds refresh.';
-  const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, brief];
-  if (withUrls.length) {
-    const showIndex = withUrls.length > 1;
-    parts.push('', withUrls.map((i, idx) => formatNewsStoryBlock(i, idx, showIndex)).join('\n\n'));
-  }
-  return parts.join('\n');
-}
-
-function fallbackWhatsApp(topicLabel: string, reason: string): string {
-  return ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, reason].join('\n');
-}
-
-/** Quality gate: never send wrong-city weather or empty "successful" prices. */
-function assertReplyQuality(payload: QualityPayload): { ok: true } | { ok: false; reason: string } {
-  const { intent, whatsappText, weather, goldPrice, cryptoPrice, items, requestedCity } = payload;
-
-  if (!whatsappText || whatsappText.length < 20) {
-    return { ok: false, reason: 'Reply was empty. Please ask again.' };
-  }
-
-  if (intent === 'weather') {
-    if (weather?.error) return { ok: true };
-    if (!weather?.location || weather.temperature == null) {
-      return { ok: false, reason: 'Could not fetch live weather right now. Please try again.' };
+  if (kind === 'weather' && !weather?.error) {
+    if (weather?.temperature == null || !weather.location) {
+      return { ok: false, reason: 'Could not fetch live weather. Please try again.' };
     }
     if (requestedCity) {
-      const cityToken = requestedCity.toLowerCase().split(/\s+/)[0];
-      if (cityToken && cityToken.length >= 3) {
-        const loc = (weather.location || '').toLowerCase();
-        if (!loc.includes(cityToken)) {
-          return {
-            ok: false,
-            reason: `Could not confirm weather for "${requestedCity}". Try a clearer city name.`,
-          };
-        }
+      const token = requestedCity.toLowerCase().split(/\s+/)[0];
+      if (token.length >= 3 && !(weather.location || '').toLowerCase().includes(token)) {
+        return { ok: false, reason: `Could not confirm weather for "${requestedCity}".` };
       }
     }
   }
 
-  if (intent === 'gold_price') {
-    if (!goldPrice || !(goldPrice.price > 0)) {
-      return { ok: false, reason: 'Live gold price is temporarily unavailable. Please try again.' };
-    }
-    if (!/\$|usd|xau/i.test(whatsappText)) {
-      return { ok: false, reason: 'Live gold price is temporarily unavailable. Please try again.' };
-    }
+  if (kind === 'gold_price' && !(gold && gold.price > 0)) {
+    return { ok: false, reason: 'Live gold price unavailable. Please try again.' };
+  }
+  if (kind === 'crypto_price' && !(crypto && crypto.usd > 0)) {
+    return { ok: false, reason: 'Live crypto price unavailable. Please try again.' };
   }
 
-  if (intent === 'crypto_price') {
-    if (!cryptoPrice || !(cryptoPrice.usd > 0)) {
-      return { ok: false, reason: 'Live crypto price is temporarily unavailable. Please try again.' };
-    }
-  }
-
-  if (intent === 'news' && items && items.length > 0) {
-    const missingUrl = items.some((i) => !isValidArticleUrl(i.url));
-    if (missingUrl) {
-      return {
-        ok: false,
-        reason:
-          'Could not attach a verifiable source link. Please ask again or try another topic.',
-      };
-    }
+  if (kind === 'news' && items?.length) {
     for (const item of items) {
-      if (!whatsappText.includes(item.url.trim())) {
+      if (!isValidArticleUrl(item.url) || !text.includes(item.url.trim())) {
         return {
           ok: false,
-          reason:
-            'Could not attach a verifiable source link. Please ask again or try another topic.',
+          reason: 'Could not attach a verifiable NewsDash source link. Please ask again.',
         };
       }
     }
@@ -939,252 +791,7 @@ function assertReplyQuality(payload: QualityPayload): { ok: true } | { ok: false
   return { ok: true };
 }
 
-async function loadFreshItems(): Promise<NewsItem[]> {
-  const all = await getFeedItemsForQuery().catch(() => [] as NewsItem[]);
-  return all.filter((item) => item?.id && isFresh(item.publishedAt));
-}
-
-function titlesTooSimilar(a: string, b: string): boolean {
-  const ta = new Set(
-    cleanQuery(a)
-      .split(/\s+/g)
-      .filter((w) => w.length > 3),
-  );
-  const tb = cleanQuery(b)
-    .split(/\s+/g)
-    .filter((w) => w.length > 3);
-  if (!tb.length) return false;
-  let overlap = 0;
-  for (const w of tb) if (ta.has(w)) overlap += 1;
-  return overlap / tb.length >= 0.55;
-}
-
-function titleHasAnyTerm(title: string, terms: string[]): boolean {
-  const hay = title.toLowerCase();
-  return terms.some((t) => t && matchesAnyVariant(hay, t));
-}
-
-function strongTopicTerms(primary: string[], q: string): string[] {
-  const cats = new Set([
-    'ai',
-    'crypto',
-    'trading',
-    'tech',
-    'research',
-    'startups',
-    'global',
-    'github',
-  ]);
-  const fromSyn = primary.filter(
-    (t) =>
-      Boolean(TOPIC_SYNONYMS[t]) ||
-      cats.has(t) ||
-      Object.values(TOPIC_SYNONYMS).some((syns) => syns.includes(t)),
-  );
-  const topic = topicFromPhrase(q);
-  if (topic) fromSyn.unshift(topic);
-  for (const c of inferCategories(q)) fromSyn.push(c);
-  return Array.from(new Set(fromSyn));
-}
-
-/** Specific entities that must appear in titles (not broad section names). */
-function titleRequiredEntities(primary: string[], q: string): string[] {
-  const broad = new Set(['tech', 'trading', 'global', 'research', 'startups', 'github']);
-  return strongTopicTerms(primary, q).filter((t) => !broad.has(t));
-}
-
-function filterByTitleEntities(
-  items: QueryResultItem[],
-  primary: string[],
-  q = '',
-): QueryResultItem[] {
-  const entities = titleRequiredEntities(primary, q);
-  if (!entities.length || !items.length) return items;
-  const hit = items.filter((i) => titleHasAnyTerm(i.title, entities));
-  return hit.length ? hit : [];
-}
-
-function buildGreetingWhatsApp(): string {
-  return [
-    '*NewsDash Analyst*',
-    '',
-    'Hi — ask any news or market question and I will reply from your NewsDash feeds with source links.',
-    '',
-    '*Examples*',
-    '• AI news',
-    '• Gold price now',
-    '• Weather in Peshawar',
-    '• Petrol price',
-    '• Iran oil',
-    '• Bitcoin today',
-  ].join('\n');
-}
-
-function isTeaserStory(item: NewsItem): boolean {
-  return (
-    TEASER_TITLE_RE.test(item.title) ||
-    NEWSLETTER_BOILERPLATE_RE.test(item.description || '') ||
-    /\b(we announced|our latest)\b/i.test(item.title)
-  );
-}
-
-function pickStories(scored: QueryResultItem[], limit: number): QueryResultItem[] {
-  if (!scored.length || limit <= 0) return [];
-  const preferred = scored.filter((i) => !isTeaserStory(i));
-  const pool = preferred.length ? preferred : scored;
-  const out: QueryResultItem[] = [pool[0]];
-  for (const cand of pool.slice(1)) {
-    if (out.length >= limit) break;
-    const tooClose = out.some(
-      (prev) =>
-        titlesTooSimilar(prev.title, cand.title) ||
-        (prev.source && cand.source && prev.source === cand.source && titlesTooSimilar(prev.title, cand.title)),
-    );
-    if (!tooClose) out.push(cand);
-  }
-  // If diversity filter was too aggressive, fill remaining slots.
-  for (const cand of pool.slice(1)) {
-    if (out.length >= limit) break;
-    if (!out.some((p) => p.id === cand.id)) out.push(cand);
-  }
-  return out;
-}
-
-async function searchNews(
-  q: string,
-  limit: number,
-  categories?: Category[],
-): Promise<{
-  items: QueryResultItem[];
-  total: number;
-  poolSize: number;
-  primary: string[];
-  expanded: string[];
-  allowed: Category[];
-  soft: boolean;
-}> {
-  let primary = tokenize(q);
-  let expanded = expandTerms(q);
-  const phrase = cleanQuery(q);
-  const inferred = inferCategories(q);
-  const allowed = categories && categories.length > 0 ? categories : inferred;
-
-  // Fuel/petrol natural language → search oil/fuel cluster.
-  const fuelAsk =
-    /\b(petrol|diesel|gasoline|fuel|pump)\b/.test(phrase) ||
-    (/\bgas\b/.test(phrase) && /\b(price|prices|rate|cost)\b/.test(phrase));
-  if (fuelAsk) {
-    primary = Array.from(new Set(['petrol', 'oil', 'fuel', ...primary]));
-    expanded = Array.from(
-      new Set([
-        ...expanded,
-        ...expandTerms('petrol oil fuel crude petroleum'),
-        'pakistan',
-      ]),
-    );
-  }
-
-  const fresh = await loadFreshItems();
-  const poolSize = fresh.length;
-
-  const rank = (list: QueryResultItem[]) =>
-    list.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
-      return new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime();
-    });
-
-  const scorePool = (terms: string[], exp: string[], mode: 'strict' | 'relaxed', minScore: number) =>
-    rank(
-      fresh
-        .filter((i) => isValidArticleUrl(i.url))
-        .map((i) => {
-          const { matchScore, score, matchedTerms } = scoreItem(i, terms, exp, phrase, mode);
-          return { ...i, score, matchScore, matchedTerms };
-        })
-        .filter((i) => i.matchScore >= minScore),
-    );
-
-  let soft = false;
-  let scored = primary.length ? scorePool(primary, expanded, 'strict', 10) : [];
-
-  if (scored.length === 0 && primary.length > 2) {
-    primary = fallbackPrimary(primary);
-    expanded = expandTerms(primary.join(' '));
-    scored = scorePool(primary, expanded, 'strict', 10);
-  }
-
-  if (scored.length === 0) {
-    const topic = topicFromPhrase(q);
-    if (topic) {
-      primary = Array.from(new Set([topic, ...primary]));
-      expanded = expandTerms([...primary, topic].join(' '));
-      scored = scorePool(primary, expanded, 'strict', 10);
-    }
-  }
-
-  // Tier: relaxed matching so natural questions still get sourced news.
-  if (scored.length === 0 && (primary.length || expanded.length)) {
-    soft = true;
-    scored = scorePool(
-      primary.length ? primary : expanded.slice(0, 3),
-      expanded,
-      'relaxed',
-      4,
-    );
-  }
-
-  // Tier: category browse from inferred/dashboard categories.
-  if (scored.length === 0 && allowed.length) {
-    soft = true;
-    const entities = titleRequiredEntities(primary, q);
-    scored = rank(
-      fresh
-        .filter((i) => {
-          if (!isValidArticleUrl(i.url) || !allowed.includes(i.category)) return false;
-          if (entities.length) return titleHasAnyTerm(i.title, entities);
-          return true;
-        })
-        .map((i) => ({
-          ...i,
-          matchScore: 6,
-          score: Math.min(8, i.significance) + 2,
-          matchedTerms: (entities.length ? entities : allowed).slice(0, 2),
-        })),
-    );
-  }
-
-  // Global browse for known specific entities only.
-  if (scored.length === 0 && titleRequiredEntities(primary, q).length) {
-    soft = true;
-    const entities = titleRequiredEntities(primary, q);
-    scored = rank(
-      fresh
-        .filter((i) => isValidArticleUrl(i.url) && titleHasAnyTerm(i.title, entities))
-        .map((i) => ({
-          ...i,
-          matchScore: 5,
-          score: Math.min(8, i.significance),
-          matchedTerms: entities.slice(0, 2),
-        })),
-    );
-  }
-
-  let items = filterByTitleEntities(pickStories(scored, limit), primary, q);
-  if (fuelAsk) items = items.filter(isUsefulFuelHeadline);
-
-  return {
-    items,
-    total: scored.length,
-    poolSize,
-    primary,
-    expanded,
-    allowed,
-    soft,
-  };
-}
-
-function linkPreviewFromItems(items: QueryResultItem[]): LinkPreview | undefined {
+function linkPreview(items: QueryResultItem[]): LinkPreview | undefined {
   const top = items[0];
   if (!top?.url) return undefined;
   return {
@@ -1202,51 +809,47 @@ export async function POST(request: Request) {
 
   const rawQ = body.q.trim();
   const q = extractTopicQuery(rawQ);
-  const limit = Math.min(
-    Math.max(body.limit ?? WA_STORY_LIMIT, 1),
-    WA_STORY_LIMIT_MAX,
-  );
-  const intent = resolveIntent(q);
-  const topicLabel = displayTopic(q, intent);
+  const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT_MAX);
+  const plugin = detectPlugin(q);
+  const topicLabel = displayTopic(q, plugin);
   const now = new Date().toISOString();
 
-  if (intent.kind === 'greeting') {
-    const whatsappText = buildGreetingWhatsApp();
+  if (plugin.kind === 'greeting') {
     return Response.json({
       query: q,
-      displayTopic: topicLabel,
       rawQuery: rawQ,
-      intent: intent.kind,
-      categories: [],
+      displayTopic: topicLabel,
+      intent: 'greeting',
       brief: 'Greeting',
       items: [],
       total: 0,
-      whatsappText,
+      whatsappText: buildGreeting(),
       lastUpdated: now,
     });
   }
 
-  if (intent.kind === 'weather') {
-    const weather = await fetchDashboardWeather(intent.city, intent.cityAsked);
-    const brief = buildBrief([], topicLabel, weather, 0);
-    let whatsappText = buildWhatsAppText(topicLabel, brief, [], weather);
-    const gate = assertReplyQuality({
-      intent: 'weather',
-      whatsappText,
+  if (plugin.kind === 'weather') {
+    const weather = await fetchWeather(plugin.city, plugin.cityAsked);
+    let whatsappText = buildWeatherReply(
+      topicLabel,
+      weather || { error: 'Could not fetch live weather. Please try again.' },
+    );
+    const gate = assertQuality({
+      kind: 'weather',
+      text: whatsappText,
       weather,
-      requestedCity: intent.cityAsked ? intent.city : undefined,
+      requestedCity: plugin.cityAsked ? plugin.city : undefined,
     });
     if (!gate.ok) {
-      whatsappText = fallbackWhatsApp(topicLabel, gate.reason);
+      whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
     }
     return Response.json({
       query: q,
-      displayTopic: topicLabel,
       rawQuery: rawQ,
-      intent: intent.kind,
-      categories: [],
+      displayTopic: topicLabel,
+      intent: 'weather',
       weather: weather ?? undefined,
-      brief,
+      brief: weather?.error || `Live conditions for ${weather?.location || topicLabel}.`,
       items: [],
       total: weather && !weather.error ? 1 : 0,
       whatsappText,
@@ -1254,157 +857,100 @@ export async function POST(request: Request) {
     });
   }
 
-  if (intent.kind === 'gold_price') {
-    const gold = await fetchLiveGoldPrice();
+  if (plugin.kind === 'gold_price') {
+    const gold = await fetchGold();
     if (gold) {
-      let whatsappText = buildGoldWhatsApp(topicLabel, gold);
-      const gate = assertReplyQuality({
-        intent: 'gold_price',
-        whatsappText,
-        goldPrice: gold,
-      });
-      if (!gate.ok) whatsappText = fallbackWhatsApp(topicLabel, gate.reason);
+      let whatsappText = buildGoldReply(topicLabel, gold);
+      const gate = assertQuality({ kind: 'gold_price', text: whatsappText, gold });
+      if (!gate.ok) {
+        whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
+      }
       return Response.json({
         query: q,
-        displayTopic: topicLabel,
         rawQuery: rawQ,
-        intent: intent.kind,
-        categories: ['trading'],
+        displayTopic: topicLabel,
+        intent: 'gold_price',
         brief: 'Live gold spot (international).',
         items: [],
         total: 1,
-        whatsappText,
         goldPrice: gold,
+        whatsappText,
         lastUpdated: now,
       });
     }
+    // Fall through to universal news if live quote fails.
   }
 
-  if (intent.kind === 'crypto_price') {
-    const quote = await fetchCryptoPrice(intent.cryptoId);
+  if (plugin.kind === 'crypto_price') {
+    const quote = await fetchCrypto(plugin.cryptoId);
     if (quote) {
-      let whatsappText = buildCryptoWhatsApp(topicLabel, quote);
-      const gate = assertReplyQuality({
-        intent: 'crypto_price',
-        whatsappText,
-        cryptoPrice: quote,
-      });
-      if (!gate.ok) whatsappText = fallbackWhatsApp(topicLabel, gate.reason);
+      let whatsappText = buildCryptoReply(topicLabel, quote);
+      const gate = assertQuality({ kind: 'crypto_price', text: whatsappText, crypto: quote });
+      if (!gate.ok) {
+        whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
+      }
       return Response.json({
         query: q,
-        displayTopic: topicLabel,
         rawQuery: rawQ,
-        intent: intent.kind,
-        categories: ['crypto'],
+        displayTopic: topicLabel,
+        intent: 'crypto_price',
         brief: `Live ${quote.name} price.`,
         items: [],
         total: 1,
-        whatsappText,
         cryptoPrice: quote,
+        whatsappText,
         lastUpdated: now,
       });
     }
   }
 
-  if (intent.kind === 'unsupported_live') {
-    // Never invent pump prices — but always answer with real oil/fuel news + source links.
-    const oil = await searchNews('petrol oil fuel crude petroleum pakistan', 8, ['trading']);
-    const chosen = oil.items.filter(isUsefulFuelHeadline).slice(0, 2);
-    const whatsappText = buildFuelNewsWhatsApp(topicLabel, chosen);
-    return Response.json({
-      query: q,
-      displayTopic: topicLabel,
-      rawQuery: rawQ,
-      intent: intent.kind,
-      categories: ['trading'],
-      brief:
-        'Live Pakistan pump prices are not wired yet. Latest oil/fuel coverage from NewsDash.',
-      items: chosen,
-      total: chosen.length,
-      poolSize: oil.poolSize,
-      soft: oil.soft,
-      whatsappText,
-      linkPreview: linkPreviewFromItems(chosen),
-      linkPreviewEnabled: chosen.length > 0,
-      lastUpdated: now,
-    });
-  }
-
-  // News from NewsDash dashboard feeds (also gold/crypto fallback if live quote failed)
+  // ── Universal NewsDash path (default for any question) ──
   const newsQ =
-    intent.kind === 'gold_price'
+    plugin.kind === 'gold_price'
       ? 'gold'
-      : intent.kind === 'crypto_price'
-        ? intent.cryptoId
+      : plugin.kind === 'crypto_price'
+        ? plugin.cryptoId
         : q;
 
-  if (tokenize(newsQ).length === 0 && !topicFromPhrase(newsQ)) {
-    const msg =
-      'Please ask about a topic (for example AI, oil, bitcoin, Pakistan markets, or a company name).';
-    return Response.json({
-      query: q,
-      displayTopic: topicLabel,
-      rawQuery: rawQ,
-      intent: 'news',
-      categories: [],
-      brief: msg,
-      items: [],
-      total: 0,
-      whatsappText: buildWhatsAppText(topicLabel, msg, []),
-      lastUpdated: now,
-    });
-  }
+  // Fuel/pump asks: never invent a number; answer with oil/fuel market evidence from feeds.
+  const fuelAsk = /\b(petrol|diesel|gasoline|pump\s*price|fuel\s*price)\b/i.test(q);
+  const searchQ = fuelAsk ? `${newsQ} oil crude petroleum fuel` : newsQ;
 
-  const searched = await searchNews(
-    newsQ,
+  const ranked = await retrieveAndRank(
+    searchQ,
     limit,
-    body.categories && body.categories.length > 0 ? body.categories : undefined,
+    body.categories && body.categories.length ? body.categories : undefined,
   );
 
-  const brief = buildBrief(
-    searched.items,
-    topicLabel,
-    null,
-    searched.poolSize,
-    searched.soft,
-  );
-  const liveGold =
-    /\b(gold|xau|bullion)\b/i.test(newsQ) ? await fetchLiveGoldPrice() : null;
-  const briefFinal =
-    liveGold && searched.items.length === 0
-      ? 'No fresh gold headline in NewsDash right now. Live spot context is below.'
-      : brief;
-  let whatsappText = buildWhatsAppText(
-    topicLabel,
-    briefFinal,
-    searched.items,
-    null,
-    liveGold,
-  );
-  const gate = assertReplyQuality({
-    intent: 'news',
-    whatsappText,
-    items: searched.items,
-  });
-  if (!gate.ok && searched.items.length > 0) {
-    whatsappText = fallbackWhatsApp(topicLabel, gate.reason);
+  let items = ranked.items;
+  if (fuelAsk) {
+    items = items.filter((i) =>
+      /\b(oil|crude|brent|wti|petroleum|petrol|diesel|fuel|gasoline|opec)\b/i.test(i.title),
+    );
   }
 
-  const preview = linkPreviewFromItems(searched.items);
+  const note = fuelAsk
+    ? 'Live Pakistan pump prices are not wired yet. Showing related oil/fuel coverage from NewsDash.'
+    : undefined;
+
+  let whatsappText = buildNewsReply(topicLabel, items, ranked.poolSize, note);
+  const gate = assertQuality({ kind: 'news', text: whatsappText, items });
+  if (!gate.ok && items.length) {
+    whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
+  }
+
+  const preview = linkPreview(items);
 
   return Response.json({
     query: q,
-    displayTopic: topicLabel,
     rawQuery: rawQ,
-    intent: 'news',
-    categories: searched.allowed,
-    terms: { primary: searched.primary, expanded: searched.expanded },
-    brief,
-    items: searched.items,
-    total: searched.total,
-    poolSize: searched.poolSize,
-    soft: searched.soft,
-    goldPrice: liveGold || undefined,
+    displayTopic: topicLabel,
+    intent: fuelAsk ? 'unsupported_live' : 'news',
+    terms: { primary: ranked.tokens, expanded: ranked.expanded },
+    brief: note || (items.length ? 'Matching stories from NewsDash.' : 'No strong match.'),
+    items,
+    total: ranked.total,
+    poolSize: ranked.poolSize,
     whatsappText,
     linkPreview: preview,
     linkPreviewEnabled: Boolean(preview),
