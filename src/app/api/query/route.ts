@@ -40,6 +40,7 @@ const STOP_WORDS = new Set([
   'everything', 'thing', 'things', 'from', 'with', 'into', 'over', 'under', 'again',
   'can', 'you', 'could', 'would', 'need', 'want', 'looking', 'know', 'explain', 'describe',
   'detail', 'details', 'summary', 'brief', 'quick', 'currently', 'happening',
+  'price', 'prices', 'cost', 'rate', 'rates', 'value', 'current', 'spot',
 ]);
 
 /** Optional boosts only — any other word still searches the full dashboard. */
@@ -199,6 +200,61 @@ function isWeatherIntent(q: string): boolean {
     return true;
   }
   return false;
+}
+
+function isGoldPriceIntent(q: string): boolean {
+  const s = cleanQuery(q);
+  if (!/\b(gold|xau|bullion)\b/.test(s)) return false;
+  if (/\b(price|prices|spot|rate|cost|xau|how much|trading at)\b/.test(s)) return true;
+  if (/^(gold|xau|bullion)$/.test(s)) return true;
+  return false;
+}
+
+function extractWeatherLocation(q: string): string {
+  let s = cleanQuery(q);
+  s = s.replace(/\b(weather|forecast|temperature|humidity|today|now|current|please|tell|me|about|of|in|for|the|a|an)\b/g, ' ');
+  s = s.replace(/\s+/g, ' ').trim();
+  return s || 'London';
+}
+
+async function geocodeLocation(name: string): Promise<{ lat: number; lon: number; label: string } | null> {
+  try {
+    const url =
+      'https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name=' +
+      encodeURIComponent(name);
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const hit = Array.isArray(data?.results) ? data.results[0] : null;
+    if (!hit) return null;
+    const parts = [hit.name, hit.admin1, hit.country].filter(Boolean);
+    return {
+      lat: Number(hit.latitude),
+      lon: Number(hit.longitude),
+      label: parts.join(', '),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchLiveGoldPrice(): Promise<{ price: number; currency: string; symbol: string } | null> {
+  try {
+    const res = await fetch('https://api.gold-api.com/price/XAU', {
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const price = Number(data.price ?? data.ask ?? data.bid);
+    if (!Number.isFinite(price) || price <= 0) return null;
+    return {
+      price,
+      currency: String(data.currency || 'USD'),
+      symbol: 'XAU',
+    };
+  } catch {
+    return null;
+  }
 }
 
 function inferCategories(q: string): Category[] {
@@ -380,10 +436,12 @@ async function loadFreshItems(): Promise<NewsItem[]> {
   return all.filter((item) => item?.id && isFresh(item.publishedAt));
 }
 
-async function fetchDashboardWeather(): Promise<WeatherPayload | null> {
+async function fetchDashboardWeather(locationHint = 'London'): Promise<WeatherPayload | null> {
   try {
-    const lat = 51.5074;
-    const lon = -0.1278;
+    const geo = await geocodeLocation(locationHint);
+    const lat = geo?.lat ?? 51.5074;
+    const lon = geo?.lon ?? -0.1278;
+    const label = geo?.label ?? 'London, UK';
     const forecastUrl =
       `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day' +
@@ -406,7 +464,7 @@ async function fetchDashboardWeather(): Promise<WeatherPayload | null> {
       95: 'Thunderstorm',
     };
     return {
-      location: 'London, UK',
+      location: label,
       temperature: Math.round(Number(current.temperature_2m ?? 0)),
       feelsLike: Math.round(Number(current.apparent_temperature ?? 0)),
       humidity: Math.round(Number(current.relative_humidity_2m ?? 0)),
@@ -432,8 +490,9 @@ export async function POST(request: Request) {
   let expanded = expandTerms(q);
   const phrase = cleanQuery(q);
   const weatherIntent = isWeatherIntent(q);
+  const goldPriceIntent = isGoldPriceIntent(q);
 
-  if (primary.length === 0) {
+  if (primary.length === 0 && !weatherIntent && !goldPriceIntent) {
     const msg = 'Please ask with a clear keyword (any topic on your NewsDash feeds).';
     return Response.json({
       query: q,
@@ -447,8 +506,37 @@ export async function POST(request: Request) {
     });
   }
 
-  const weatherPromise = weatherIntent ? fetchDashboardWeather() : Promise.resolve(null);
-  const pureWeather = weatherIntent && /^(weather|forecast|temperature|humidity)$/.test(phrase);
+  // Live gold spot price (same source as Market Telemetry)
+  if (goldPriceIntent) {
+    const gold = await fetchLiveGoldPrice();
+    if (gold) {
+      const brief = `Live gold spot price from NewsDash market data.`;
+      const block = [
+        '*Live gold price*',
+        `*XAU/USD* — $${gold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} per oz`,
+        `_Updated just now_`,
+      ].join('\n');
+      const whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief, '', block].join('\n');
+      return Response.json({
+        query: q,
+        rawQuery: rawQ,
+        categories: ['trading'],
+        brief,
+        items: [],
+        total: 1,
+        whatsappText,
+        goldPrice: gold,
+        lastUpdated: new Date().toISOString(),
+      });
+    }
+  }
+
+  const locationHint = weatherIntent ? extractWeatherLocation(q) : 'London';
+  const weatherPromise = weatherIntent ? fetchDashboardWeather(locationHint) : Promise.resolve(null);
+  const pureWeather =
+    weatherIntent &&
+    (/^(weather|forecast|temperature|humidity)$/.test(phrase) ||
+      Boolean(extractWeatherLocation(q)));
 
   let items: QueryResultItem[] = [];
   let scoredTotal = 0;
