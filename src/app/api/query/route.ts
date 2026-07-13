@@ -210,6 +210,58 @@ function isGoldPriceIntent(q: string): boolean {
   return false;
 }
 
+type CryptoQuote = {
+  id: string;
+  symbol: string;
+  name: string;
+  usd: number;
+  change24h?: number;
+};
+
+function detectCryptoPriceIntent(q: string): CryptoQuote['id'] | null {
+  const s = cleanQuery(q);
+  const wantsPrice =
+    /\b(price|prices|spot|rate|cost|how much|worth|trading at)\b/.test(s) ||
+    /^(bitcoin|btc|ethereum|eth|solana|sol|crypto)$/.test(s);
+  if (!wantsPrice) return null;
+  if (/\b(bitcoin|btc)\b/.test(s)) return 'bitcoin';
+  if (/\b(ethereum|eth)\b/.test(s)) return 'ethereum';
+  if (/\b(solana|sol)\b/.test(s)) return 'solana';
+  if (/\b(crypto|cryptocurrency)\b/.test(s)) return 'bitcoin';
+  return null;
+}
+
+async function fetchCryptoPrice(id: string): Promise<CryptoQuote | null> {
+  try {
+    const url =
+      `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}` +
+      '&vs_currencies=usd&include_24hr_change=true';
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const row = data?.[id];
+    const usd = Number(row?.usd);
+    if (!Number.isFinite(usd) || usd <= 0) return null;
+    const names: Record<string, { symbol: string; name: string }> = {
+      bitcoin: { symbol: 'BTC', name: 'Bitcoin' },
+      ethereum: { symbol: 'ETH', name: 'Ethereum' },
+      solana: { symbol: 'SOL', name: 'Solana' },
+    };
+    const meta = names[id] || { symbol: id.toUpperCase(), name: id };
+    return {
+      id,
+      symbol: meta.symbol,
+      name: meta.name,
+      usd,
+      change24h: Number.isFinite(Number(row?.usd_24h_change))
+        ? Number(row.usd_24h_change)
+        : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function extractWeatherLocation(q: string): string {
   let s = cleanQuery(q);
   s = s.replace(/\b(weather|forecast|temperature|humidity|today|now|current|please|tell|me|about|of|in|for|the|a|an)\b/g, ' ');
@@ -381,7 +433,7 @@ function buildBrief(
     if (poolSize === 0) {
       return `NewsDash feeds are still syncing. Open the dashboard once, wait a few seconds, then ask “${q}” again.`;
     }
-    return `No matching headline for “${q}” in NewsDash right now (tech, markets, crypto & AI feeds · ${poolSize} stories checked). Try a simpler keyword like bitcoin, gold, or AI.`;
+    return `No strong headline match for “${q}” right now (${poolSize} stories checked). Try a clearer topic like bitcoin, gold, AI, oil — or ask “bitcoin price” / “weather in Karachi” for live data.`;
   }
   return `${items.length} matching stor${items.length === 1 ? 'y' : 'ies'} from NewsDash.`;
 }
@@ -491,8 +543,9 @@ export async function POST(request: Request) {
   const phrase = cleanQuery(q);
   const weatherIntent = isWeatherIntent(q);
   const goldPriceIntent = isGoldPriceIntent(q);
+  const cryptoId = detectCryptoPriceIntent(q);
 
-  if (primary.length === 0 && !weatherIntent && !goldPriceIntent) {
+  if (primary.length === 0 && !weatherIntent && !goldPriceIntent && !cryptoId) {
     const msg = 'Please ask with a clear keyword (any topic on your NewsDash feeds).';
     return Response.json({
       query: q,
@@ -504,6 +557,35 @@ export async function POST(request: Request) {
       whatsappText: buildWhatsAppText(q, msg, []),
       lastUpdated: new Date().toISOString(),
     });
+  }
+
+  // Live crypto spot (fast path for price questions)
+  if (cryptoId) {
+    const quote = await fetchCryptoPrice(cryptoId);
+    if (quote) {
+      const ch =
+        quote.change24h == null
+          ? ''
+          : ` · 24h ${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}%`;
+      const brief = `Live ${quote.name} price from NewsDash market data.`;
+      const block = [
+        `*Live ${quote.name} price*`,
+        `*${quote.symbol}/USD* — $${quote.usd.toLocaleString('en-US', { maximumFractionDigits: quote.usd >= 100 ? 2 : 4 })}${ch}`,
+        `_Updated just now_`,
+      ].join('\n');
+      const whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${q}`, brief, '', block].join('\n');
+      return Response.json({
+        query: q,
+        rawQuery: rawQ,
+        categories: ['crypto'],
+        brief,
+        items: [],
+        total: 1,
+        whatsappText,
+        cryptoPrice: quote,
+        lastUpdated: new Date().toISOString(),
+      });
+    }
   }
 
   // Live gold spot price (same source as Market Telemetry)
