@@ -748,18 +748,34 @@ function makeShortLink(url: string): string {
 }
 
 /**
- * Formats a source entry for WhatsApp.
- * Line 1: bold title — Publisher · Time
- * Line 2: Go to: [Publisher](short NewsDash redirect)
- * WhatsApp auto-linkifies the https URL; the raw article URL never appears.
+ * Formats a source entry for WhatsApp body text (no URLs — open via URL buttons).
  */
 function formatSourceLine(i: QueryResultItem, idx: number, showIndex: boolean): string {
   const when = formatTime(i.publishedAt);
-  const label = (i.source || 'Open article').replace(/[\[\]]/g, '').trim() || 'Open article';
+  const label = (i.source || 'Publisher').replace(/[\[\]]/g, '').trim() || 'Publisher';
   const prefix = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
   const meta = [label, when].filter(Boolean).join(' · ');
-  const shortLink = makeShortLink(i.url);
-  return [`${prefix}${meta ? ` — ${meta}` : ''}`, `Go to: [${label}](${shortLink})`].join('\n');
+  return `${prefix}${meta ? ` — ${meta}` : ''}`;
+}
+
+/** WAHA sendButtons URL entries — label only; URL is behind the button. */
+type SourceButton = { type: 'url'; text: string; url: string };
+
+function buttonLabel(source: string, idx: number, total: number): string {
+  const base = (source || 'article').replace(/[\[\]*]/g, '').trim() || 'article';
+  const raw = total > 1 ? `Open ${idx + 1}: ${base}` : `Open ${base}`;
+  return raw.length <= 20 ? raw : raw.slice(0, 17) + '...';
+}
+
+function buildSourceButtons(items: QueryResultItem[]): SourceButton[] {
+  return items
+    .filter((i) => isValidArticleUrl(i.url))
+    .slice(0, 3)
+    .map((i, idx, arr) => ({
+      type: 'url' as const,
+      text: buttonLabel(i.source || 'article', idx, arr.length),
+      url: makeShortLink(i.url),
+    }));
 }
 
 async function enrichGroundedSources(items: QueryResultItem[]): Promise<GroundedSource[]> {
@@ -785,7 +801,7 @@ async function buildNewsReply(
   items: QueryResultItem[],
   poolSize: number,
   note?: string,
-): Promise<{ text: string; answer: string; sources: GroundedSource[] }> {
+): Promise<{ text: string; answer: string; sources: GroundedSource[]; sourceButtons: SourceButton[] }> {
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`];
   if (note) parts.push(note);
 
@@ -803,7 +819,7 @@ async function buildNewsReply(
             '• Check back later — feeds update every few minutes',
           ].join('\n');
     parts.push(notFound);
-    return { text: parts.join('\n'), answer: '', sources: [] };
+    return { text: parts.join('\n'), answer: '', sources: [], sourceButtons: [] };
   }
 
   const sources = await enrichGroundedSources(items);
@@ -812,10 +828,14 @@ async function buildNewsReply(
     answer = buildExtractiveAnswer(question, sources);
   }
 
+  const sourceButtons = buildSourceButtons(items);
   parts.push('', '*Answer:*', answer, '', '*Sources*');
   const showIndex = items.length > 1;
   parts.push(items.map((i, idx) => formatSourceLine(i, idx, showIndex)).join('\n\n'));
-  return { text: parts.join('\n'), answer, sources };
+  if (sourceButtons.length) {
+    parts.push('', '_Tap a button below to open the source._');
+  }
+  return { text: parts.join('\n'), answer, sources, sourceButtons };
 }
 
 function buildGreeting(): string {
@@ -892,8 +912,9 @@ function assertQuality(args: {
   crypto?: CryptoQuote | null;
   requestedCity?: string;
   answer?: string;
+  sourceButtons?: SourceButton[];
 }): { ok: true } | { ok: false; reason: string } {
-  const { kind, text, items, weather, gold, crypto, requestedCity, answer } = args;
+  const { kind, text, items, weather, gold, crypto, requestedCity, answer, sourceButtons } = args;
   if (!text || text.length < 16) return { ok: false, reason: 'Empty reply. Please ask again.' };
 
   if (kind === 'weather' && !weather?.error) {
@@ -916,7 +937,6 @@ function assertQuality(args: {
   }
 
   if (kind === 'news' && items?.length) {
-    // Only enforce source-grounding checks when we actually have local news items
     if (!text.includes('*Answer:*')) {
       return { ok: false, reason: 'Could not build a grounded answer.' };
     }
@@ -930,8 +950,14 @@ function assertQuality(args: {
       if (!isValidArticleUrl(item.url)) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
-      // Verify the short link (not raw URL) appears in the message
-      if (!text.includes(makeShortLink(item.url))) {
+    }
+    const buttons = sourceButtons || [];
+    if (buttons.length < 1) {
+      return { ok: false, reason: 'Could not attach a verifiable source link.' };
+    }
+    for (const item of items) {
+      const expected = makeShortLink(item.url);
+      if (!buttons.some((b) => b.url === expected)) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
     }
@@ -1094,22 +1120,26 @@ export async function POST(request: Request) {
 
   const built = await buildNewsReply(rawQ, topicLabel, items, ranked.poolSize, note);
   let whatsappText = built.text;
+  let sourceButtons = built.sourceButtons;
   const gate = assertQuality({
     kind: 'news',
     text: whatsappText,
     items,
     answer: built.answer,
+    sourceButtons,
   });
   if (!gate.ok && items.length) {
-    // Grounded answer quality gate failed — show a helpful message with the available sources
+    sourceButtons = buildSourceButtons(items);
     whatsappText = [
       '*NewsDash Analyst*',
       '',
       `*Topic:* ${topicLabel}`,
-      'Found relevant stories but could not build a complete grounded answer. Here are the sources:',
+      'Found relevant stories. Open a source with the buttons below.',
       '',
       '*Sources*',
       items.map((i, idx) => formatSourceLine(i, idx, items.length > 1)).join('\n\n'),
+      '',
+      '_Tap a button below to open the source._',
     ].join('\n');
   }
 
@@ -1126,8 +1156,9 @@ export async function POST(request: Request) {
     total: ranked.total,
     poolSize: ranked.poolSize,
     whatsappText,
+    sourceButtons,
     linkPreview: preview,
-    linkPreviewEnabled: Boolean(preview),
+    linkPreviewEnabled: false,
     lastUpdated: now,
   });
 }
