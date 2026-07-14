@@ -733,26 +733,25 @@ async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
 }
 
 /**
- * Formats a source entry for WhatsApp.
- * WhatsApp only makes real https:// URLs tappable — put the publisher article URL
- * on its own line so the user can open the real source.
+ * Source title line for WhatsApp body (no URL — URLs go in named buttons).
  */
 function formatSourceLine(i: QueryResultItem, idx: number, showIndex: boolean): string {
   const when = formatTime(i.publishedAt);
   const label = (i.source || 'Publisher').replace(/[\[\]]/g, '').trim() || 'Publisher';
   const prefix = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
   const meta = [label, when].filter(Boolean).join(' · ');
-  const href = i.url.trim();
-  return [`${prefix}${meta ? ` — ${meta}` : ''}`, href].join('\n');
+  return `${prefix}${meta ? ` — ${meta}` : ''}`;
 }
 
-/** Optional WAHA URL buttons (unreliable on some clients). Text links are the primary open path. */
+/** WAHA URL button: display_text = source name (no URL shown in chat text). */
 type SourceButton = { type: 'url'; text: string; url: string };
 
 function buttonLabel(source: string, idx: number, total: number): string {
-  const base = (source || 'article').replace(/[\[\]*]/g, '').trim() || 'article';
-  const raw = total > 1 ? `Open ${idx + 1}: ${base}` : `Open ${base}`;
-  return raw.length <= 20 ? raw : raw.slice(0, 17) + '...';
+  const base = (source || 'Open article').replace(/[\[\]*]/g, '').trim() || 'Open article';
+  // Prefer the publisher name alone (what the user taps). Keep ≤20 chars for WAHA.
+  let label = total > 1 ? `${idx + 1}. ${base}` : base;
+  if (label.length > 20) label = label.slice(0, 17) + '...';
+  return label;
 }
 
 function buildSourceButtons(items: QueryResultItem[]): SourceButton[] {
@@ -761,8 +760,7 @@ function buildSourceButtons(items: QueryResultItem[]): SourceButton[] {
     .slice(0, 3)
     .map((i, idx, arr) => ({
       type: 'url' as const,
-      text: buttonLabel(i.source || 'article', idx, arr.length),
-      // Real article URL — tap opens the publisher page
+      text: buttonLabel(i.source || 'Open article', idx, arr.length),
       url: i.url.trim(),
     }));
 }
@@ -821,7 +819,9 @@ async function buildNewsReply(
   parts.push('', '*Answer:*', answer, '', '*Sources*');
   const showIndex = items.length > 1;
   parts.push(items.map((i, idx) => formatSourceLine(i, idx, showIndex)).join('\n\n'));
-  parts.push('', '_Tap a source link to open the full article._');
+  if (sourceButtons.length) {
+    parts.push('', '_Tap a source name below to open the full article._');
+  }
   return { text: parts.join('\n'), answer, sources, sourceButtons };
 }
 
@@ -901,7 +901,7 @@ function assertQuality(args: {
   answer?: string;
   sourceButtons?: SourceButton[];
 }): { ok: true } | { ok: false; reason: string } {
-  const { kind, text, items, weather, gold, crypto, requestedCity, answer } = args;
+  const { kind, text, items, weather, gold, crypto, requestedCity, answer, sourceButtons } = args;
   if (!text || text.length < 16) return { ok: false, reason: 'Empty reply. Please ask again.' };
 
   if (kind === 'weather' && !weather?.error) {
@@ -937,7 +937,13 @@ function assertQuality(args: {
       if (!isValidArticleUrl(item.url)) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
-      if (!text.includes(item.url.trim())) {
+    }
+    const buttons = sourceButtons || [];
+    if (buttons.length < 1) {
+      return { ok: false, reason: 'Could not attach a verifiable source link.' };
+    }
+    for (const item of items) {
+      if (!buttons.some((b) => b.url === item.url.trim())) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
     }
@@ -1114,7 +1120,7 @@ export async function POST(request: Request) {
       '*NewsDash Analyst*',
       '',
       `*Topic:* ${topicLabel}`,
-      'Found relevant stories. Tap a link below to open the full article.',
+      'Found relevant stories. Tap a source name below to open the full article.',
       '',
       '*Sources*',
       items.map((i, idx) => formatSourceLine(i, idx, items.length > 1)).join('\n\n'),
@@ -1136,7 +1142,7 @@ export async function POST(request: Request) {
     whatsappText,
     sourceButtons,
     linkPreview: preview,
-    linkPreviewEnabled: Boolean(preview),
+    linkPreviewEnabled: false,
     lastUpdated: now,
   });
 }
