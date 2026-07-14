@@ -5,6 +5,7 @@ import {
   buildExtractiveAnswer,
   buildGroundedAnswer,
   detectQueryLanguage,
+  englishSearchHints,
   type GroundedSource,
 } from '@/lib/query/grounded-answer';
 import type { Category, NewsItem } from '@/types';
@@ -1148,6 +1149,7 @@ export async function POST(request: Request) {
   }
 
   // ── Universal NewsDash path (default for any question) ──
+  const replyLang = detectQueryLanguage(rawQ);
   const newsQ =
     plugin.kind === 'gold_price'
       ? 'gold'
@@ -1156,8 +1158,14 @@ export async function POST(request: Request) {
         : q;
 
   // Fuel/pump asks: never invent a number; answer with oil/fuel market evidence from feeds.
-  const fuelAsk = /\b(petrol|diesel|gasoline|pump\s*price|fuel\s*price)\b/i.test(q);
-  const searchQ = fuelAsk ? `${newsQ} oil crude petroleum fuel` : newsQ;
+  const fuelAsk =
+    /\b(petrol|diesel|gasoline|pump\s*price|fuel\s*price)\b/i.test(q) ||
+    /پیٹرول|ڈیزل|پیٹرولیم/.test(rawQ);
+
+  // Urdu-script questions need English keywords to match English RSS headlines.
+  const urduHints = await englishSearchHints(rawQ, replyLang);
+  const baseSearch = urduHints || newsQ;
+  const searchQ = fuelAsk ? `${baseSearch} oil crude petroleum fuel` : baseSearch;
 
   const ranked = await retrieveAndRank(
     searchQ,

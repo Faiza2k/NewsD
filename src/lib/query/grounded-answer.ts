@@ -122,6 +122,34 @@ ${body || '(no body text)'}`;
     .join('\n\n---\n\n');
 }
 
+/**
+ * For Urdu-script asks, get English keywords so we can rank English RSS headlines.
+ * Returns null when unused / unavailable.
+ */
+export async function englishSearchHints(question: string, lang: ReplyLanguage): Promise<string | null> {
+  if (lang !== 'ur') return null;
+  const latin = question.match(/[A-Za-z]{3,}/g) || [];
+  if (latin.length >= 2) return null;
+  if (!process.env.GROQ_API_KEY) return null;
+  try {
+    const text = await groqChat(
+      [
+        {
+          role: 'system',
+          content:
+            'Convert the user news question into 3-8 English search keywords for RSS headline matching. Reply with keywords only, separated by spaces. No punctuation, no sentences.',
+        },
+        { role: 'user', content: question.trim() },
+      ],
+      { maxTokens: 48, temperature: 0 },
+    );
+    const cleaned = text.replace(/[^\w\s-]/g, ' ').replace(/\s+/g, ' ').trim();
+    return cleaned.length >= 3 ? cleaned : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Groq grounded brief; returns null on failure / empty. */
 export async function buildGroundedAnswer(
   question: string,
