@@ -181,7 +181,12 @@ export async function getAllFeedItems(force = false): Promise<NewsItem[]> {
 export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
   const MIN_HEALTHY = 120;
   const cached = getCached<NewsItem[]>(ALL_FEEDS_CACHE_KEY);
-  if (cached && cached.length >= MIN_HEALTHY) return cached;
+  if (cached && cached.length >= MIN_HEALTHY) {
+    // Keep answering from cache, but refresh the full catalog in the background
+    // so price/geopolitics/tech stories stay current across all sources.
+    void getAllFeedItems(true).catch(() => undefined);
+    return cached;
+  }
 
   const merged = new Map<string, NewsItem>();
   if (cached) for (const item of cached) merged.set(item.id, item);
@@ -193,29 +198,29 @@ export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
   if (merged.size >= MIN_HEALTHY) {
     const items = processItems([...merged.values()]);
     setCache(ALL_FEEDS_CACHE_KEY, items, CACHE_TTL);
+    void getAllFeedItems(true).catch(() => undefined);
     return items;
   }
 
   const globalFirst = FEED_SOURCES.filter((s) => s.category === 'global')
     .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
-    .slice(0, 18);
+    .slice(0, 22);
   const rest = FEED_SOURCES.filter((s) => s.category !== 'global')
     .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
-    .slice(0, 24);
+    .slice(0, 36);
   const prioritized = [...globalFirst, ...rest];
 
   let bootstrap: NewsItem[] = [];
   try {
     bootstrap = await Promise.race([
-      fetchFeedsUntil(prioritized, 160).then((items) => processItems(items)),
-      new Promise<NewsItem[]>((resolve) => setTimeout(() => resolve([]), 12000)),
+      fetchFeedsUntil(prioritized, 220).then((items) => processItems(items)),
+      new Promise<NewsItem[]>((resolve) => setTimeout(() => resolve([]), 14000)),
     ]);
   } catch {
     bootstrap = [];
   }
 
   if (bootstrap.length > 0) {
-    // Merge with whatever we already had so refreshes don't shrink the pool.
     for (const item of bootstrap) merged.set(item.id, item);
     const items = processItems([...merged.values()]);
     setCache(ALL_FEEDS_CACHE_KEY, items, CACHE_TTL);
@@ -229,7 +234,6 @@ export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
 
   if (merged.size > 0) return processItems([...merged.values()]);
 
-  // Absolute last resort: short sync bootstrap via shared loader (also capped).
   void getAllFeedItems(false).catch(() => undefined);
   return getCached<NewsItem[]>(ALL_FEEDS_CACHE_KEY) || [];
 }

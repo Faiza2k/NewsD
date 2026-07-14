@@ -732,33 +732,21 @@ async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
   }
 }
 
-const REDIRECT_BASE = 'https://news-d.vercel.app/api/r';
-
 /**
- * Encodes an article URL into a Base64url token for use in the /api/r/[id] redirect.
- * WhatsApp auto-links the resulting short branded URL — the raw article URL never appears.
- */
-function makeShortLink(url: string): string {
-  const b64 = Buffer.from(url.trim(), 'utf-8')
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-  return `${REDIRECT_BASE}/${b64}`;
-}
-
-/**
- * Formats a source entry for WhatsApp body text (no URLs — open via URL buttons).
+ * Formats a source entry for WhatsApp.
+ * WhatsApp only makes real https:// URLs tappable — put the publisher article URL
+ * on its own line so the user can open the real source.
  */
 function formatSourceLine(i: QueryResultItem, idx: number, showIndex: boolean): string {
   const when = formatTime(i.publishedAt);
   const label = (i.source || 'Publisher').replace(/[\[\]]/g, '').trim() || 'Publisher';
   const prefix = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
   const meta = [label, when].filter(Boolean).join(' · ');
-  return `${prefix}${meta ? ` — ${meta}` : ''}`;
+  const href = i.url.trim();
+  return [`${prefix}${meta ? ` — ${meta}` : ''}`, href].join('\n');
 }
 
-/** WAHA sendButtons URL entries — label only; URL is behind the button. */
+/** Optional WAHA URL buttons (unreliable on some clients). Text links are the primary open path. */
 type SourceButton = { type: 'url'; text: string; url: string };
 
 function buttonLabel(source: string, idx: number, total: number): string {
@@ -774,7 +762,8 @@ function buildSourceButtons(items: QueryResultItem[]): SourceButton[] {
     .map((i, idx, arr) => ({
       type: 'url' as const,
       text: buttonLabel(i.source || 'article', idx, arr.length),
-      url: makeShortLink(i.url),
+      // Real article URL — tap opens the publisher page
+      url: i.url.trim(),
     }));
 }
 
@@ -832,9 +821,7 @@ async function buildNewsReply(
   parts.push('', '*Answer:*', answer, '', '*Sources*');
   const showIndex = items.length > 1;
   parts.push(items.map((i, idx) => formatSourceLine(i, idx, showIndex)).join('\n\n'));
-  if (sourceButtons.length) {
-    parts.push('', '_Tap a button below to open the source._');
-  }
+  parts.push('', '_Tap a source link to open the full article._');
   return { text: parts.join('\n'), answer, sources, sourceButtons };
 }
 
@@ -914,7 +901,7 @@ function assertQuality(args: {
   answer?: string;
   sourceButtons?: SourceButton[];
 }): { ok: true } | { ok: false; reason: string } {
-  const { kind, text, items, weather, gold, crypto, requestedCity, answer, sourceButtons } = args;
+  const { kind, text, items, weather, gold, crypto, requestedCity, answer } = args;
   if (!text || text.length < 16) return { ok: false, reason: 'Empty reply. Please ask again.' };
 
   if (kind === 'weather' && !weather?.error) {
@@ -950,14 +937,7 @@ function assertQuality(args: {
       if (!isValidArticleUrl(item.url)) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
-    }
-    const buttons = sourceButtons || [];
-    if (buttons.length < 1) {
-      return { ok: false, reason: 'Could not attach a verifiable source link.' };
-    }
-    for (const item of items) {
-      const expected = makeShortLink(item.url);
-      if (!buttons.some((b) => b.url === expected)) {
+      if (!text.includes(item.url.trim())) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
     }
@@ -1134,12 +1114,10 @@ export async function POST(request: Request) {
       '*NewsDash Analyst*',
       '',
       `*Topic:* ${topicLabel}`,
-      'Found relevant stories. Open a source with the buttons below.',
+      'Found relevant stories. Tap a link below to open the full article.',
       '',
       '*Sources*',
       items.map((i, idx) => formatSourceLine(i, idx, items.length > 1)).join('\n\n'),
-      '',
-      '_Tap a button below to open the source._',
     ].join('\n');
   }
 
@@ -1158,7 +1136,7 @@ export async function POST(request: Request) {
     whatsappText,
     sourceButtons,
     linkPreview: preview,
-    linkPreviewEnabled: false,
+    linkPreviewEnabled: Boolean(preview),
     lastUpdated: now,
   });
 }
