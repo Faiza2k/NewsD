@@ -732,18 +732,64 @@ async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
   }
 }
 
+const SHORT_LINK_TIMEOUT_MS = 2500;
+const PUBLIC_APP = 'https://news-d.vercel.app';
+
+function makeBrandedRedirect(url: string): string {
+  const b64 = Buffer.from(url.trim(), 'utf-8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  return `${PUBLIC_APP}/api/r/${b64}`;
+}
+
 /**
- * Formats a source for WhatsApp with a real publisher https URL.
- * WhatsApp auto-linkifies https:// lines so users can open the article.
- * (Named URL buttons / markdown links are NOT reliable on WhatsApp.)
+ * Shorten publisher URLs for WhatsApp (messy long links → short tappable https).
+ * Prefer is.gd; fall back to a branded /api/r redirect when that is shorter.
  */
-function formatSourceLine(i: QueryResultItem, idx: number, showIndex: boolean): string {
+async function shortenArticleUrl(url: string): Promise<string> {
+  const original = url.trim();
+  if (!isValidArticleUrl(original)) return original;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SHORT_LINK_TIMEOUT_MS);
+    try {
+      const res = await fetch(
+        'https://is.gd/create.php?format=simple&url=' + encodeURIComponent(original),
+        { signal: controller.signal, headers: { Accept: 'text/plain' } },
+      );
+      if (res.ok) {
+        const short = (await res.text()).trim();
+        if (/^https?:\/\/is\.gd\/[A-Za-z0-9_-]+$/i.test(short)) return short;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    // ignore — use fallback
+  }
+
+  const branded = makeBrandedRedirect(original);
+  return branded.length < original.length ? branded : original;
+}
+
+/**
+ * Formats a source for WhatsApp with a short clickable https URL.
+ * WhatsApp auto-linkifies https:// so users can open the real article.
+ */
+function formatSourceLine(
+  i: QueryResultItem,
+  idx: number,
+  showIndex: boolean,
+  displayUrl: string,
+): string {
   const when = formatTime(i.publishedAt);
   const label = (i.source || 'Publisher').replace(/[\[\]]/g, '').trim() || 'Publisher';
   const prefix = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
   const meta = [label, when].filter(Boolean).join(' · ');
-  const href = i.url.trim();
-  return [`${prefix}${meta ? ` — ${meta}` : ''}`, href].join('\n');
+  return [`${prefix}${meta ? ` — ${meta}` : ''}`, displayUrl].join('\n');
 }
 
 type SourceButton = { type: 'url'; text: string; url: string };
@@ -755,15 +801,14 @@ function buttonLabel(source: string, idx: number, total: number): string {
   return label;
 }
 
-function buildSourceButtons(items: QueryResultItem[]): SourceButton[] {
-  // Kept for API compatibility; WhatsApp delivery uses https lines in text.
+function buildSourceButtons(items: QueryResultItem[], displayUrls: string[]): SourceButton[] {
   return items
     .filter((i) => isValidArticleUrl(i.url))
     .slice(0, 3)
     .map((i, idx, arr) => ({
       type: 'url' as const,
       text: buttonLabel(i.source || 'Open article', idx, arr.length),
-      url: i.url.trim(),
+      url: displayUrls[idx] || i.url.trim(),
     }));
 }
 
@@ -790,7 +835,13 @@ async function buildNewsReply(
   items: QueryResultItem[],
   poolSize: number,
   note?: string,
-): Promise<{ text: string; answer: string; sources: GroundedSource[]; sourceButtons: SourceButton[] }> {
+): Promise<{
+  text: string;
+  answer: string;
+  sources: GroundedSource[];
+  sourceButtons: SourceButton[];
+  displayUrls: string[];
+}> {
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`];
   if (note) parts.push(note);
 
@@ -808,7 +859,7 @@ async function buildNewsReply(
             '• Check back later — feeds update every few minutes',
           ].join('\n');
     parts.push(notFound);
-    return { text: parts.join('\n'), answer: '', sources: [], sourceButtons: [] };
+    return { text: parts.join('\n'), answer: '', sources: [], sourceButtons: [], displayUrls: [] };
   }
 
   const sources = await enrichGroundedSources(items);
@@ -817,12 +868,15 @@ async function buildNewsReply(
     answer = buildExtractiveAnswer(question, sources);
   }
 
-  const sourceButtons = buildSourceButtons(items);
+  const displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
+  const sourceButtons = buildSourceButtons(items, displayUrls);
   parts.push('', '*Answer:*', answer, '', '*Sources*');
   const showIndex = items.length > 1;
-  parts.push(items.map((i, idx) => formatSourceLine(i, idx, showIndex)).join('\n\n'));
-  parts.push('', '_Tap a blue link below to open the full article on the publisher site._');
-  return { text: parts.join('\n'), answer, sources, sourceButtons };
+  parts.push(
+    items.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
+  );
+  parts.push('', '_Tap a short blue link to open the full article._');
+  return { text: parts.join('\n'), answer, sources, sourceButtons, displayUrls };
 }
 
 function buildGreeting(): string {
@@ -900,8 +954,9 @@ function assertQuality(args: {
   requestedCity?: string;
   answer?: string;
   sourceButtons?: SourceButton[];
+  displayUrls?: string[];
 }): { ok: true } | { ok: false; reason: string } {
-  const { kind, text, items, weather, gold, crypto, requestedCity, answer } = args;
+  const { kind, text, items, weather, gold, crypto, requestedCity, answer, displayUrls } = args;
   if (!text || text.length < 16) return { ok: false, reason: 'Empty reply. Please ask again.' };
 
   if (kind === 'weather' && !weather?.error) {
@@ -933,11 +988,13 @@ function assertQuality(args: {
     if (/open the source link for the full publisher article/i.test(answer)) {
       return { ok: false, reason: 'Could not build a grounded answer.' };
     }
-    for (const item of items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
       if (!isValidArticleUrl(item.url)) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
-      if (!text.includes(item.url.trim())) {
+      const shown = (displayUrls && displayUrls[i]) || item.url.trim();
+      if (!text.includes(shown) && !text.includes(item.url.trim())) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
     }
@@ -1101,23 +1158,28 @@ export async function POST(request: Request) {
   const built = await buildNewsReply(rawQ, topicLabel, items, ranked.poolSize, note);
   let whatsappText = built.text;
   let sourceButtons = built.sourceButtons;
+  let displayUrls = built.displayUrls;
   const gate = assertQuality({
     kind: 'news',
     text: whatsappText,
     items,
     answer: built.answer,
     sourceButtons,
+    displayUrls,
   });
   if (!gate.ok && items.length) {
-    sourceButtons = buildSourceButtons(items);
+    displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
+    sourceButtons = buildSourceButtons(items, displayUrls);
     whatsappText = [
       '*NewsDash Analyst*',
       '',
       `*Topic:* ${topicLabel}`,
-      'Found relevant stories. Tap a blue link below to open the full article.',
+      'Found relevant stories. Tap a short blue link to open the full article.',
       '',
       '*Sources*',
-      items.map((i, idx) => formatSourceLine(i, idx, items.length > 1)).join('\n\n'),
+      items
+        .map((i, idx) => formatSourceLine(i, idx, items.length > 1, displayUrls[idx]))
+        .join('\n\n'),
     ].join('\n');
   }
 
