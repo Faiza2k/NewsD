@@ -4,6 +4,7 @@ import { resolveArticleBodies } from '@/lib/feeds/article-body';
 import {
   buildExtractiveAnswer,
   buildGroundedAnswer,
+  detectQueryLanguage,
   type GroundedSource,
 } from '@/lib/query/grounded-answer';
 import type { Category, NewsItem } from '@/types';
@@ -851,35 +852,47 @@ async function buildNewsReply(
   sourceButtons: SourceButton[];
   displayUrls: string[];
 }> {
+  const lang = detectQueryLanguage(question);
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`];
   if (note) parts.push(note);
 
   if (!items.length) {
-    // No matching news — give a professional, helpful message with guidance
     const notFound =
       poolSize === 0
-        ? 'Our news feeds are still syncing. Please try again in a moment.'
-        : [
-            `No NewsDash coverage found for *"${topicLabel}"* right now.`,
-            '',
-            'This could mean:',
-            '• The topic is not yet in our live feeds',
-            '• Try a shorter or different keyword (e.g. just the city, person, or event name)',
-            '• Check back later — feeds update every few minutes',
-          ].join('\n');
+        ? lang === 'ur'
+          ? 'NewsDash کی فیڈز ابھی سنک ہو رہی ہیں۔ کچھ دیر بعد دوبارہ کوشش کریں۔'
+          : 'Our news feeds are still syncing. Please try again in a moment.'
+        : lang === 'ur'
+          ? [
+              `*"${topicLabel}"* کے لیے اس وقت NewsDash میں کوئی مضبوط خبر نہیں ملی۔`,
+              '',
+              'آپ یہ کوشش کر سکتے ہیں:',
+              '• مختصر یا مختلف لفظ استعمال کریں',
+              '• تھوڑی دیر بعد دوبارہ پوچھیں — فیڈز چند منٹ میں اپڈیٹ ہوتی ہیں',
+            ].join('\n')
+          : [
+              `No NewsDash coverage found for *"${topicLabel}"* right now.`,
+              '',
+              'This could mean:',
+              '• The topic is not yet in our live feeds',
+              '• Try a shorter or different keyword (e.g. just the city, person, or event name)',
+              '• Check back later — feeds update every few minutes',
+            ].join('\n');
     parts.push(notFound);
     return { text: parts.join('\n'), answer: '', sources: [], sourceButtons: [], displayUrls: [] };
   }
 
   const sources = await enrichGroundedSources(items);
-  let answer = await buildGroundedAnswer(question, sources);
+  let answer = await buildGroundedAnswer(question, sources, lang);
   if (!answer || answer.length < WA_ANSWER_MIN) {
-    answer = buildExtractiveAnswer(question, sources);
+    answer = buildExtractiveAnswer(question, sources, lang);
   }
 
   const displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
   const sourceButtons = buildSourceButtons(items, displayUrls);
-  parts.push('', '*Answer:*', answer, '', '*Sources*');
+  const answerLabel = lang === 'ur' ? '*جواب:*' : '*Answer:*';
+  const sourcesLabel = lang === 'ur' ? '*ذرائع:*' : '*Sources*';
+  parts.push('', answerLabel, answer, '', sourcesLabel);
   const showIndex = items.length > 1;
   parts.push(
     items.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
@@ -987,7 +1000,7 @@ function assertQuality(args: {
   }
 
   if (kind === 'news' && items?.length) {
-    if (!text.includes('*Answer:*')) {
+    if (!text.includes('*Answer:*') && !text.includes('*جواب:*')) {
       return { ok: false, reason: 'Could not build a grounded answer.' };
     }
     if (!answer || answer.length < WA_ANSWER_MIN) {
