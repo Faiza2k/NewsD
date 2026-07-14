@@ -1,0 +1,100 @@
+from pathlib import Path
+import json
+
+RESOLVE_JS = r"""const item = $input.first()?.json || {};
+let q = String(item.q || '').trim();
+const chatId = String(item.chatId || '');
+const baseUrl = String(item.baseUrl || 'https://news-d.vercel.app');
+const limit = item.limit || 2;
+let mediaUrl = String(item.mediaUrl || '').trim();
+const mimeType = String(item.mimeType || 'audio/ogg').split(';')[0].trim() || 'audio/ogg';
+
+// Always rewrite host-local WAHA media URLs so n8n (Docker) can download them.
+if (mediaUrl.startsWith('/')) mediaUrl = 'http://waha:3000' + mediaUrl;
+mediaUrl = mediaUrl.replace(/https?:\/\/(localhost|127\.0\.0\.1):(3000|3001)/gi, 'http://waha:3000');
+
+const failHear = (reason) => ([{
+  json: {
+    chatId,
+    baseUrl,
+    limit,
+    q: '',
+    skipQuery: true,
+    whatsappText: '*NewsDash Analyst*\n\nCouldn’t hear that—please retry or type your question.',
+    voiceError: String(reason || ''),
+  },
+}]);
+
+if ((!q || item.needsTranscribe) && mediaUrl) {
+  try {
+    const audioResp = await this.helpers.httpRequest({
+      method: 'GET',
+      url: mediaUrl,
+      encoding: 'arraybuffer',
+      returnFullResponse: true,
+      json: false,
+      timeout: 30000,
+    });
+    const raw = audioResp?.body ?? audioResp;
+    let buf;
+    if (Buffer.isBuffer(raw)) buf = raw;
+    else if (raw instanceof ArrayBuffer) buf = Buffer.from(raw);
+    else if (ArrayBuffer.isView(raw)) buf = Buffer.from(raw.buffer);
+    else if (typeof raw === 'string') buf = Buffer.from(raw, 'binary');
+    else if (raw?.data) buf = Buffer.from(raw.data);
+    else buf = Buffer.from([]);
+
+    if (!buf.length) return failHear('empty-audio from ' + mediaUrl);
+
+    const ext = mimeType.includes('mpeg') || mimeType.includes('mp3')
+      ? 'mp3'
+      : mimeType.includes('mp4') || mimeType.includes('m4a')
+        ? 'm4a'
+        : mimeType.includes('wav')
+          ? 'wav'
+          : 'ogg';
+
+    const resp = await this.helpers.httpRequest({
+      method: 'POST',
+      url: baseUrl + '/api/transcribe',
+      headers: {},
+      formData: {
+        file: {
+          value: buf,
+          options: { filename: 'voice.' + ext, contentType: mimeType },
+        },
+      },
+      json: true,
+      timeout: 60000,
+    });
+    q = String(resp?.text || '').trim();
+    if (!q) return failHear('empty-transcript');
+  } catch (e) {
+    return failHear((e && (e.message || e.statusCode || e)) || 'transcribe-failed');
+  }
+}
+
+if (!q || q.length < 2) {
+  return [{
+    json: {
+      chatId,
+      baseUrl,
+      limit,
+      q: '',
+      skipQuery: true,
+      whatsappText: '*NewsDash Analyst*\n\nPlease send a short text or voice question.',
+    },
+  }];
+}
+
+return [{ json: { q, chatId, baseUrl, limit, skipQuery: false } }];
+"""
+
+p = Path(r"D:\n8n\NewsDash_Ask_Agent_DM.json")
+data = json.loads(p.read_text(encoding="utf-8"))
+wf = data[0]
+for n in wf["nodes"]:
+    if n["name"] == "Resolve Text Query":
+        n["parameters"]["jsCode"] = RESOLVE_JS
+p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+print("updated Resolve Text Query")

@@ -8,6 +8,7 @@ import {
 } from '@/lib/query/grounded-answer';
 import type { Category, NewsItem } from '@/types';
 
+
 export const dynamic = 'force-dynamic';
 
 /**
@@ -139,13 +140,18 @@ function clean(q: string): string {
 function extractTopicQuery(raw: string): string {
   let q = String(raw || '').trim();
   q = q.replace(/^["'`]+|["'`]+$/g, '');
+  // Strip leading politeness
   q = q.replace(/^(please\s+)?(can you|could you|would you)\s+/i, '');
+  // Strip intent phrases (greedy — catches "i want to know about", "tell me about", etc.)
   q = q.replace(
-    /^(tell me|tell us|give me|show me|get me|i want|i need|looking for|explain|describe)\s+(about\s+|regarding\s+|on\s+|for\s+|to know about\s+)?/i,
+    /^(tell me|tell us|give me|show me|get me|i want to know|i need to know|i want|i need|i would like|looking for|explain|describe|find out|check)\s+(about\s+|regarding\s+|on\s+|for\s+|the\s+)?/i,
     '',
   );
-  q = q.replace(/^(what(?:'s| is| are)|whats)\s+(the\s+)?(latest\s+|current\s+)?/i, '');
+  // Catch remaining filler starters
+  q = q.replace(/^(to know about|to know|to find out about|to find out|to check|to see)\s+/i, '');
+  q = q.replace(/^(what(?:'s| is| are)|whats)\s+(the\s+)?(latest\s+|current\s+|live\s+)?/i, '');
   q = q.replace(/^(any|some)\s+(news|updates?|info|information)\s+(on|about|regarding)\s+/i, '');
+  q = q.replace(/^(the\s+)?/i, '');
   q = q.replace(/\?+$/g, '').trim();
   return q || String(raw || '').trim();
 }
@@ -222,7 +228,7 @@ function detectPlugin(q: string): Plugin {
   ) {
     let city = s
       .replace(
-        /\b(weather|forecast|temperature|humidity|today|now|current|please|tell|me|about|of|in|for|the|a|an)\b/g,
+        /\b(weather|forecast|temperature|humidity|today|now|current|please|tell|me|about|of|in|for|the|a|an|to|know|want|need|check|see|find|out|give|show|i|is|what|whats|how)\b/g,
         ' ',
       )
       .replace(/\s+/g, ' ')
@@ -726,20 +732,33 @@ async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
   }
 }
 
-/** WhatsApp auto-linkifies the https URL inside markdown [label](url). */
-function sourceHyperlink(source: string, url: string): string {
-  const href = url.trim();
-  const label = (source || 'Open article').replace(/[\[\]]/g, '').trim() || 'Open article';
-  return `Go to: [${label}](${href})`;
+const REDIRECT_BASE = 'https://news-d.vercel.app/api/r';
+
+/**
+ * Encodes an article URL into a Base64url token for use in the /api/r/[id] redirect.
+ * WhatsApp auto-links the resulting short branded URL — the raw article URL never appears.
+ */
+function makeShortLink(url: string): string {
+  const b64 = Buffer.from(url.trim(), 'utf-8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  return `${REDIRECT_BASE}/${b64}`;
 }
 
+/**
+ * Formats a source entry for WhatsApp.
+ * Line 1: bold title — Publisher · Time
+ * Line 2: short branded redirect link (auto-linked by WhatsApp, raw article URL is hidden)
+ */
 function formatSourceLine(i: QueryResultItem, idx: number, showIndex: boolean): string {
   const when = formatTime(i.publishedAt);
+  const label = (i.source || 'Publisher').trim();
   const prefix = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
-  const meta = [i.source || 'Publisher', when].filter(Boolean).join(' · ');
-  return [prefix + (meta ? ` — ${meta}` : ''), sourceHyperlink(i.source || 'Publisher', i.url)]
-    .filter(Boolean)
-    .join('\n');
+  const meta = [label, when].filter(Boolean).join(' · ');
+  const shortLink = makeShortLink(i.url);
+  return [`${prefix}${meta ? ` — ${meta}` : ''}`, shortLink].join('\n');
 }
 
 async function enrichGroundedSources(items: QueryResultItem[]): Promise<GroundedSource[]> {
@@ -770,11 +789,19 @@ async function buildNewsReply(
   if (note) parts.push(note);
 
   if (!items.length) {
-    const empty =
+    // No matching news — give a professional, helpful message with guidance
+    const notFound =
       poolSize === 0
-        ? 'NewsDash feeds are still syncing. Please try again in a moment.'
-        : `No strong matching story for "${topicLabel}" in your NewsDash feeds right now. Try another keyword, or add an RSS source that covers that topic.`;
-    parts.push(empty);
+        ? 'Our news feeds are still syncing. Please try again in a moment.'
+        : [
+            `No NewsDash coverage found for *"${topicLabel}"* right now.`,
+            '',
+            'This could mean:',
+            '• The topic is not yet in our live feeds',
+            '• Try a shorter or different keyword (e.g. just the city, person, or event name)',
+            '• Check back later — feeds update every few minutes',
+          ].join('\n');
+    parts.push(notFound);
     return { text: parts.join('\n'), answer: '', sources: [] };
   }
 
@@ -888,21 +915,23 @@ function assertQuality(args: {
   }
 
   if (kind === 'news' && items?.length) {
+    // Only enforce source-grounding checks when we actually have local news items
     if (!text.includes('*Answer:*')) {
-      return { ok: false, reason: 'Could not build a grounded answer. Please ask again.' };
+      return { ok: false, reason: 'Could not build a grounded answer.' };
     }
     if (!answer || answer.length < WA_ANSWER_MIN) {
-      return { ok: false, reason: 'Could not build a grounded answer. Please ask again.' };
+      return { ok: false, reason: 'Could not build a grounded answer.' };
     }
     if (/open the source link for the full publisher article/i.test(answer)) {
-      return { ok: false, reason: 'Could not build a grounded answer. Please ask again.' };
+      return { ok: false, reason: 'Could not build a grounded answer.' };
     }
     for (const item of items) {
-      if (!isValidArticleUrl(item.url) || !text.includes(item.url.trim())) {
-        return {
-          ok: false,
-          reason: 'Could not attach a verifiable NewsDash source link. Please ask again.',
-        };
+      if (!isValidArticleUrl(item.url)) {
+        return { ok: false, reason: 'Could not attach a verifiable source link.' };
+      }
+      // Verify the short link (not raw URL) appears in the message
+      if (!text.includes(makeShortLink(item.url))) {
+        return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
     }
   }
@@ -951,7 +980,7 @@ export async function POST(request: Request) {
     const weather = await fetchWeather(plugin.city, plugin.cityAsked);
     let whatsappText = buildWeatherReply(
       topicLabel,
-      weather || { error: 'Could not fetch live weather. Please try again.' },
+      weather || { error: 'Could not fetch live weather.' },
     );
     const gate = assertQuality({
       kind: 'weather',
@@ -960,7 +989,17 @@ export async function POST(request: Request) {
       requestedCity: plugin.cityAsked ? plugin.city : undefined,
     });
     if (!gate.ok) {
-      whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
+      // Weather API failed — give a clean, professional message
+      whatsappText = [
+        '*NewsDash Analyst*',
+        '',
+        `*Topic:* ${topicLabel}`,
+        `Live weather for *${plugin.city}* is not available right now.`,
+        '',
+        'Please try:',
+        '• A more specific city name (e.g. "Karachi weather", "Lahore weather")',
+        '• Checking again in a few minutes',
+      ].join('\n');
     }
     return Response.json({
       query: q,
@@ -1061,7 +1100,16 @@ export async function POST(request: Request) {
     answer: built.answer,
   });
   if (!gate.ok && items.length) {
-    whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
+    // Grounded answer quality gate failed — show a helpful message with the available sources
+    whatsappText = [
+      '*NewsDash Analyst*',
+      '',
+      `*Topic:* ${topicLabel}`,
+      'Found relevant stories but could not build a complete grounded answer. Here are the sources:',
+      '',
+      '*Sources*',
+      items.map((i, idx) => formatSourceLine(i, idx, items.length > 1)).join('\n\n'),
+    ].join('\n');
   }
 
   const preview = linkPreview(items);
