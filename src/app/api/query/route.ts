@@ -746,29 +746,38 @@ function makeBrandedRedirect(url: string): string {
 
 /**
  * Shorten publisher URLs for WhatsApp (messy long links → short tappable https).
- * Prefer is.gd; fall back to a branded /api/r redirect when that is shorter.
+ * Prefer public shorteners; fall back to branded /api/r when shorter than original.
  */
 async function shortenArticleUrl(url: string): Promise<string> {
   const original = url.trim();
   if (!isValidArticleUrl(original)) return original;
 
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), SHORT_LINK_TIMEOUT_MS);
+  const endpoints = [
+    'https://is.gd/create.php?format=simple&url=' + encodeURIComponent(original),
+    'https://v.gd/create.php?format=simple&url=' + encodeURIComponent(original),
+    'https://tinyurl.com/api-create.php?url=' + encodeURIComponent(original),
+  ];
+
+  for (const endpoint of endpoints) {
     try {
-      const res = await fetch(
-        'https://is.gd/create.php?format=simple&url=' + encodeURIComponent(original),
-        { signal: controller.signal, headers: { Accept: 'text/plain' } },
-      );
-      if (res.ok) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), SHORT_LINK_TIMEOUT_MS);
+      try {
+        const res = await fetch(endpoint, {
+          signal: controller.signal,
+          headers: { Accept: 'text/plain' },
+        });
+        if (!res.ok) continue;
         const short = (await res.text()).trim();
-        if (/^https?:\/\/is\.gd\/[A-Za-z0-9_-]+$/i.test(short)) return short;
+        if (/^https?:\/\/(is\.gd|v\.gd|tinyurl\.com)\/[A-Za-z0-9_-]+$/i.test(short)) {
+          return short;
+        }
+      } finally {
+        clearTimeout(timer);
       }
-    } finally {
-      clearTimeout(timer);
+    } catch {
+      // try next shortener
     }
-  } catch {
-    // ignore — use fallback
   }
 
   const branded = makeBrandedRedirect(original);
