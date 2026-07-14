@@ -733,28 +733,30 @@ async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
 }
 
 /**
- * Source title line for WhatsApp body (no URL — URLs go in named buttons).
+ * Formats a source for WhatsApp with a real publisher https URL.
+ * WhatsApp auto-linkifies https:// lines so users can open the article.
+ * (Named URL buttons / markdown links are NOT reliable on WhatsApp.)
  */
 function formatSourceLine(i: QueryResultItem, idx: number, showIndex: boolean): string {
   const when = formatTime(i.publishedAt);
   const label = (i.source || 'Publisher').replace(/[\[\]]/g, '').trim() || 'Publisher';
   const prefix = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
   const meta = [label, when].filter(Boolean).join(' · ');
-  return `${prefix}${meta ? ` — ${meta}` : ''}`;
+  const href = i.url.trim();
+  return [`${prefix}${meta ? ` — ${meta}` : ''}`, href].join('\n');
 }
 
-/** WAHA URL button: display_text = source name (no URL shown in chat text). */
 type SourceButton = { type: 'url'; text: string; url: string };
 
 function buttonLabel(source: string, idx: number, total: number): string {
   const base = (source || 'Open article').replace(/[\[\]*]/g, '').trim() || 'Open article';
-  // Prefer the publisher name alone (what the user taps). Keep ≤20 chars for WAHA.
   let label = total > 1 ? `${idx + 1}. ${base}` : base;
   if (label.length > 20) label = label.slice(0, 17) + '...';
   return label;
 }
 
 function buildSourceButtons(items: QueryResultItem[]): SourceButton[] {
+  // Kept for API compatibility; WhatsApp delivery uses https lines in text.
   return items
     .filter((i) => isValidArticleUrl(i.url))
     .slice(0, 3)
@@ -819,9 +821,7 @@ async function buildNewsReply(
   parts.push('', '*Answer:*', answer, '', '*Sources*');
   const showIndex = items.length > 1;
   parts.push(items.map((i, idx) => formatSourceLine(i, idx, showIndex)).join('\n\n'));
-  if (sourceButtons.length) {
-    parts.push('', '_Tap a source name below to open the full article._');
-  }
+  parts.push('', '_Tap a blue link below to open the full article on the publisher site._');
   return { text: parts.join('\n'), answer, sources, sourceButtons };
 }
 
@@ -901,7 +901,7 @@ function assertQuality(args: {
   answer?: string;
   sourceButtons?: SourceButton[];
 }): { ok: true } | { ok: false; reason: string } {
-  const { kind, text, items, weather, gold, crypto, requestedCity, answer, sourceButtons } = args;
+  const { kind, text, items, weather, gold, crypto, requestedCity, answer } = args;
   if (!text || text.length < 16) return { ok: false, reason: 'Empty reply. Please ask again.' };
 
   if (kind === 'weather' && !weather?.error) {
@@ -937,13 +937,7 @@ function assertQuality(args: {
       if (!isValidArticleUrl(item.url)) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
-    }
-    const buttons = sourceButtons || [];
-    if (buttons.length < 1) {
-      return { ok: false, reason: 'Could not attach a verifiable source link.' };
-    }
-    for (const item of items) {
-      if (!buttons.some((b) => b.url === item.url.trim())) {
+      if (!text.includes(item.url.trim())) {
         return { ok: false, reason: 'Could not attach a verifiable source link.' };
       }
     }
@@ -1120,7 +1114,7 @@ export async function POST(request: Request) {
       '*NewsDash Analyst*',
       '',
       `*Topic:* ${topicLabel}`,
-      'Found relevant stories. Tap a source name below to open the full article.',
+      'Found relevant stories. Tap a blue link below to open the full article.',
       '',
       '*Sources*',
       items.map((i, idx) => formatSourceLine(i, idx, items.length > 1)).join('\n\n'),
@@ -1142,7 +1136,7 @@ export async function POST(request: Request) {
     whatsappText,
     sourceButtons,
     linkPreview: preview,
-    linkPreviewEnabled: false,
+    linkPreviewEnabled: true,
     lastUpdated: now,
   });
 }
