@@ -85,6 +85,14 @@ const STOP_WORDS = new Set([
   'there', 'this', 'that', 'these', 'those', 'also', 'just', 'really', 'very',
   'claiming', 'against', 'between', 'versus', 'vs', 'does', 'did', 'doing', 'been',
   'have', 'has', 'had', 'will', 'should', 'their', 'they', 'them', 'its', 'into',
+  // Roman Urdu grammar/filler — carry no search value against English headlines
+  'ki', 'ka', 'ke', 'ko', 'ne', 'se', 'hai', 'hain', 'tha', 'thi', 'the',
+  'raha', 'rahi', 'rahe', 'wala', 'wali', 'wale', 'par', 'mein', 'bhi',
+  'kya', 'kab', 'kahan', 'kyun', 'kaun', 'kaise', 'kis', 'kisi', 'kuch',
+  'aur', 'ya', 'nahi', 'nah', 'hoga', 'hogi', 'ho', 'ab', 'phir', 'sath',
+  'chal', 'rha', 'rhi', 'kr', 'kia', 'kar', 'ap', 'aap', 'hum', 'mujhe',
+  'mera', 'meri', 'mere', 'uska', 'uski', 'unka', 'unki', 'jo', 'jab', 'jis',
+  'batao', 'batain', 'bata', 'do', 'dain', 'hy', 'ha', 'thi', 'tha',
 ]);
 
 /** Light query expansion only — never the main brain. Unknown words still search feeds. */
@@ -104,6 +112,23 @@ const LIGHT_EXPAND: Record<string, string[]> = {
   gpt: ['openai', 'ai'],
   war: ['conflict', 'strike', 'attack', 'military', 'invasion', 'bombing'],
   wars: ['war', 'conflict', 'strike', 'attack'],
+  jung: ['war', 'conflict', 'strike', 'attack', 'military', 'invasion'],
+  jang: ['war', 'conflict', 'strike', 'attack', 'military'],
+  khabar: ['news', 'update', 'report'],
+  khabrain: ['news', 'update', 'report'],
+  haalat: ['situation', 'update', 'crisis', 'conflict'],
+  masla: ['issue', 'conflict', 'crisis', 'problem'],
+  maslay: ['issue', 'conflict', 'crisis'],
+  hamla: ['attack', 'strike', 'bombing', 'invasion'],
+  hamlay: ['attack', 'strike', 'bombing'],
+  fauj: ['military', 'army', 'troops', 'forces'],
+  fauji: ['military', 'army', 'troops'],
+  siyasat: ['politics', 'government', 'policy'],
+  hukumat: ['government', 'government', 'administration'],
+  ekonomi: ['economy', 'economic', 'market'],
+  mehngai: ['inflation', 'prices', 'economy'],
+  dollar: ['usd', 'currency', 'exchange', 'pkr'],
+  rupee: ['pkr', 'currency', 'exchange'],
   lebanon: ['lebanese', 'hezbollah', 'beirut', 'israel'],
   lebanese: ['lebanon', 'hezbollah', 'beirut'],
   iran: ['iranian', 'tehran', 'strike', 'israel'],
@@ -112,6 +137,19 @@ const LIGHT_EXPAND: Record<string, string[]> = {
   gaza: ['israel', 'palestinian', 'hamas'],
   ukraine: ['ukrainian', 'russia', 'kyiv'],
   russia: ['russian', 'ukraine', 'moscow'],
+  // Roman Urdu country/entity names → English equivalents
+  america: ['american', 'us', 'usa', 'united states', 'washington'],
+  amreeka: ['america', 'american', 'us', 'usa', 'united states'],
+  pakistan: ['pakistani', 'islamabad', 'karachi', 'lahore', 'pkr'],
+  pakistani: ['pakistan', 'islamabad'],
+  china: ['chinese', 'beijing', 'xi jinping'],
+  cheena: ['china', 'chinese', 'beijing'],
+  india: ['indian', 'new delhi', 'modi', 'bjp'],
+  bharat: ['india', 'indian', 'new delhi', 'modi'],
+  turkey: ['turkish', 'ankara', 'erdogan'],
+  saudi: ['saudi arabia', 'riyadh', 'opec'],
+  imran: ['imran khan', 'pti', 'pakistan'],
+  nawaz: ['nawaz sharif', 'pmln', 'pakistan'],
 };
 
 const ENTITY_BLOCKLIST: Record<string, string[]> = {
