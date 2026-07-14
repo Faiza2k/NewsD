@@ -750,15 +750,16 @@ function makeShortLink(url: string): string {
 /**
  * Formats a source entry for WhatsApp.
  * Line 1: bold title — Publisher · Time
- * Line 2: short branded redirect link (auto-linked by WhatsApp, raw article URL is hidden)
+ * Line 2: Go to: [Publisher](short NewsDash redirect)
+ * WhatsApp auto-linkifies the https URL; the raw article URL never appears.
  */
 function formatSourceLine(i: QueryResultItem, idx: number, showIndex: boolean): string {
   const when = formatTime(i.publishedAt);
-  const label = (i.source || 'Publisher').trim();
+  const label = (i.source || 'Open article').replace(/[\[\]]/g, '').trim() || 'Open article';
   const prefix = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
   const meta = [label, when].filter(Boolean).join(' · ');
   const shortLink = makeShortLink(i.url);
-  return [`${prefix}${meta ? ` — ${meta}` : ''}`, shortLink].join('\n');
+  return [`${prefix}${meta ? ` — ${meta}` : ''}`, `Go to: [${label}](${shortLink})`].join('\n');
 }
 
 async function enrichGroundedSources(items: QueryResultItem[]): Promise<GroundedSource[]> {
