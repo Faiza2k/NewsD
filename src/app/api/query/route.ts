@@ -884,7 +884,6 @@ async function buildNewsReply(
   parts.push(
     items.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
   );
-  parts.push('', '_Tap a short blue link to open the full article._');
   return { text: parts.join('\n'), answer, sources, sourceButtons, displayUrls };
 }
 
@@ -1183,7 +1182,7 @@ export async function POST(request: Request) {
       '*NewsDash Analyst*',
       '',
       `*Topic:* ${topicLabel}`,
-      'Found relevant stories. Tap a short blue link to open the full article.',
+      'Found relevant stories.',
       '',
       '*Sources*',
       items
