@@ -1,4 +1,3 @@
-import { after } from 'next/server';
 import { POST as queryPost } from '@/app/api/query/route';
 import {
   getWhatsAppConfig,
@@ -10,6 +9,8 @@ import {
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
+/** Allow query + Graph send before Meta's webhook timeout. */
+export const maxDuration = 60;
 
 type InboundText = {
   from: string;
@@ -85,23 +86,22 @@ export async function POST(request: Request) {
 
   const messages = extractInboundTexts(payload);
   if (messages.length) {
-    after(async () => {
-      for (const msg of messages) {
+    // Await replies here — Vercel often kills `after()` before Graph API send finishes.
+    for (const msg of messages) {
+      try {
+        await replyToUser(msg);
+      } catch (err) {
+        console.error('[whatsapp webhook] reply failed', msg.messageId, err);
         try {
-          await replyToUser(msg);
-        } catch (err) {
-          console.error('[whatsapp webhook] reply failed', msg.messageId, err);
-          try {
-            await sendWhatsAppText(
-              msg.from,
-              '*NewsDash Analyst*\n\nSomething went wrong answering that. Please try again in a moment.',
-            );
-          } catch {
-            // ignore
-          }
+          await sendWhatsAppText(
+            msg.from,
+            '*NewsDash Analyst*\n\nSomething went wrong answering that. Please try again in a moment.',
+          );
+        } catch {
+          // ignore
         }
       }
-    });
+    }
   }
 
   return new Response('EVENT_RECEIVED', { status: 200 });
