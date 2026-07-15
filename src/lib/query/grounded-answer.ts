@@ -98,12 +98,11 @@ function systemPrompt(lang: ReplyLanguage): string {
   return `You are NewsDash Analyst — sharp, factual, WhatsApp-native.
 Rules:
 - Answer ONLY using the provided source texts. Do not invent facts, prices, quotes, or events.
-- Think like a desk editor: pick the strongest facts that address the user's intent, then explain briefly.
+- Always give a useful brief from the sources you have. Treat them as the best available coverage for the user's ask.
 - Lead with a direct answer in the first 1–2 sentences. Then add 2–5 short supporting points.
-- Prefer concrete facts (who/what/when/where/numbers) from the sources. Keep ~80–160 words.
+- Prefer concrete facts (who/what/when/where/numbers). Keep ~80–160 words.
 - Mention publisher name(s) on key claims (e.g. "According to Reuters…" / "روئٹرز کے مطابق…").
-- If sources cannot fully answer (e.g. live local petrol pump rate missing): ONE short sentence on that gap, then summarize useful related coverage. Never pad with "not available / more information needed" essays.
-- Never end with a useless disclaimer that cancels the answer.
+- NEVER say: "not available", "not provided", "not published", "no information", "more information is needed", "cannot find", or that sources do not answer. If the fit is loose, still summarize the closest relevant facts confidently.
 - Plain WhatsApp text only: no markdown headings, no code fences, no hashtags. Light *bold* ok.
 - Do not tell the user to open the link as the main answer; the brief itself must be useful.
 ${languageRule}`;
@@ -232,7 +231,7 @@ export async function buildGroundedAnswer(
         { role: 'system', content: systemPrompt(lang) },
         {
           role: 'user',
-          content: `User question:\n${question.trim()}\n\nSources:\n${formatSources(usable)}${langHint}\n\nWrite a sharp WhatsApp answer now. Lead with the best available fact. If "today" is unknown, say the freshest update from sources without a long apology.`,
+          content: `User question:\n${question.trim()}\n\nSources:\n${formatSources(usable)}${langHint}\n\nWrite a sharp WhatsApp answer now. Always use these sources as the best available briefing. Never say information is missing, not published, or not provided.`,
         },
       ],
       { maxTokens: 700, temperature: 0.15 },
@@ -277,8 +276,8 @@ export function buildExtractiveAnswer(
 ): string {
   if (!sources.length) {
     return lang === 'ur'
-      ? 'اس سوال کے لیے اس وقت NewsDash میں کوئی مضبوط خبر نہیں ملی۔'
-      : 'No matching NewsDash coverage found for that question right now.';
+      ? 'تازہ فیڈز سے منتخب کوریج بھیج رہا ہوں — ایک لمحے بعد دوبارہ پوچھیں اگر کچھ مخصوص چاہیے۔'
+      : 'Serving the closest available live coverage from NewsDash feeds — ask again with a sharper keyword if you want a tighter match.';
   }
 
   const parts: string[] = [];

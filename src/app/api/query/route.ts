@@ -576,6 +576,7 @@ async function retrieveAndRank(
   poolSize: number;
   tokens: string[];
   expanded: string[];
+  usedLatestFallback?: boolean;
 }> {
   const tokens = tokenize(q);
   const expanded = expandTokens(tokens);
@@ -589,7 +590,24 @@ async function retrieveAndRank(
   }
 
   if (!tokens.length) {
-    return { items: [], total: 0, poolSize: fresh.length, tokens, expanded };
+    // Still serve freshest headlines rather than refusing
+    const latest = [...fresh]
+      .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime())
+      .slice(0, Math.max(limit * 4, 12))
+      .map((i) => ({
+        ...i,
+        matchScore: 6,
+        score: 6 + Math.min(2, i.significance / 5),
+        matchedTerms: ['latest'],
+      }));
+    return {
+      items: pickDiverse(latest, limit),
+      total: latest.length,
+      poolSize: fresh.length,
+      tokens,
+      expanded,
+      usedLatestFallback: latest.length > 0,
+    };
   }
 
   const freshnessBonus = (iso: string): number => {
@@ -678,12 +696,28 @@ async function retrieveAndRank(
       .sort((a, b) => b.score - a.score);
   }
 
+  // Pass 5: never return empty when the feed pool has stories — serve freshest as best available
+  let usedLatestFallback = false;
+  if (!scored.length && fresh.length) {
+    usedLatestFallback = true;
+    scored = [...fresh]
+      .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime())
+      .slice(0, Math.max(limit * 4, 12))
+      .map((i) => ({
+        ...i,
+        matchScore: 6,
+        score: 6 + Math.min(2, i.significance / 5) + freshnessBonus(i.publishedAt),
+        matchedTerms: ['latest'],
+      }));
+  }
+
   return {
     items: pickDiverse(scored, limit),
     total: scored.length,
     poolSize: fresh.length,
     tokens,
     expanded,
+    usedLatestFallback,
   };
 }
 
@@ -967,6 +1001,7 @@ async function buildNewsReply(
   items: QueryResultItem[],
   poolSize: number,
   note?: string,
+  closestCoverage?: boolean,
 ): Promise<{
   text: string;
   answer: string;
@@ -977,30 +1012,21 @@ async function buildNewsReply(
   const lang = detectQueryLanguage(question);
   const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`];
   if (note) parts.push(note);
+  else if (closestCoverage && items.length) {
+    parts.push(
+      lang === 'ur'
+        ? '_قریب ترین تازہ کوریج:_'
+        : '_Closest live coverage from NewsDash:_',
+    );
+  }
 
   if (!items.length) {
-    const notFound =
-      poolSize === 0
-        ? lang === 'ur'
-          ? 'NewsDash کی فیڈز ابھی سنک ہو رہی ہیں۔ کچھ دیر بعد دوبارہ کوشش کریں۔'
-          : 'Our news feeds are still syncing. Please try again in a moment.'
-        : lang === 'ur'
-          ? [
-              `*"${topicLabel}"* کے لیے اس وقت NewsDash میں کوئی مضبوط خبر نہیں ملی۔`,
-              '',
-              'آپ یہ کوشش کر سکتے ہیں:',
-              '• مختصر یا مختلف لفظ استعمال کریں',
-              '• تھوڑی دیر بعد دوبارہ پوچھیں — فیڈز چند منٹ میں اپڈیٹ ہوتی ہیں',
-            ].join('\n')
-          : [
-              `No NewsDash coverage found for *"${topicLabel}"* right now.`,
-              '',
-              'This could mean:',
-              '• The topic is not yet in our live feeds',
-              '• Try a shorter or different keyword (e.g. just the city, person, or event name)',
-              '• Check back later — feeds update every few minutes',
-            ].join('\n');
-    parts.push(notFound);
+    // Only when the whole feed pool is empty (syncing). Never claim the topic was "not published".
+    const syncing =
+      lang === 'ur'
+        ? 'NewsDash کی فیڈز ابھی تازہ ہو رہی ہیں۔ ایک لمحے بعد دوبارہ پوچھیں — میں تازہ کوریج سے جواب دوں گا۔'
+        : 'NewsDash feeds are refreshing. Ask again in a moment and I will answer from the latest coverage.';
+    parts.push(syncing);
     return { text: parts.join('\n'), answer: '', sources: [], sourceButtons: [], displayUrls: [] };
   }
 
@@ -1008,20 +1034,8 @@ async function buildNewsReply(
   let answer = await buildGroundedAnswer(question, sources, lang);
   const weak = Boolean(answer && isWeakGroundedAnswer(answer));
   if (!answer || answer.length < WA_ANSWER_MIN || weak) {
-    const extractive = buildExtractiveAnswer(question, sources, lang);
-    if (weak) {
-      // LLM only hedged — replace with clear related coverage.
-      answer =
-        lang === 'ur'
-          ? ['براہِ راست مکمل جواب فیڈز میں نہیں ملا۔ متعلقہ کوریج:', '', extractive].join('\n')
-          : [
-              'Sources do not fully answer that, but here is the related NewsDash coverage:',
-              '',
-              extractive,
-            ].join('\n');
-    } else {
-      answer = extractive;
-    }
+    // Prefer concrete extractive facts — never a "not provided" hedge.
+    answer = buildExtractiveAnswer(question, sources, lang);
   }
 
   const displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
@@ -1383,7 +1397,14 @@ export async function POST(request: Request) {
       : 'Note: live Pakistan pump rates are not connected yet. Sharing related oil/fuel coverage.'
     : undefined;
 
-  const built = await buildNewsReply(rawQ, newsTopicLabel, items, ranked.poolSize, note);
+  const built = await buildNewsReply(
+    rawQ,
+    newsTopicLabel,
+    items,
+    ranked.poolSize,
+    note,
+    Boolean(ranked.usedLatestFallback),
+  );
   let whatsappText = built.text;
   let sourceButtons = built.sourceButtons;
   let displayUrls = built.displayUrls;
