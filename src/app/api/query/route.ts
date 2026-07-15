@@ -13,8 +13,11 @@ import {
   type ReplyLanguage,
 } from '@/lib/query/grounded-answer';
 import {
+  isVagueFollowUp,
+  normalizeChatId,
   resolveEffectiveQuery,
   setChatMemory,
+  type HistoryTurn,
 } from '@/lib/query/memory';
 import type { Category, NewsItem } from '@/types';
 
@@ -38,6 +41,10 @@ type QueryRequest = {
   /** Whisper / client language hint (`ur`, `en`, …). */
   lang?: string;
   replyLang?: 'en' | 'ur';
+  /** Recent chat turns from n8n (user/assistant). */
+  history?: HistoryTurn[];
+  /** Last known intent from session (gold_price, fuel_price, …). */
+  previousIntent?: string;
 };
 
 type QueryResultItem = NewsItem & {
@@ -281,14 +288,16 @@ function isGreeting(q: string): boolean {
 function wantsLivePrice(q: string): boolean {
   const s = clean(q);
   if (
-    /\b(price|prices|spot|rate|rates|cost|how much|worth|trading at|quote|increasing|decreasing|up or down|going up|going down|rose|fell|rally|dump|keemat|qimat|qiymat|kimat|qeemat)\b/.test(
+    /\b(price|prices|spot|rate|rates|cost|how much|worth|trading at|quote|increasing|decreasing|increase|decrease|up or down|going up|going down|rose|fell|rally|dump|keemat|qimat|qiymat|kimat|qeemat|praiz|prize)\b/.test(
       s,
     )
   ) {
     return true;
   }
-  // Urdu script price/rate phrasing (common in voice asks)
-  return /قیمت|ریٹ|ریٹس|کتنی|کتنا|کَتنا|کَتنی|ما لیا|مالیت/.test(q);
+  // Urdu script price/rate / increase-decrease phrasing (common in voice asks)
+  return /قیمت|ریٹ|ریٹس|پرائز|پرائیس|انکریز|ڈیکریز|کتنی|کتنا|کَتنا|کَتنی|بڑھی|کم\s*ہو|زیادہ\s*ہو|ما لیا|مالیت/.test(
+    q,
+  );
 }
 
 /** Fix common Whisper STT mangling before intent detection. */
@@ -308,20 +317,29 @@ function normalizeVoiceQuery(raw: string): string {
   q = q.replace(/\b(sona|sone|sonay)\b/gi, 'gold');
   q = q.replace(/\b(bit\s*coin|bitkon)\b/gi, 'bitcoin');
   q = q.replace(/\bpatrol\b/gi, 'petrol');
-  q = q.replace(/\b(petrol|diesel|fuel)\s*(ki|ke|ka)?\s*(keemat|qimat|qiymat|kimat|price|rate)\b/gi, '$1 price');
+  q = q.replace(/\b(praiz|prize|pricc)\b/gi, 'price');
+  q = q.replace(/\b(increez|increse|inkreez)\b/gi, 'increase');
+  q = q.replace(/\b(decreez|dicrease|dikreez)\b/gi, 'decrease');
+  q = q.replace(
+    /\b(petrol|diesel|fuel)\s*(ki|ke|ka)?\s*(keemat|qimat|qiymat|kimat|price|rate|praiz)\b/gi,
+    '$1 price',
+  );
   q = q.replace(/پٹرول|پیٹرولیم/g, 'petrol');
   q = q.replace(/ڈیزل/g, 'diesel');
+  q = q.replace(/پرائز|پرائیس/g, 'price');
+  q = q.replace(/انکریز/g, 'increase');
+  q = q.replace(/ڈیکریز/g, 'decrease');
 
-  // Nastaliq: bitcoin/سونا/پیٹرول + قیمت
-  if (/قیمت|ریٹ/.test(q)) {
+  // Nastaliq / mixed: bitcoin/سونا/پیٹرول + قیمت/پرائز
+  if (/قیمت|ریٹ|پرائز|price|increase|decrease/i.test(q)) {
     if (/بٹ\s*کوائن|بٹکوائن|بٹ\s*کون|bitcoin|btc/i.test(q) || /بی\s*ٹی\s*سی/.test(raw)) {
       q = `bitcoin price ${q}`;
     } else if (/سونا|گولڈ|gold/i.test(q)) {
       q = `gold price ${q}`;
     } else if (/ایتھیریم|ethereum|eth/i.test(q)) {
       q = `ethereum price ${q}`;
-    } else if (/پیٹرول|پٹرول|ڈیزل|petrol|diesel|fuel/i.test(q)) {
-      q = `petrol price ${q}`;
+    } else if (/پیٹرول|پٹرول|ڈیزل|petrol|diesel|fuel|ایندھن/i.test(q)) {
+      q = `diesel price ${q}`;
     }
   }
 
@@ -1289,6 +1307,17 @@ function buildFuelReply(topicLabel: string, oil: OilQuote, lang: ReplyLanguage):
   const topicHdr = localizedTopicLabel(topicLabel, lang);
   const fmtCh = (n?: number) =>
     n == null ? '' : ` | 24h ${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+  const direction = (n?: number) => {
+    if (n == null) return '';
+    if (lang === 'ur') {
+      if (n > 0.15) return ' بڑھ رہی ہے / up';
+      if (n < -0.15) return ' گر رہی ہے / down';
+      return ' تقریباً فلیٹ / flat';
+    }
+    if (n > 0.15) return ' (up)';
+    if (n < -0.15) return ' (down)';
+    return ' (flat)';
+  };
   const liveHdr = lang === 'ur' ? '*لائیو کرڈ آئل (بین الاقوامی)*' : '*Live crude oil (international)*';
   const lines = [
     '*NewsDash Analyst*',
@@ -1296,11 +1325,11 @@ function buildFuelReply(topicLabel: string, oil: OilQuote, lang: ReplyLanguage):
     `${topicKey} ${topicHdr}`,
     '',
     liveHdr,
-    `*WTI* - $${oil.wtiUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel${fmtCh(oil.wtiChange24h)}`,
+    `*WTI* - $${oil.wtiUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel${fmtCh(oil.wtiChange24h)}${direction(oil.wtiChange24h)}`,
   ];
   if (oil.brentUsd) {
     lines.push(
-      `*Brent* - $${oil.brentUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel${fmtCh(oil.brentChange24h)}`,
+      `*Brent* - $${oil.brentUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel${fmtCh(oil.brentChange24h)}${direction(oil.brentChange24h)}`,
     );
   }
   if (oil.usdPkrRate) {
@@ -1399,14 +1428,19 @@ export async function POST(request: Request) {
     return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
   }
 
-  const chatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
+  const chatId = normalizeChatId(
+    typeof body.chatId === 'string' ? body.chatId.trim() : '',
+  );
   const incomingQ = body.q.trim();
   const replyLangEarly = detectQueryLanguage(incomingQ);
+  const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
   const resolved = await resolveEffectiveQuery({
     rawQ: incomingQ,
     previousQ: typeof body.previousQ === 'string' ? body.previousQ : null,
     chatId,
     lang: replyLangEarly,
+    history,
+    previousIntent: typeof body.previousIntent === 'string' ? body.previousIntent : null,
   });
 
   if (resolved.needsClarify && resolved.clarifyText) {
@@ -1428,20 +1462,58 @@ export async function POST(request: Request) {
   if (rawQ.length < 2) {
     return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
   }
-  const replyLang = resolveReplyLanguage(
+  let replyLang = resolveReplyLanguage(
     incomingQ,
     rawQ,
-    body.replyLang || body.lang,
+    body.replyLang || body.lang || resolved.preferredLang,
   );
+  if (resolved.preferredLang) replyLang = resolved.preferredLang;
+
   const q = extractTopicQuery(rawQ);
   const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT_MAX);
-  const plugin = detectPlugin(q);
+  let plugin = detectPlugin(q);
+
+  // Prefer explicit new asset names in the resolved ask over sticky session intent.
+  const incomingMentionsCrypto = /\b(bitcoin|btc|ethereum|eth|solana|sol)\b/i.test(`${incomingQ} ${q}`);
+  const incomingMentionsGold = /\b(gold|xau|sona)\b/i.test(`${incomingQ} ${q}`);
+  const incomingMentionsFuel = /\b(petrol|diesel|fuel|oil)\b/i.test(`${incomingQ} ${q}`);
+
+  // Sticky only for vague continues — never when user names a different asset.
+  const stickyIntent =
+    resolved.memoryIntent ||
+    (isVagueFollowUp(incomingQ) && !incomingMentionsCrypto && !incomingMentionsGold && !incomingMentionsFuel
+      ? String(body.previousIntent || '').trim()
+      : '');
+
+  if (incomingMentionsCrypto) {
+    const id = /\bethereum|eth\b/i.test(`${incomingQ} ${q}`)
+      ? 'ethereum'
+      : /\bsolana|sol\b/i.test(`${incomingQ} ${q}`)
+        ? 'solana'
+        : 'bitcoin';
+    plugin = { kind: 'crypto_price', cryptoId: id };
+  } else if (incomingMentionsGold && !incomingMentionsFuel) {
+    plugin = { kind: 'gold_price' };
+  } else if (incomingMentionsFuel) {
+    plugin = { kind: 'fuel_price' };
+  } else if (plugin.kind === 'news' && stickyIntent) {
+    if (stickyIntent === 'fuel_price') plugin = { kind: 'fuel_price' };
+    else if (stickyIntent === 'gold_price') plugin = { kind: 'gold_price' };
+    else if (stickyIntent === 'crypto_price') {
+      plugin = { kind: 'crypto_price', cryptoId: 'bitcoin' };
+    }
+  }
+
   const topicLabel = displayTopic(q, plugin);
   const now = new Date().toISOString();
-  const remember = (topic: string) => {
-    // Remember the user-facing topic, not internal clarifiers.
+  const remember = (topic: string, intent: string, answerBrief?: string, assistantText?: string) => {
     if (plugin.kind === 'greeting') return;
-    setChatMemory(chatId, rawQ, topic);
+    setChatMemory(chatId, rawQ, topic, {
+      intent,
+      answerBrief,
+      preferredLang: replyLang,
+      assistantText,
+    });
   };
 
   if (plugin.kind === 'greeting') {
@@ -1497,7 +1569,7 @@ export async function POST(request: Request) {
               '• Checking again in a few minutes',
             ].join('\n');
     }
-    remember(topicLabel);
+    remember(topicLabel, 'weather', weather?.error || `Live weather for ${weather?.location || topicLabel}`, whatsappText);
     return Response.json({
       query: q,
       rawQuery: incomingQ,
@@ -1522,7 +1594,7 @@ export async function POST(request: Request) {
         const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
         whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
-      remember(topicLabel);
+      remember(topicLabel, 'gold_price', `Gold $${gold.price}/oz`, whatsappText);
       return Response.json({
         query: q,
         rawQuery: incomingQ,
@@ -1549,7 +1621,7 @@ export async function POST(request: Request) {
         const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
         whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
-      remember(topicLabel);
+      remember(topicLabel, 'crypto_price', `${quote.symbol} $${quote.usd}`, whatsappText);
       return Response.json({
         query: q,
         rawQuery: incomingQ,
@@ -1575,7 +1647,12 @@ export async function POST(request: Request) {
         const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
         whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
-      remember(topicLabel);
+      remember(
+        topicLabel,
+        'fuel_price',
+        `WTI $${oil.wtiUsd}${oil.brentUsd ? ` / Brent $${oil.brentUsd}` : ''}`,
+        whatsappText,
+      );
       return Response.json({
         query: q,
         rawQuery: incomingQ,
@@ -1605,8 +1682,10 @@ export async function POST(request: Request) {
 
   // Fuel/pump asks: never invent a pump number; answer with oil/fuel market evidence.
   const fuelAsk =
+    plugin.kind === 'fuel_price' ||
+    stickyIntent === 'fuel_price' ||
     /\b(petrol|diesel|gasoline|pump\s*price|fuel\s*price)\b/i.test(q) ||
-    /پیٹرول|ڈیزل|پیٹرولیم/.test(rawQ);
+    /پیٹرول|ڈیزل|پیٹرولیم|ایندھن|پرائز/.test(rawQ);
 
   // Smart rewrite: better keywords + topic label than raw tokenize.
   const plan = plugin.kind === 'news' ? await planNewsQuery(rawQ) : null;
@@ -1716,7 +1795,12 @@ export async function POST(request: Request) {
 
   const preview = linkPreview(items);
 
-  remember(newsTopicLabel);
+  remember(
+    newsTopicLabel,
+    fuelAsk ? 'fuel_price' : 'news',
+    built.answer || note || newsTopicLabel,
+    whatsappText,
+  );
   return Response.json({
     query: q,
     rawQuery: incomingQ,
