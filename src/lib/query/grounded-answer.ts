@@ -95,14 +95,16 @@ function systemPrompt(lang: ReplyLanguage): string {
 - Source titles stay as provided; you are only translating/adapting the answer narrative.`
       : `- Respond FULLY in English.`;
 
-  return `You are NewsDash Analyst answering WhatsApp users.
+  return `You are NewsDash Analyst — sharp, factual, WhatsApp-native.
 Rules:
 - Answer ONLY using the provided source texts. Do not invent facts, prices, quotes, or events.
-- Directly answer the user's question in 4–8 short sentences, or a few short bullets if clearer.
-- Prefer concrete facts (who/what/when/where/why) from the sources.
-- Mention the publisher name(s) when stating key claims (e.g. "According to Reuters…" / "روئٹرز کے مطابق…").
-- If the sources do not contain enough to answer, say clearly what is known and what is missing. Do not pad.
-- Plain WhatsApp text only: no markdown headings, no code fences, no hashtags.
+- Think like a desk editor: pick the strongest facts that address the user's intent, then explain briefly.
+- Lead with a direct answer in the first 1–2 sentences. Then add 2–5 short supporting points.
+- Prefer concrete facts (who/what/when/where/numbers) from the sources. Keep ~80–160 words.
+- Mention publisher name(s) on key claims (e.g. "According to Reuters…" / "روئٹرز کے مطابق…").
+- If sources cannot fully answer (e.g. live local petrol pump rate missing): ONE short sentence on that gap, then summarize useful related coverage. Never pad with "not available / more information needed" essays.
+- Never end with a useless disclaimer that cancels the answer.
+- Plain WhatsApp text only: no markdown headings, no code fences, no hashtags. Light *bold* ok.
 - Do not tell the user to open the link as the main answer; the brief itself must be useful.
 ${languageRule}`;
 }
@@ -150,6 +152,63 @@ export async function englishSearchHints(question: string, lang: ReplyLanguage):
   }
 }
 
+export type NewsQueryPlan = {
+  searchQuery: string;
+  displayTopic: string;
+  preferFreshHours: number | null;
+};
+
+/**
+ * Rewrite a natural-language ask into RSS search keywords + a clean topic label.
+ * Falls back to null when Groq is unavailable.
+ */
+export async function planNewsQuery(question: string): Promise<NewsQueryPlan | null> {
+  if (!question.trim() || !process.env.GROQ_API_KEY) return null;
+  try {
+    const text = await groqChat(
+      [
+        {
+          role: 'system',
+          content: `You rewrite WhatsApp news questions for RSS headline search.
+Return ONLY valid JSON with keys:
+- searchQuery: 3-10 English keywords/entities that best match news headlines (no filler like what/happened/tell/me/today unless the entity itself needs them)
+- displayTopic: short Title Case label for the reply header (2-6 words)
+- preferFreshHours: number 6, 24, or 72 if the user wants latest/today/now; otherwise null
+No markdown, no extra keys.`,
+        },
+        { role: 'user', content: question.trim() },
+      ],
+      { maxTokens: 120, temperature: 0 },
+    );
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]) as {
+      searchQuery?: unknown;
+      displayTopic?: unknown;
+      preferFreshHours?: unknown;
+    };
+    const searchQuery = String(parsed.searchQuery || '')
+      .replace(/[^\w\s+-]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const displayTopic = String(parsed.displayTopic || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 60);
+    let preferFreshHours: number | null = null;
+    const fh = Number(parsed.preferFreshHours);
+    if (fh === 6 || fh === 24 || fh === 72) preferFreshHours = fh;
+    if (searchQuery.length < 2) return null;
+    return {
+      searchQuery,
+      displayTopic: displayTopic || searchQuery,
+      preferFreshHours,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Groq grounded brief; returns null on failure / empty. */
 export async function buildGroundedAnswer(
   question: string,
@@ -173,10 +232,10 @@ export async function buildGroundedAnswer(
         { role: 'system', content: systemPrompt(lang) },
         {
           role: 'user',
-          content: `User question:\n${question.trim()}\n\nSources:\n${formatSources(usable)}${langHint}\n\nWrite the WhatsApp answer now.`,
+          content: `User question:\n${question.trim()}\n\nSources:\n${formatSources(usable)}${langHint}\n\nWrite a sharp WhatsApp answer now. Lead with the best available fact. If "today" is unknown, say the freshest update from sources without a long apology.`,
         },
       ],
-      { maxTokens: 650, temperature: 0.2 },
+      { maxTokens: 700, temperature: 0.15 },
     );
     const cleaned = text
       .replace(/^#{1,6}\s+/gm, '')
@@ -188,6 +247,26 @@ export async function buildGroundedAnswer(
   } catch {
     return null;
   }
+}
+
+/** True when the model hedged instead of giving a useful brief. */
+export function isWeakGroundedAnswer(answer: string): boolean {
+  const t = String(answer || '').trim();
+  if (t.length < 40) return true;
+  const lower = t.toLowerCase();
+  const hedge =
+    /not available in the provided source|there is no information|no information available|does not (mention|provide|contain)|more information is needed|cannot (determine|answer|find)|insufficient (information|detail|data)|i (do not|don't) have (enough|sufficient)|could not find|اس سوال کا جواب (نہیں|نہيں)|کافی معلومات نہیں|کوئی معلومات نہیں/.test(
+      lower,
+    );
+  if (!hedge) return false;
+  // Hedge dominates → weak even if a date appears once
+  const sentences = t.split(/[.؟!]\s+/).filter(Boolean);
+  const hedgeSentences = sentences.filter((s) =>
+    /no information|not available|more information|cannot |insufficient|کوئی معلومات|کافی معلومات/i.test(s),
+  ).length;
+  if (hedgeSentences >= 1 && sentences.length <= 3) return true;
+  const hasFactSignal = /\b(20\d{2}|\$\d|\d+%|\d+\s?(million|billion|km|usd|pkr))\b/i.test(t);
+  return !hasFactSignal || hedgeSentences >= 2;
 }
 
 /** Extractive fallback when Groq is unavailable — never invents. */

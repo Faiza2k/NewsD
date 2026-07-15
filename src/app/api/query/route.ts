@@ -6,6 +6,8 @@ import {
   buildGroundedAnswer,
   detectQueryLanguage,
   englishSearchHints,
+  isWeakGroundedAnswer,
+  planNewsQuery,
   type GroundedSource,
 } from '@/lib/query/grounded-answer';
 import type { Category, NewsItem } from '@/types';
@@ -162,8 +164,8 @@ const BOILERPLATE_RE =
   /this is today'?s edition|weekday newsletter|daily dose of what'?s going on|subscribe to|photo:/i;
 
 const WA_SUMMARY_MAX = 200;
-const WA_STORY_LIMIT = 2;
-const WA_STORY_LIMIT_MAX = 2;
+const WA_STORY_LIMIT = 3;
+const WA_STORY_LIMIT_MAX = 3;
 const WA_ANSWER_MIN = 40;
 const MIN_MATCH = 8;
 const GRAMS_PER_TROY_OZ = 31.1034768;
@@ -190,9 +192,16 @@ function extractTopicQuery(raw: string): string {
   // Catch remaining filler starters
   q = q.replace(/^(to know about|to know|to find out about|to find out|to check|to see)\s+/i, '');
   q = q.replace(/^(what(?:'s| is| are)|whats)\s+(the\s+)?(latest\s+|current\s+|live\s+)?/i, '');
+  // "what happened with/to/in X today"
+  q = q.replace(
+    /^(what\s+)?(happened|happening|going on|news)\s+(with|to|in|about|on|regarding)\s+/i,
+    '',
+  );
   q = q.replace(/^(any|some)\s+(news|updates?|info|information)\s+(on|about|regarding)\s+/i, '');
+  q = q.replace(/\b(today|tonight|right now|currently)\b/gi, ' ');
   q = q.replace(/^(the\s+)?/i, '');
   q = q.replace(/\?+$/g, '').trim();
+  q = q.replace(/\s+/g, ' ').trim();
   return q || String(raw || '').trim();
 }
 
@@ -497,6 +506,7 @@ async function retrieveAndRank(
   q: string,
   limit: number,
   categories?: Category[],
+  preferFreshHours?: number | null,
 ): Promise<{
   items: QueryResultItem[];
   total: number;
@@ -519,11 +529,21 @@ async function retrieveAndRank(
     return { items: [], total: 0, poolSize: fresh.length, tokens, expanded };
   }
 
+  const freshnessBonus = (iso: string): number => {
+    if (!preferFreshHours) return 0;
+    const ageMs = Date.now() - new Date(iso).getTime();
+    const windowMs = preferFreshHours * 60 * 60 * 1000;
+    if (Number.isNaN(ageMs) || ageMs < 0) return 0;
+    if (ageMs <= windowMs) return 12;
+    if (ageMs <= windowMs * 2) return 5;
+    return 0;
+  };
+
   // Pass 1: strict title-first ranking
   let scored = fresh
     .map((i) => {
       const { matchScore, score, matchedTerms } = scoreAgainstQuery(i, tokens, expanded, phrase);
-      return { ...i, matchScore, score, matchedTerms };
+      return { ...i, matchScore, score: score + freshnessBonus(i.publishedAt), matchedTerms };
     })
     .filter((i) => i.matchScore >= MIN_MATCH)
     .sort((a, b) => {
@@ -539,7 +559,7 @@ async function retrieveAndRank(
     scored = fresh
       .map((i) => {
         const { matchScore, score, matchedTerms } = scoreAgainstQuery(i, focus, exp, phrase);
-        return { ...i, matchScore, score, matchedTerms };
+        return { ...i, matchScore, score: score + freshnessBonus(i.publishedAt), matchedTerms };
       })
       .filter((i) => i.matchScore >= MIN_MATCH)
       .sort((a, b) => b.score - a.score);
@@ -570,7 +590,7 @@ async function retrieveAndRank(
         return {
           ...i,
           matchScore,
-          score: matchScore + Math.min(2, i.significance / 5),
+          score: matchScore + Math.min(2, i.significance / 5) + freshnessBonus(i.publishedAt),
           matchedTerms: [term],
         } as QueryResultItem;
       })
@@ -589,7 +609,7 @@ async function retrieveAndRank(
       .map((i) => ({
         ...i,
         matchScore: 9,
-        score: 9 + Math.min(2, i.significance / 5),
+        score: 9 + Math.min(2, i.significance / 5) + freshnessBonus(i.publishedAt),
         matchedTerms: ['tech'],
       }))
       .sort((a, b) => b.score - a.score);
@@ -923,8 +943,22 @@ async function buildNewsReply(
 
   const sources = await enrichGroundedSources(items);
   let answer = await buildGroundedAnswer(question, sources, lang);
-  if (!answer || answer.length < WA_ANSWER_MIN) {
-    answer = buildExtractiveAnswer(question, sources, lang);
+  const weak = Boolean(answer && isWeakGroundedAnswer(answer));
+  if (!answer || answer.length < WA_ANSWER_MIN || weak) {
+    const extractive = buildExtractiveAnswer(question, sources, lang);
+    if (weak) {
+      // LLM only hedged — replace with clear related coverage.
+      answer =
+        lang === 'ur'
+          ? ['براہِ راست مکمل جواب فیڈز میں نہیں ملا۔ متعلقہ کوریج:', '', extractive].join('\n')
+          : [
+              'Sources do not fully answer that, but here is the related NewsDash coverage:',
+              '',
+              extractive,
+            ].join('\n');
+    } else {
+      answer = extractive;
+    }
   }
 
   const displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
@@ -943,9 +977,13 @@ function buildGreeting(): string {
   return [
     '*NewsDash Analyst*',
     '',
-    'Ask any news or market question (text or voice). I search NewsDash feeds and reply with a grounded answer plus source links.',
+    'Ask in English or Urdu (text or voice). I search live NewsDash feeds and reply with a short clear answer plus source links.',
     '',
-    'Examples: AI regulation, OpenAI, oil markets, Pakistan crypto, gold price now, weather in Karachi.',
+    'Try:',
+    '• gold price now',
+    '• bitcoin price',
+    '• weather in Karachi',
+    '• AI regulation / OpenAI / oil markets',
   ].join('\n');
 }
 
@@ -1195,34 +1233,54 @@ export async function POST(request: Request) {
         ? plugin.cryptoId
         : q;
 
-  // Fuel/pump asks: never invent a number; answer with oil/fuel market evidence from feeds.
+  // Fuel/pump asks: never invent a pump number; answer with oil/fuel market evidence.
   const fuelAsk =
     /\b(petrol|diesel|gasoline|pump\s*price|fuel\s*price)\b/i.test(q) ||
     /پیٹرول|ڈیزل|پیٹرولیم/.test(rawQ);
 
-  // Urdu-script questions need English keywords to match English RSS headlines.
+  // Smart rewrite: better keywords + topic label than raw tokenize.
+  const plan = plugin.kind === 'news' ? await planNewsQuery(rawQ) : null;
   const urduHints = await englishSearchHints(rawQ, replyLang);
-  const baseSearch = urduHints || newsQ;
-  const searchQ = fuelAsk ? `${baseSearch} oil crude petroleum fuel` : baseSearch;
+  let baseSearch = plan?.searchQuery || urduHints || newsQ;
+  if (fuelAsk) {
+    // Prefer oil market headlines over literal "pakistan petrol" which often match nothing.
+    baseSearch = `${plan?.searchQuery || 'oil crude petroleum fuel gasoline'} oil crude petroleum fuel opec diesel`;
+  }
+
+  const preferFresh =
+    plan?.preferFreshHours ??
+    (/\b(today|latest|now|breaking|just\s+in|aaj)\b/i.test(rawQ) ? 24 : null);
+
+  const newsTopicLabel =
+    plugin.kind === 'news' && plan?.displayTopic
+      ? plan.displayTopic
+      : topicLabel;
 
   const ranked = await retrieveAndRank(
-    searchQ,
+    baseSearch,
     limit,
     body.categories && body.categories.length ? body.categories : undefined,
+    preferFresh,
   );
 
   let items = ranked.items;
   if (fuelAsk) {
-    items = items.filter((i) =>
-      /\b(oil|crude|brent|wti|petroleum|petrol|diesel|fuel|gasoline|opec)\b/i.test(i.title),
+    const fuelish = items.filter((i) =>
+      /\b(oil|crude|brent|wti|petroleum|petrol|diesel|fuel|gasoline|opec)\b/i.test(
+        `${i.title} ${i.description || ''}`,
+      ),
     );
+    // Never wipe results — if filter is empty, keep ranked oil-expanded search hits.
+    if (fuelish.length) items = fuelish;
   }
 
   const note = fuelAsk
-    ? 'Live Pakistan pump prices are not wired yet. Showing related oil/fuel coverage from NewsDash.'
+    ? replyLang === 'ur'
+      ? 'نوٹ: پاکستان کے لائیو پمپ ریٹ ابھی منسلک نہیں۔ تیل/ایندھن کی متعلقہ کوریج دے رہا ہوں۔'
+      : 'Note: live Pakistan pump rates are not connected yet. Sharing related oil/fuel coverage.'
     : undefined;
 
-  const built = await buildNewsReply(rawQ, topicLabel, items, ranked.poolSize, note);
+  const built = await buildNewsReply(rawQ, newsTopicLabel, items, ranked.poolSize, note);
   let whatsappText = built.text;
   let sourceButtons = built.sourceButtons;
   let displayUrls = built.displayUrls;
@@ -1237,13 +1295,29 @@ export async function POST(request: Request) {
   if (!gate.ok && items.length) {
     displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
     sourceButtons = buildSourceButtons(items, displayUrls);
+    const fallbackLang = detectQueryLanguage(rawQ);
+    const fallbackAnswer = buildExtractiveAnswer(
+      rawQ,
+      items.map((i) => ({
+        title: i.title,
+        source: i.source || 'Publisher',
+        url: i.url,
+        publishedAt: i.publishedAt,
+        body: i.description || i.title,
+      })),
+      fallbackLang,
+    );
+    const aLabel = fallbackLang === 'ur' ? '*جواب:*' : '*Answer:*';
+    const sLabel = fallbackLang === 'ur' ? '*ذرائع:*' : '*Sources*';
     whatsappText = [
       '*NewsDash Analyst*',
       '',
-      `*Topic:* ${topicLabel}`,
-      'Found relevant stories.',
+      `*Topic:* ${newsTopicLabel}`,
       '',
-      '*Sources*',
+      aLabel,
+      fallbackAnswer,
+      '',
+      sLabel,
       items
         .map((i, idx) => formatSourceLine(i, idx, items.length > 1, displayUrls[idx]))
         .join('\n\n'),
@@ -1255,7 +1329,7 @@ export async function POST(request: Request) {
   return Response.json({
     query: q,
     rawQuery: rawQ,
-    displayTopic: topicLabel,
+    displayTopic: newsTopicLabel,
     intent: fuelAsk ? 'unsupported_live' : 'news',
     terms: { primary: ranked.tokens, expanded: ranked.expanded },
     brief: built.answer || note || (items.length ? 'Matching stories from NewsDash.' : 'No strong match.'),
