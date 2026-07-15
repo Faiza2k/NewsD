@@ -263,9 +263,47 @@ function isGreeting(q: string): boolean {
 }
 
 function wantsLivePrice(q: string): boolean {
-  return /\b(price|prices|spot|rate|rates|cost|how much|worth|trading at|quote|increasing|decreasing|up or down|going up|going down|rose|fell|rally|dump)\b/.test(
-    clean(q),
-  );
+  const s = clean(q);
+  if (
+    /\b(price|prices|spot|rate|rates|cost|how much|worth|trading at|quote|increasing|decreasing|up or down|going up|going down|rose|fell|rally|dump|keemat|qimat|qiymat|kimat|qeemat)\b/.test(
+      s,
+    )
+  ) {
+    return true;
+  }
+  // Urdu script price/rate phrasing (common in voice asks)
+  return /قیمت|ریٹ|ریٹس|کتنی|کتنا|کَتنا|کَتنی|ما لیا|مالیت/.test(q);
+}
+
+/** Fix common Whisper STT mangling before intent detection. */
+function normalizeVoiceQuery(raw: string): string {
+  let q = String(raw || '').trim();
+  if (!q) return q;
+
+  // Split letters "B T C" / "بی ٹی سی" often heard for BTC
+  q = q.replace(/\bb\s*[\.\-]?\s*t\s*[\.\-]?\s*c\b/gi, 'bitcoin');
+  q = q.replace(/بی\s*ٹی\s*سی/g, 'bitcoin');
+  q = q.replace(/\be\s*[\.\-]?\s*t\s*[\.\-]?\s*h\b/gi, 'ethereum');
+  q = q.replace(/\bs\s*[\.\-]?\s*o\s*[\.\-]?\s*l\b/gi, 'solana');
+
+  // Roman Urdu: "bitcoin ki keemat / price batao"
+  q = q.replace(/\b(ki|ke|ka)\s+(keemat|qimat|qiymat|kimat|price|rate)\b/gi, ' price ');
+  q = q.replace(/\b(keemat|qimat|qiymat|kimat)\b/gi, 'price');
+  q = q.replace(/\b(sona|sone|sonay)\b/gi, 'gold');
+  q = q.replace(/\b(bit\s*coin|bitkon)\b/gi, 'bitcoin');
+
+  // Nastaliq: bitcoin/سونا + قیمت
+  if (/قیمت|ریٹ/.test(q)) {
+    if (/بٹ\s*کوائن|بٹکوائن|بٹ\s*کون|bitcoin|btc/i.test(q) || /بی\s*ٹی\s*سی/.test(raw)) {
+      q = `bitcoin price ${q}`;
+    } else if (/سونا|گولڈ|gold/i.test(q)) {
+      q = `gold price ${q}`;
+    } else if (/ایتھیریم|ethereum|eth/i.test(q)) {
+      q = `ethereum price ${q}`;
+    }
+  }
+
+  return q.replace(/\s+/g, ' ').trim();
 }
 
 /** e.g. "62899 or 62829 ?" after a BTC quote — treat as live bitcoin ask */
@@ -280,14 +318,15 @@ function detectPlugin(q: string): Plugin {
 
   if (
     /^(weather|forecast|temperature|humidity)$/.test(s) ||
-    (/\b(weather|forecast|temperature|humidity)\b/.test(s) &&
+    (/\b(weather|forecast|temperature|humidity|mosam|mosaam|موسم)\b/.test(s) &&
       !/\b(oil|stock|market|bitcoin|crypto|gold|ai|nvidia|news)\b/.test(s))
   ) {
     let city = s
       .replace(
-        /\b(weather|forecast|temperature|humidity|today|now|current|please|tell|me|about|of|in|for|the|a|an|to|know|want|need|check|see|find|out|give|show|i|is|what|whats|how)\b/g,
+        /\b(weather|forecast|temperature|humidity|mosam|mosaam|today|now|current|please|tell|me|about|of|in|for|the|a|an|to|know|want|need|check|see|find|out|give|show|i|is|what|whats|how|kya|hai)\b/g,
         ' ',
       )
+      .replace(/موسم|بتاؤ|بتاو|کیا|ہے/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
     if (!city) return { kind: 'weather', city: 'London', cityAsked: false };
@@ -298,11 +337,27 @@ function detectPlugin(q: string): Plugin {
     return { kind: 'crypto_price', cryptoId: 'bitcoin' };
   }
 
-  if (wantsLivePrice(s) || /\b(increasing|decreasing|up or down)\b/.test(s)) {
-    if (/\b(gold|xau|bullion)\b/.test(s)) return { kind: 'gold_price' };
-    if (/\b(bitcoin|btc)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
-    if (/\b(ethereum|eth)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'ethereum' };
-    if (/\b(solana|sol)\b/.test(s)) return { kind: 'crypto_price', cryptoId: 'solana' };
+  const priceAsk = wantsLivePrice(q) || /\b(increasing|decreasing|up or down)\b/.test(s);
+  const mentionsBtc = /\b(bitcoin|btc)\b/.test(s) || /بٹ\s*کوائن|بٹکوائن/.test(q);
+  const mentionsEth = /\b(ethereum|eth)\b/.test(s) || /ایتھیریم/.test(q);
+  const mentionsSol = /\b(solana|sol)\b/.test(s);
+  const mentionsGold = /\b(gold|xau|bullion)\b/.test(s) || /سونا|گولڈ/.test(q);
+  const shortAsk = tokenize(s).length <= 5;
+  const newsy = /\b(news|headline|regulation|etf|hack|lawsuit|sue|ban|wars?|war)\b/.test(s);
+
+  if (priceAsk) {
+    if (mentionsGold) return { kind: 'gold_price' };
+    if (mentionsBtc) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
+    if (mentionsEth) return { kind: 'crypto_price', cryptoId: 'ethereum' };
+    if (mentionsSol) return { kind: 'crypto_price', cryptoId: 'solana' };
+  }
+
+  // Short voice asks like "bitcoin", "btc keemat", "sona" → live quote (not RSS digests)
+  if (shortAsk && !newsy) {
+    if (mentionsBtc) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
+    if (mentionsEth) return { kind: 'crypto_price', cryptoId: 'ethereum' };
+    if (mentionsSol) return { kind: 'crypto_price', cryptoId: 'solana' };
+    if (mentionsGold) return { kind: 'gold_price' };
   }
 
   return { kind: 'news' };
@@ -1150,7 +1205,7 @@ export async function POST(request: Request) {
     });
   }
 
-  const rawQ = resolved.effectiveQ.trim();
+  const rawQ = normalizeVoiceQuery(resolved.effectiveQ.trim());
   if (rawQ.length < 2) {
     return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
   }
