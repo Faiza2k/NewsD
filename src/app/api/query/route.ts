@@ -8,7 +8,9 @@ import {
   englishSearchHints,
   isWeakGroundedAnswer,
   planNewsQuery,
+  resolveReplyLanguage,
   type GroundedSource,
+  type ReplyLanguage,
 } from '@/lib/query/grounded-answer';
 import {
   resolveEffectiveQuery,
@@ -33,6 +35,9 @@ type QueryRequest = {
   previousQ?: string;
   /** WhatsApp chat id for short session memory. */
   chatId?: string;
+  /** Whisper / client language hint (`ur`, `en`, …). */
+  lang?: string;
+  replyLang?: 'en' | 'ur';
 };
 
 type QueryResultItem = NewsItem & {
@@ -73,15 +78,26 @@ type CryptoQuote = {
   name: string;
   usd: number;
   change24h?: number;
+  usdPkrRate?: number;
+  pkrApprox?: number;
 };
 
-type PluginKind = 'greeting' | 'weather' | 'gold_price' | 'crypto_price' | 'news';
+type OilQuote = {
+  wtiUsd: number;
+  brentUsd?: number;
+  wtiChange24h?: number;
+  brentChange24h?: number;
+  usdPkrRate?: number;
+};
+
+type PluginKind = 'greeting' | 'weather' | 'gold_price' | 'crypto_price' | 'fuel_price' | 'news';
 
 type Plugin =
   | { kind: 'greeting' }
   | { kind: 'weather'; city: string; cityAsked: boolean }
   | { kind: 'gold_price' }
   | { kind: 'crypto_price'; cryptoId: string }
+  | { kind: 'fuel_price' }
   | { kind: 'news' };
 
 const STOP_WORDS = new Set([
@@ -291,8 +307,12 @@ function normalizeVoiceQuery(raw: string): string {
   q = q.replace(/\b(keemat|qimat|qiymat|kimat)\b/gi, 'price');
   q = q.replace(/\b(sona|sone|sonay)\b/gi, 'gold');
   q = q.replace(/\b(bit\s*coin|bitkon)\b/gi, 'bitcoin');
+  q = q.replace(/\bpatrol\b/gi, 'petrol');
+  q = q.replace(/\b(petrol|diesel|fuel)\s*(ki|ke|ka)?\s*(keemat|qimat|qiymat|kimat|price|rate)\b/gi, '$1 price');
+  q = q.replace(/پٹرول|پیٹرولیم/g, 'petrol');
+  q = q.replace(/ڈیزل/g, 'diesel');
 
-  // Nastaliq: bitcoin/سونا + قیمت
+  // Nastaliq: bitcoin/سونا/پیٹرول + قیمت
   if (/قیمت|ریٹ/.test(q)) {
     if (/بٹ\s*کوائن|بٹکوائن|بٹ\s*کون|bitcoin|btc/i.test(q) || /بی\s*ٹی\s*سی/.test(raw)) {
       q = `bitcoin price ${q}`;
@@ -300,6 +320,8 @@ function normalizeVoiceQuery(raw: string): string {
       q = `gold price ${q}`;
     } else if (/ایتھیریم|ethereum|eth/i.test(q)) {
       q = `ethereum price ${q}`;
+    } else if (/پیٹرول|پٹرول|ڈیزل|petrol|diesel|fuel/i.test(q)) {
+      q = `petrol price ${q}`;
     }
   }
 
@@ -342,22 +364,26 @@ function detectPlugin(q: string): Plugin {
   const mentionsEth = /\b(ethereum|eth)\b/.test(s) || /ایتھیریم/.test(q);
   const mentionsSol = /\b(solana|sol)\b/.test(s);
   const mentionsGold = /\b(gold|xau|bullion)\b/.test(s) || /سونا|گولڈ/.test(q);
+  const mentionsFuel =
+    /\b(petrol|diesel|gasoline|fuel|pump)\b/.test(s) || /پیٹرول|پٹرول|ڈیزل|ایندھن/.test(q);
   const shortAsk = tokenize(s).length <= 5;
   const newsy = /\b(news|headline|regulation|etf|hack|lawsuit|sue|ban|wars?|war)\b/.test(s);
 
   if (priceAsk) {
     if (mentionsGold) return { kind: 'gold_price' };
+    if (mentionsFuel && !newsy) return { kind: 'fuel_price' };
     if (mentionsBtc) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
     if (mentionsEth) return { kind: 'crypto_price', cryptoId: 'ethereum' };
     if (mentionsSol) return { kind: 'crypto_price', cryptoId: 'solana' };
   }
 
-  // Short voice asks like "bitcoin", "btc keemat", "sona" → live quote (not RSS digests)
+  // Short voice asks like "bitcoin", "btc keemat", "sona", "petrol price" → live quote
   if (shortAsk && !newsy) {
     if (mentionsBtc) return { kind: 'crypto_price', cryptoId: 'bitcoin' };
     if (mentionsEth) return { kind: 'crypto_price', cryptoId: 'ethereum' };
     if (mentionsSol) return { kind: 'crypto_price', cryptoId: 'solana' };
     if (mentionsGold) return { kind: 'gold_price' };
+    if (mentionsFuel) return { kind: 'fuel_price' };
   }
 
   return { kind: 'news' };
@@ -371,6 +397,7 @@ function displayTopic(q: string, plugin: Plugin): string {
       : 'Weather';
   }
   if (plugin.kind === 'gold_price') return 'Gold price';
+  if (plugin.kind === 'fuel_price') return 'Petrol / fuel price';
   if (plugin.kind === 'crypto_price') {
     const map: Record<string, string> = {
       bitcoin: 'Bitcoin price',
@@ -858,7 +885,7 @@ async function fetchGold(): Promise<GoldQuote | null> {
   }
 }
 
-async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
+async function fetchCrypto(id: string, withPkr = false): Promise<CryptoQuote | null> {
   try {
     const url =
       `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}` +
@@ -875,7 +902,7 @@ async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
       solana: { symbol: 'SOL', name: 'Solana' },
     };
     const meta = names[id] || { symbol: id.toUpperCase(), name: id };
-    return {
+    const quote: CryptoQuote = {
       id,
       symbol: meta.symbol,
       name: meta.name,
@@ -884,9 +911,83 @@ async function fetchCrypto(id: string): Promise<CryptoQuote | null> {
         ? Number(row.usd_24h_change)
         : undefined,
     };
+    if (withPkr) {
+      const usdPkr = await fetchUsdPkr();
+      if (usdPkr) {
+        quote.usdPkrRate = usdPkr;
+        quote.pkrApprox = Math.round(usd * usdPkr);
+      }
+    }
+    return quote;
   } catch {
     return null;
   }
+}
+
+async function fetchYahooOil(symbol: string): Promise<{
+  price: number;
+  change24h?: number;
+} | null> {
+  try {
+    const url =
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}` +
+      '?interval=1d&range=2d';
+    const res = await fetch(url, {
+      headers: { Accept: 'application/json', 'User-Agent': 'NewsDash/1.0' },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const meta = data?.chart?.result?.[0]?.meta;
+    const price = Number(meta?.regularMarketPrice);
+    if (!Number.isFinite(price) || price <= 0) return null;
+    const prev = Number(meta?.chartPreviousClose ?? meta?.previousClose);
+    const change24h =
+      Number.isFinite(prev) && prev > 0 ? ((price - prev) / prev) * 100 : undefined;
+    return { price, change24h };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchOil(): Promise<OilQuote | null> {
+  try {
+    const [wti, brent, usdPkr] = await Promise.all([
+      fetchYahooOil('CL=F'),
+      fetchYahooOil('BZ=F'),
+      fetchUsdPkr(),
+    ]);
+    if (!wti) return null;
+    const quote: OilQuote = {
+      wtiUsd: wti.price,
+      wtiChange24h: wti.change24h,
+      brentUsd: brent?.price,
+      brentChange24h: brent?.change24h,
+    };
+    if (usdPkr) quote.usdPkrRate = usdPkr;
+    return quote;
+  } catch {
+    return null;
+  }
+}
+
+function isFuelStory(item: Pick<NewsItem, 'title' | 'description'>): boolean {
+  const hay = `${item.title} ${item.description || ''}`.toLowerCase();
+  return /\b(oil|crude|brent|wti|petroleum|petrol|diesel|fuel|gasoline|opec|barrel|gas\s+price)\b/i.test(
+    hay,
+  );
+}
+
+function localizedTopicLabel(label: string, lang: ReplyLanguage): string {
+  if (lang !== 'ur') return label;
+  const map: Record<string, string> = {
+    'Gold price': 'سونے کی قیمت',
+    'Bitcoin price': 'بٹ کوائن کی قیمت',
+    'Ethereum price': 'ایتھیریم کی قیمت',
+    'Solana price': 'سولانا کی قیمت',
+    'Petrol / fuel price': 'پیٹرول / ایندھن کی قیمت',
+    'Crypto price': 'کرپٹو کی قیمت',
+  };
+  return map[label] || label;
 }
 
 const SHORT_LINK_TIMEOUT_MS = 2500;
@@ -1002,6 +1103,7 @@ async function buildNewsReply(
   poolSize: number,
   note?: string,
   closestCoverage?: boolean,
+  langOverride?: ReplyLanguage,
 ): Promise<{
   text: string;
   answer: string;
@@ -1009,8 +1111,10 @@ async function buildNewsReply(
   sourceButtons: SourceButton[];
   displayUrls: string[];
 }> {
-  const lang = detectQueryLanguage(question);
-  const parts = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`];
+  const lang = langOverride ?? detectQueryLanguage(question);
+  const topicHdr = localizedTopicLabel(topicLabel, lang);
+  const topicKey = lang === 'ur' ? '*موضوع:*' : '*Topic:*';
+  const parts = ['*NewsDash Analyst*', '', `${topicKey} ${topicHdr}`];
   if (note) parts.push(note);
   else if (closestCoverage && items.length) {
     parts.push(
@@ -1058,7 +1162,20 @@ async function buildNewsReply(
   return { text: parts.join('\n'), answer, sources, sourceButtons, displayUrls };
 }
 
-function buildGreeting(): string {
+function buildGreeting(lang: ReplyLanguage): string {
+  if (lang === 'ur') {
+    return [
+      '*NewsDash Analyst*',
+      '',
+      'انگریزی یا اردو میں (ٹیکسٹ یا آواز) سوال کریں۔ میں NewsDash کی تازہ خبریں تلاش کر کے مختصر جواب اور ذرائع کے لنک بھیجتا ہوں۔',
+      '',
+      'مثالیں:',
+      '• gold price now / سونے کی قیمت',
+      '• bitcoin price / بٹ کوائن',
+      '• weather in Karachi / کراچی کا موسم',
+      '• AI regulation / OpenAI / oil markets',
+    ].join('\n');
+  }
   return [
     '*NewsDash Analyst*',
     '',
@@ -1072,59 +1189,135 @@ function buildGreeting(): string {
   ].join('\n');
 }
 
-function buildWeatherReply(topicLabel: string, weather: WeatherPayload): string {
+function buildWeatherReply(topicLabel: string, weather: WeatherPayload, lang: ReplyLanguage): string {
+  const topicKey = lang === 'ur' ? '*موضوع:*' : '*Topic:*';
+  const topicHdr = localizedTopicLabel(topicLabel, lang);
   if (weather.error) {
-    return ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, weather.error].join('\n');
+    const err =
+      lang === 'ur'
+        ? 'موسم کی معلومات ابھی دستیاب نہیں۔'
+        : weather.error;
+    return ['*NewsDash Analyst*', '', `${topicKey} ${topicHdr}`, err].join('\n');
   }
+  const liveHdr = lang === 'ur' ? '*لائیو موسم*' : '*Live weather*';
+  const condLine =
+    lang === 'ur'
+      ? `*${weather.location}* — ${weather.condition || '-'}`
+      : `*${weather.location}* - ${weather.condition || '-'}`;
+  const statsLine =
+    lang === 'ur'
+      ? `${weather.temperature ?? '-'}°C (محسوس ${weather.feelsLike ?? '-'}°C) | نمی ${weather.humidity ?? '-'}% | ہوا ${weather.windKmh ?? '-'} کلومیٹر/گھنٹہ`
+      : `${weather.temperature ?? '-'} C (feels ${weather.feelsLike ?? '-'} C) | Humidity ${weather.humidity ?? '-'}% | Wind ${weather.windKmh ?? '-'} km/h`;
+  const intro =
+    lang === 'ur'
+      ? `${weather.location} کے لیے تازہ موسم۔`
+      : `Live conditions for ${weather.location}.`;
   return [
     '*NewsDash Analyst*',
     '',
-    `*Topic:* ${topicLabel}`,
-    `Live conditions for ${weather.location}.`,
+    `${topicKey} ${topicHdr}`,
+    intro,
     '',
-    '*Live weather*',
-    `*${weather.location}* - ${weather.condition || '-'}`,
-    `${weather.temperature ?? '-'} C (feels ${weather.feelsLike ?? '-'} C) | Humidity ${weather.humidity ?? '-'}% | Wind ${weather.windKmh ?? '-'} km/h`,
+    liveHdr,
+    condLine,
+    statsLine,
   ].join('\n');
 }
 
-function buildGoldReply(topicLabel: string, gold: GoldQuote): string {
+function buildGoldReply(topicLabel: string, gold: GoldQuote, lang: ReplyLanguage): string {
+  const topicKey = lang === 'ur' ? '*موضوع:*' : '*Topic:*';
+  const topicHdr = localizedTopicLabel(topicLabel, lang);
+  const liveHdr = lang === 'ur' ? '*لائیو سونے کی قیمت*' : '*Live gold price*';
   const lines = [
     '*NewsDash Analyst*',
     '',
-    `*Topic:* ${topicLabel}`,
-    'Live gold spot (international).',
+    `${topicKey} ${topicHdr}`,
+    lang === 'ur' ? 'بین الاقوامی سونے کی اسپاٹ قیمت۔' : 'Live gold spot (international).',
     '',
-    '*Live gold price*',
+    liveHdr,
     `*XAU/USD* - $${gold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} / oz`,
   ];
   if (gold.pkrPerTolaApprox && gold.usdPkrRate) {
     lines.push(
-      `*Approx PKR/tola* - Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} (converted @ ${gold.usdPkrRate.toFixed(2)} PKR/USD)`,
-      '_Converted estimate - local jewellery rates may differ._',
+      lang === 'ur'
+        ? `*تخمینہ PKR/تولہ* — Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} (@ ${gold.usdPkrRate.toFixed(2)} PKR/USD)`
+        : `*Approx PKR/tola* - Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} (converted @ ${gold.usdPkrRate.toFixed(2)} PKR/USD)`,
+      lang === 'ur'
+        ? '_تخمینہ — مقامی زیورات کی قیمتیں مختلف ہو سکتی ہیں۔_'
+        : '_Converted estimate - local jewellery rates may differ._',
     );
   }
-  lines.push('_Updated just now_');
+  lines.push(lang === 'ur' ? '_ابھی اپ ڈیٹ_' : '_Updated just now_');
   return lines.join('\n');
 }
 
-function buildCryptoReply(topicLabel: string, quote: CryptoQuote): string {
+function buildCryptoReply(topicLabel: string, quote: CryptoQuote, lang: ReplyLanguage): string {
+  const topicKey = lang === 'ur' ? '*موضوع:*' : '*Topic:*';
+  const topicHdr = localizedTopicLabel(topicLabel, lang);
   const ch =
     quote.change24h == null
       ? ''
       : ` | 24h ${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}%`;
-  return [
+  const liveHdr =
+    lang === 'ur'
+      ? `*لائیو ${localizedTopicLabel(topicLabel, 'ur')}*`
+      : `*Live ${quote.name} price*`;
+  const lines = [
     '*NewsDash Analyst*',
     '',
-    `*Topic:* ${topicLabel}`,
-    `Live ${quote.name} price.`,
+    `${topicKey} ${topicHdr}`,
+    lang === 'ur' ? `لائیو ${quote.name} قیمت۔` : `Live ${quote.name} price.`,
     '',
-    `*Live ${quote.name} price*`,
+    liveHdr,
     `*${quote.symbol}/USD* - $${quote.usd.toLocaleString('en-US', {
       maximumFractionDigits: quote.usd >= 100 ? 2 : 4,
     })}${ch}`,
-    '_Updated just now_',
-  ].join('\n');
+  ];
+  if (quote.pkrApprox && quote.usdPkrRate) {
+    lines.push(
+      lang === 'ur'
+        ? `*تخمینہ PKR* — Rs ${quote.pkrApprox.toLocaleString('en-PK')} (@ ${quote.usdPkrRate.toFixed(2)} PKR/USD)`
+        : `*Approx PKR* - Rs ${quote.pkrApprox.toLocaleString('en-PK')} (@ ${quote.usdPkrRate.toFixed(2)} PKR/USD)`,
+    );
+  }
+  lines.push(lang === 'ur' ? '_ابھی اپ ڈیٹ_' : '_Updated just now_');
+  return lines.join('\n');
+}
+
+function buildFuelReply(topicLabel: string, oil: OilQuote, lang: ReplyLanguage): string {
+  const topicKey = lang === 'ur' ? '*موضوع:*' : '*Topic:*';
+  const topicHdr = localizedTopicLabel(topicLabel, lang);
+  const fmtCh = (n?: number) =>
+    n == null ? '' : ` | 24h ${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+  const liveHdr = lang === 'ur' ? '*لائیو کرڈ آئل (بین الاقوامی)*' : '*Live crude oil (international)*';
+  const lines = [
+    '*NewsDash Analyst*',
+    '',
+    `${topicKey} ${topicHdr}`,
+    '',
+    liveHdr,
+    `*WTI* - $${oil.wtiUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel${fmtCh(oil.wtiChange24h)}`,
+  ];
+  if (oil.brentUsd) {
+    lines.push(
+      `*Brent* - $${oil.brentUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel${fmtCh(oil.brentChange24h)}`,
+    );
+  }
+  if (oil.usdPkrRate) {
+    const wtiPkr = Math.round(oil.wtiUsd * oil.usdPkrRate);
+    lines.push(
+      lang === 'ur'
+        ? `*WTI تخمینہ PKR* — Rs ${wtiPkr.toLocaleString('en-PK')} فی بیرل (@ ${oil.usdPkrRate.toFixed(2)} PKR/USD)`
+        : `*WTI approx PKR* - Rs ${wtiPkr.toLocaleString('en-PK')} / barrel (@ ${oil.usdPkrRate.toFixed(2)} PKR/USD)`,
+    );
+  }
+  lines.push(
+    lang === 'ur'
+      ? '_نوٹ: پاکستان کے پمپ ریٹ OGRA سے الگ ہوتے ہیں؛ یہ بین الاقوامی تیل کی قیمت ہے۔_'
+      : '_Note: Pakistan pump rates are set by OGRA and differ from international crude._',
+    lang === 'ur' ? '_ابھی اپ ڈیٹ_' : '_Updated just now_',
+  );
+  return lines.join('\n');
 }
 
 function assertQuality(args: {
@@ -1134,12 +1327,13 @@ function assertQuality(args: {
   weather?: WeatherPayload | null;
   gold?: GoldQuote | null;
   crypto?: CryptoQuote | null;
+  oil?: OilQuote | null;
   requestedCity?: string;
   answer?: string;
   sourceButtons?: SourceButton[];
   displayUrls?: string[];
 }): { ok: true } | { ok: false; reason: string } {
-  const { kind, text, items, weather, gold, crypto, requestedCity, answer, displayUrls } = args;
+  const { kind, text, items, weather, gold, crypto, oil, requestedCity, answer, displayUrls } = args;
   if (!text || text.length < 16) return { ok: false, reason: 'Empty reply. Please ask again.' };
 
   if (kind === 'weather' && !weather?.error) {
@@ -1159,6 +1353,9 @@ function assertQuality(args: {
   }
   if (kind === 'crypto_price' && !(crypto && crypto.usd > 0)) {
     return { ok: false, reason: 'Live crypto price unavailable. Please try again.' };
+  }
+  if (kind === 'fuel_price' && !(oil && oil.wtiUsd > 0)) {
+    return { ok: false, reason: 'Live oil price unavailable. Please try again.' };
   }
 
   if (kind === 'news' && items?.length) {
@@ -1231,6 +1428,11 @@ export async function POST(request: Request) {
   if (rawQ.length < 2) {
     return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
   }
+  const replyLang = resolveReplyLanguage(
+    incomingQ,
+    rawQ,
+    body.replyLang || body.lang,
+  );
   const q = extractTopicQuery(rawQ);
   const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT_MAX);
   const plugin = detectPlugin(q);
@@ -1251,7 +1453,7 @@ export async function POST(request: Request) {
       brief: 'Greeting',
       items: [],
       total: 0,
-      whatsappText: buildGreeting(),
+      whatsappText: buildGreeting(replyLang),
       usedMemory: resolved.usedMemory,
       lastUpdated: now,
     });
@@ -1262,6 +1464,7 @@ export async function POST(request: Request) {
     let whatsappText = buildWeatherReply(
       topicLabel,
       weather || { error: 'Could not fetch live weather.' },
+      replyLang,
     );
     const gate = assertQuality({
       kind: 'weather',
@@ -1270,17 +1473,29 @@ export async function POST(request: Request) {
       requestedCity: plugin.cityAsked ? plugin.city : undefined,
     });
     if (!gate.ok) {
-      // Weather API failed — give a clean, professional message
-      whatsappText = [
-        '*NewsDash Analyst*',
-        '',
-        `*Topic:* ${topicLabel}`,
-        `Live weather for *${plugin.city}* is not available right now.`,
-        '',
-        'Please try:',
-        '• A more specific city name (e.g. "Karachi weather", "Lahore weather")',
-        '• Checking again in a few minutes',
-      ].join('\n');
+      const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+      whatsappText =
+        replyLang === 'ur'
+          ? [
+              '*NewsDash Analyst*',
+              '',
+              `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`,
+              `*${plugin.city}* کے لیے موسم ابھی دستیاب نہیں۔`,
+              '',
+              'براہِ کرم:',
+              '• واضح شہر لکھیں (مثلاً "Karachi weather")',
+              '• چند منٹ بعد دوبارہ کوشش کریں',
+            ].join('\n')
+          : [
+              '*NewsDash Analyst*',
+              '',
+              `${topicKey} ${topicLabel}`,
+              `Live weather for *${plugin.city}* is not available right now.`,
+              '',
+              'Please try:',
+              '• A more specific city name (e.g. "Karachi weather", "Lahore weather")',
+              '• Checking again in a few minutes',
+            ].join('\n');
     }
     remember(topicLabel);
     return Response.json({
@@ -1301,10 +1516,11 @@ export async function POST(request: Request) {
   if (plugin.kind === 'gold_price') {
     const gold = await fetchGold();
     if (gold) {
-      let whatsappText = buildGoldReply(topicLabel, gold);
+      let whatsappText = buildGoldReply(topicLabel, gold, replyLang);
       const gate = assertQuality({ kind: 'gold_price', text: whatsappText, gold });
       if (!gate.ok) {
-        whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
+        const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+        whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
       remember(topicLabel);
       return Response.json({
@@ -1325,12 +1541,13 @@ export async function POST(request: Request) {
   }
 
   if (plugin.kind === 'crypto_price') {
-    const quote = await fetchCrypto(plugin.cryptoId);
+    const quote = await fetchCrypto(plugin.cryptoId, replyLang === 'ur');
     if (quote) {
-      let whatsappText = buildCryptoReply(topicLabel, quote);
+      let whatsappText = buildCryptoReply(topicLabel, quote, replyLang);
       const gate = assertQuality({ kind: 'crypto_price', text: whatsappText, crypto: quote });
       if (!gate.ok) {
-        whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
+        const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+        whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
       remember(topicLabel);
       return Response.json({
@@ -1349,14 +1566,42 @@ export async function POST(request: Request) {
     }
   }
 
+  if (plugin.kind === 'fuel_price') {
+    const oil = await fetchOil();
+    if (oil) {
+      let whatsappText = buildFuelReply(topicLabel, oil, replyLang);
+      const gate = assertQuality({ kind: 'fuel_price', text: whatsappText, oil });
+      if (!gate.ok) {
+        const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+        whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
+      }
+      remember(topicLabel);
+      return Response.json({
+        query: q,
+        rawQuery: incomingQ,
+        displayTopic: topicLabel,
+        intent: 'fuel_price',
+        brief: 'Live crude oil (WTI/Brent).',
+        items: [],
+        total: 1,
+        oilPrice: oil,
+        whatsappText,
+        usedMemory: resolved.usedMemory,
+        lastUpdated: now,
+      });
+    }
+    // Fall through to oil-news path if live quote fails.
+  }
+
   // ── Universal NewsDash path (default for any question) ──
-  const replyLang = detectQueryLanguage(rawQ);
   const newsQ =
     plugin.kind === 'gold_price'
       ? 'gold'
       : plugin.kind === 'crypto_price'
         ? plugin.cryptoId
-        : q;
+        : plugin.kind === 'fuel_price'
+          ? 'oil crude petroleum fuel opec'
+          : q;
 
   // Fuel/pump asks: never invent a pump number; answer with oil/fuel market evidence.
   const fuelAsk =
@@ -1389,14 +1634,26 @@ export async function POST(request: Request) {
   );
 
   let items = ranked.items;
-  if (fuelAsk) {
-    const fuelish = items.filter((i) =>
-      /\b(oil|crude|brent|wti|petroleum|petrol|diesel|fuel|gasoline|opec)\b/i.test(
-        `${i.title} ${i.description || ''}`,
-      ),
-    );
-    // Never wipe results — if filter is empty, keep ranked oil-expanded search hits.
-    if (fuelish.length) items = fuelish;
+  if (fuelAsk || plugin.kind === 'fuel_price') {
+    let fuelish = items.filter(isFuelStory);
+    if (!fuelish.length) {
+      const retry = await retrieveAndRank(
+        'crude oil brent wti opec petroleum fuel diesel gasoline prices',
+        limit,
+        body.categories && body.categories.length ? body.categories : undefined,
+        preferFresh,
+      );
+      fuelish = retry.items.filter(isFuelStory);
+      if (fuelish.length) {
+        items = fuelish;
+        ranked.total = retry.total;
+        ranked.poolSize = retry.poolSize;
+      } else if (retry.items.length) {
+        items = retry.items.filter(isFuelStory);
+      }
+    } else {
+      items = fuelish;
+    }
   }
 
   const note = fuelAsk
@@ -1412,6 +1669,7 @@ export async function POST(request: Request) {
     ranked.poolSize,
     note,
     Boolean(ranked.usedLatestFallback),
+    replyLang,
   );
   let whatsappText = built.text;
   let sourceButtons = built.sourceButtons;
@@ -1427,7 +1685,6 @@ export async function POST(request: Request) {
   if (!gate.ok && items.length) {
     displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
     sourceButtons = buildSourceButtons(items, displayUrls);
-    const fallbackLang = detectQueryLanguage(rawQ);
     const fallbackAnswer = buildExtractiveAnswer(
       rawQ,
       items.map((i) => ({
@@ -1437,14 +1694,15 @@ export async function POST(request: Request) {
         publishedAt: i.publishedAt,
         body: i.description || i.title,
       })),
-      fallbackLang,
+      replyLang,
     );
-    const aLabel = fallbackLang === 'ur' ? '*جواب:*' : '*Answer:*';
-    const sLabel = fallbackLang === 'ur' ? '*ذرائع:*' : '*Sources*';
+    const aLabel = replyLang === 'ur' ? '*جواب:*' : '*Answer:*';
+    const sLabel = replyLang === 'ur' ? '*ذرائع:*' : '*Sources*';
+    const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
     whatsappText = [
       '*NewsDash Analyst*',
       '',
-      `*Topic:* ${newsTopicLabel}`,
+      `${topicKey} ${localizedTopicLabel(newsTopicLabel, replyLang)}`,
       '',
       aLabel,
       fallbackAnswer,

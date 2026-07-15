@@ -10,7 +10,7 @@ export type GroundedSource = {
 
 export type ReplyLanguage = 'en' | 'ur';
 
-const ROMAN_URDU = new Set([
+const ROMAN_URDU_STRONG = new Set([
   'kya',
   'kyun',
   'kyunke',
@@ -18,7 +18,6 @@ const ROMAN_URDU = new Set([
   'hain',
   'tha',
   'thi',
-  'the',
   'ho',
   'hun',
   'main',
@@ -52,6 +51,13 @@ const ROMAN_URDU = new Set([
   'khabren',
   'khabarain',
   'halaat',
+  'bata',
+  'btana',
+  'bataona',
+]);
+
+/** Short particles — only count with other Urdu signals (avoid "US", "the", etc.). */
+const ROMAN_URDU_WEAK = new Set([
   'ke',
   'ki',
   'ka',
@@ -65,10 +71,6 @@ const ROMAN_URDU = new Set([
   'ye',
   'yeh',
   'iss',
-  'us',
-  'bata',
-  'btana',
-  'bataona',
 ]);
 
 /** Detect reply language from the user question (Urdu script, Roman Urdu, or English). */
@@ -80,9 +82,29 @@ export function detectQueryLanguage(text: string): ReplyLanguage {
 
   const tokens = t.toLowerCase().match(/[a-z']+/g) || [];
   if (!tokens.length) return 'en';
-  const hits = tokens.filter((w) => ROMAN_URDU.has(w)).length;
-  if (hits >= 2) return 'ur';
-  if (hits >= 1 && tokens.length <= 8) return 'ur';
+  const strong = tokens.filter((w) => ROMAN_URDU_STRONG.has(w)).length;
+  const weak = tokens.filter((w) => ROMAN_URDU_WEAK.has(w)).length;
+  if (strong >= 1) return 'ur';
+  if (strong + weak >= 2 && tokens.length <= 10) return 'ur';
+  return 'en';
+}
+
+/** Pick reply language — prefer Urdu script, Roman Urdu, or Whisper `ur` hint for voice asks. */
+export function resolveReplyLanguage(
+  incomingQ: string,
+  effectiveQ?: string,
+  langHint?: string | null,
+): ReplyLanguage {
+  const inc = String(incomingQ || '').trim();
+  const eff = String(effectiveQ || '').trim();
+  if (/[\u0600-\u06FF]/.test(inc) || /[\u0600-\u06FF]/.test(eff)) return 'ur';
+
+  const hint = String(langHint || '')
+    .toLowerCase()
+    .trim();
+  if (hint === 'ur' || hint === 'urdu' || hint.startsWith('ur-')) return 'ur';
+
+  if (detectQueryLanguage(inc) === 'ur' || detectQueryLanguage(eff) === 'ur') return 'ur';
   return 'en';
 }
 
