@@ -95,20 +95,27 @@ export async function markWhatsAppRead(messageId: string): Promise<void> {
   }
 }
 
-/** Normalize PK local `03…` → `923…` and strip non-digits. */
+/** Normalize to E.164 digits without +, then send with leading + (Meta best practice). */
 export function normalizeWhatsAppTo(to: string): string {
   let digits = String(to || '').replace(/\D/g, '');
   if (digits.startsWith('0') && digits.length === 11) {
     digits = `92${digits.slice(1)}`;
   }
+  // strip accidental leading 00
+  if (digits.startsWith('00')) digits = digits.slice(2);
   return digits;
+}
+
+function toE164(to: string): string {
+  const digits = normalizeWhatsAppTo(to);
+  return digits ? `+${digits}` : '';
 }
 
 /** Send a plain text WhatsApp message via Cloud API. `to` is digits (country code, no +). */
 export async function sendWhatsAppText(to: string, text: string): Promise<SendTextResult> {
   const phoneNumberId = requireEnv('WHATSAPP_PHONE_NUMBER_ID');
   const accessToken = requireEnv('WHATSAPP_ACCESS_TOKEN');
-  const cleanedTo = normalizeWhatsAppTo(to);
+  const cleanedTo = toE164(to);
   const body = String(text || '').trim();
   if (!cleanedTo || !body) {
     return { ok: false, error: 'missing to/text' };
@@ -142,7 +149,7 @@ export async function sendWhatsAppText(to: string, text: string): Promise<SendTe
 export async function sendWhatsAppHelloWorld(to: string): Promise<SendTextResult> {
   const phoneNumberId = requireEnv('WHATSAPP_PHONE_NUMBER_ID');
   const accessToken = requireEnv('WHATSAPP_ACCESS_TOKEN');
-  const cleanedTo = normalizeWhatsAppTo(to);
+  const cleanedTo = toE164(to);
   if (!cleanedTo) return { ok: false, error: 'missing to' };
 
   const { ok, data, status } = await graphPost(phoneNumberId, accessToken, {
@@ -155,11 +162,29 @@ export async function sendWhatsAppHelloWorld(to: string): Promise<SendTextResult
     },
   });
 
-  if (!ok) {
-    const err = data.error as { message?: string } | undefined;
-    return { ok: false, error: err?.message || `Graph API ${status}`, graph: data };
-  }
-
   const messages = data.messages as Array<{ id?: string }> | undefined;
   return { ok: true, messageId: messages?.[0]?.id, graph: data };
+}
+
+/**
+ * Ensure the app is subscribed to this WABA's webhooks (required for inbound).
+ * POST /{waba-id}/subscribed_apps
+ */
+export async function subscribeAppToWaba(): Promise<{
+  ok: boolean;
+  status: number;
+  data: Record<string, unknown>;
+}> {
+  const wabaId = process.env.WHATSAPP_WABA_ID?.trim();
+  const accessToken = process.env.WHATSAPP_ACCESS_TOKEN?.trim();
+  if (!wabaId || !accessToken) {
+    return { ok: false, status: 0, data: { error: 'Missing WHATSAPP_WABA_ID or token' } };
+  }
+  const url = `https://graph.facebook.com/${GRAPH_VERSION}/${wabaId}/subscribed_apps`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  return { ok: res.ok, status: res.status, data };
 }

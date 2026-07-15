@@ -74,6 +74,7 @@ export async function POST(request: Request) {
   const signature = request.headers.get('x-hub-signature-256');
 
   if (!verifyWhatsAppSignature(rawBody, signature)) {
+    console.error('[whatsapp webhook] invalid signature');
     return new Response('Invalid signature', { status: 401 });
   }
 
@@ -84,7 +85,33 @@ export async function POST(request: Request) {
     return new Response('Bad JSON', { status: 400 });
   }
 
+  console.log(
+    '[whatsapp webhook] hit',
+    JSON.stringify({
+      hasMessages: /"messages"\s*:/.test(rawBody),
+      hasStatuses: /"statuses"\s*:/.test(rawBody),
+      bytes: rawBody.length,
+    }),
+  );
+
+  // Log delivery failures (accepted ≠ delivered)
+  try {
+    const root = payload as {
+      entry?: Array<{ changes?: Array<{ value?: { statuses?: Array<Record<string, unknown>> } }> }>;
+    };
+    for (const entry of root.entry || []) {
+      for (const change of entry.changes || []) {
+        for (const st of change.value?.statuses || []) {
+          console.log('[whatsapp status]', JSON.stringify(st));
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   const messages = extractInboundTexts(payload);
+  console.log('[whatsapp webhook] inbound texts', messages.length, messages.map((m) => m.from));
   if (messages.length) {
     // Await replies here — Vercel often kills `after()` before Graph API send finishes.
     for (const msg of messages) {

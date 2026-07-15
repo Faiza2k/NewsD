@@ -5,6 +5,7 @@ import {
   normalizeWhatsAppTo,
   sendWhatsAppHelloWorld,
   sendWhatsAppText,
+  subscribeAppToWaba,
 } from '@/lib/whatsapp/cloud';
 
 export const dynamic = 'force-dynamic';
@@ -25,7 +26,6 @@ function authorize(request: Request, bodySecret?: string): boolean {
 /**
  * POST /api/whatsapp/diagnose
  * Body: { secret, to?: "0313..." }
- * Checks token + phone number ID, then sends hello_world + a short text.
  */
 export async function POST(request: Request) {
   if (!isWhatsAppCloudConfigured()) {
@@ -44,6 +44,8 @@ export async function POST(request: Request) {
   const cfg = getWhatsAppConfig();
   const to = normalizeWhatsAppTo(body?.to || '923138308265');
 
+  const subscribed = await subscribeAppToWaba();
+
   const phoneMeta = await graphGet(
     `${cfg.phoneNumberId}?fields=display_phone_number,verified_name,quality_rating,id`,
   ).catch((e) => ({
@@ -52,16 +54,28 @@ export async function POST(request: Request) {
     data: { error: { message: e instanceof Error ? e.message : 'phone lookup failed' } },
   }));
 
+  let subscribedApps: { ok: boolean; status: number; data: Record<string, unknown> } = {
+    ok: false,
+    status: 0,
+    data: {},
+  };
+  if (cfg.wabaId) {
+    subscribedApps = await graphGet(`${cfg.wabaId}/subscribed_apps`);
+  }
+
   const hello = await sendWhatsAppHelloWorld(to);
   const text = await sendWhatsAppText(
     to,
-    '*NewsDash Analyst*\n\nDiagnose OK. If you see this, Cloud API delivery works.\n\nNext: message *+1 (555) 058-2326* with: bitcoin price',
+    '*NewsDash Analyst*\n\nDiagnose OK (E.164). If you see this, delivery works.\n\nMessage +1 (555) 058-2326 with: bitcoin price',
   );
 
   return Response.json({
     ok: hello.ok || text.ok,
-    to,
+    to: `+${to}`,
     phoneNumberId: cfg.phoneNumberId,
+    wabaId: cfg.wabaId || null,
+    subscribeAppToWaba: subscribed,
+    subscribedAppsList: subscribedApps,
     phoneMeta: {
       http: phoneMeta.status,
       ok: phoneMeta.ok,
@@ -79,8 +93,7 @@ export async function POST(request: Request) {
       error: text.error,
       graph: text.graph,
     },
-    hint: !hello.ok && !text.ok
-      ? 'Graph rejected send. Re-add your personal number under Step 1 Recipient and confirm OTP. Generate a fresh access token if expired.'
-      : 'API accepted. If phone still empty: search WhatsApp for "555" / unknown chat, confirm you are allowlisted, and Message the test number first.',
+    critical:
+      'If Vercel has no POST /api/whatsapp/webhook from Meta, inbound is not wired. Fix messages subscription + WABA subscribed_apps on the TEST account.',
   });
 }
