@@ -1032,9 +1032,17 @@ async function buildNewsReply(
 
   const sources = await enrichGroundedSources(items);
   let answer = await buildGroundedAnswer(question, sources, lang);
-  const weak = Boolean(answer && isWeakGroundedAnswer(answer));
+  // Strip leading refusal sentences the model sometimes still emits
+  if (answer) {
+    answer = answer
+      .replace(
+        /^(there is no[^.]*\.\s*|no news on[^.]*\.\s*|ن.*معلومات[^.]*[.۔]\s*)/i,
+        '',
+      )
+      .trim();
+  }
+  const weak = Boolean(!answer || isWeakGroundedAnswer(answer));
   if (!answer || answer.length < WA_ANSWER_MIN || weak) {
-    // Prefer concrete extractive facts — never a "not provided" hedge.
     answer = buildExtractiveAnswer(question, sources, lang);
   }
 

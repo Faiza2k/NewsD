@@ -254,7 +254,7 @@ export function isWeakGroundedAnswer(answer: string): boolean {
   if (t.length < 40) return true;
   const lower = t.toLowerCase();
   const hedge =
-    /not available in the provided source|there is no information|no information available|does not (mention|provide|contain)|more information is needed|cannot (determine|answer|find)|insufficient (information|detail|data)|i (do not|don't) have (enough|sufficient)|could not find|اس سوال کا جواب (نہیں|نہيں)|کافی معلومات نہیں|کوئی معلومات نہیں/.test(
+    /not available in the provided source|in the provided sources|there is no (information|news|data|coverage|mention)|no (information|news|coverage) (available|on|about)|does not (mention|provide|contain)|more information is needed|cannot (determine|answer|find)|insufficient (information|detail|data)|i (do not|don't) have (enough|sufficient)|could not find|no matching|اس سوال کا جواب (نہیں|نہيں)|کافی معلومات نہیں|کوئی معلومات نہیں|خبر نہیں ملی/.test(
       lower,
     );
   if (!hedge) return false;
