@@ -45,6 +45,8 @@ export type SendTextResult = {
   ok: boolean;
   messageId?: string;
   error?: string;
+  /** Full Graph error / response for diagnostics (no secrets). */
+  graph?: Record<string, unknown>;
 };
 
 async function graphPost(
@@ -60,6 +62,18 @@ async function graphPost(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(payload),
+  });
+  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  return { ok: res.ok, data, status: res.status };
+}
+
+export async function graphGet(
+  path: string,
+): Promise<{ ok: boolean; data: Record<string, unknown>; status: number }> {
+  const accessToken = requireEnv('WHATSAPP_ACCESS_TOKEN');
+  const url = `https://graph.facebook.com/${GRAPH_VERSION}/${path.replace(/^\//, '')}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
   });
   const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   return { ok: res.ok, data, status: res.status };
@@ -81,11 +95,20 @@ export async function markWhatsAppRead(messageId: string): Promise<void> {
   }
 }
 
+/** Normalize PK local `03…` → `923…` and strip non-digits. */
+export function normalizeWhatsAppTo(to: string): string {
+  let digits = String(to || '').replace(/\D/g, '');
+  if (digits.startsWith('0') && digits.length === 11) {
+    digits = `92${digits.slice(1)}`;
+  }
+  return digits;
+}
+
 /** Send a plain text WhatsApp message via Cloud API. `to` is digits (country code, no +). */
 export async function sendWhatsAppText(to: string, text: string): Promise<SendTextResult> {
   const phoneNumberId = requireEnv('WHATSAPP_PHONE_NUMBER_ID');
   const accessToken = requireEnv('WHATSAPP_ACCESS_TOKEN');
-  const cleanedTo = String(to || '').replace(/\D/g, '');
+  const cleanedTo = normalizeWhatsAppTo(to);
   const body = String(text || '').trim();
   if (!cleanedTo || !body) {
     return { ok: false, error: 'missing to/text' };
@@ -100,13 +123,43 @@ export async function sendWhatsAppText(to: string, text: string): Promise<SendTe
   });
 
   if (!ok) {
-    const err = data.error as { message?: string } | undefined;
+    const err = data.error as { message?: string; code?: number; error_data?: unknown } | undefined;
     return {
       ok: false,
       error: err?.message || `Graph API ${status}`,
+      graph: data,
     };
   }
 
   const messages = data.messages as Array<{ id?: string }> | undefined;
-  return { ok: true, messageId: messages?.[0]?.id };
+  return { ok: true, messageId: messages?.[0]?.id, graph: data };
+}
+
+/**
+ * Meta's default sandbox template — often delivers when free-form text does not
+ * (first contact / outside the customer-care window).
+ */
+export async function sendWhatsAppHelloWorld(to: string): Promise<SendTextResult> {
+  const phoneNumberId = requireEnv('WHATSAPP_PHONE_NUMBER_ID');
+  const accessToken = requireEnv('WHATSAPP_ACCESS_TOKEN');
+  const cleanedTo = normalizeWhatsAppTo(to);
+  if (!cleanedTo) return { ok: false, error: 'missing to' };
+
+  const { ok, data, status } = await graphPost(phoneNumberId, accessToken, {
+    messaging_product: 'whatsapp',
+    to: cleanedTo,
+    type: 'template',
+    template: {
+      name: 'hello_world',
+      language: { code: 'en_US' },
+    },
+  });
+
+  if (!ok) {
+    const err = data.error as { message?: string } | undefined;
+    return { ok: false, error: err?.message || `Graph API ${status}`, graph: data };
+  }
+
+  const messages = data.messages as Array<{ id?: string }> | undefined;
+  return { ok: true, messageId: messages?.[0]?.id, graph: data };
 }
