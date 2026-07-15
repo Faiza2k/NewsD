@@ -2,6 +2,8 @@ import { after } from 'next/server';
 import { POST as queryPost } from '@/app/api/query/route';
 import {
   getWhatsAppConfig,
+  isWhatsAppCloudConfigured,
+  markWhatsAppRead,
   sendWhatsAppText,
   verifyWhatsAppSignature,
 } from '@/lib/whatsapp/cloud';
@@ -25,9 +27,14 @@ type WaMessage = {
 type WaValue = {
   messages?: WaMessage[];
   statuses?: unknown[];
+  metadata?: { phone_number_id?: string; display_phone_number?: string };
 };
 
-/** Meta webhook verification (subscribe challenge). */
+/**
+ * GET — Meta webhook verification (subscribe challenge).
+ * Also returns a tiny JSON status when opened in a browser without hub.* params
+ * so we can confirm the route is deployed.
+ */
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const mode = url.searchParams.get('hub.mode');
@@ -35,17 +42,32 @@ export async function GET(request: Request) {
   const challenge = url.searchParams.get('hub.challenge');
   const { verifyToken } = getWhatsAppConfig();
 
-  if (mode === 'subscribe' && challenge && verifyToken && token === verifyToken) {
-    return new Response(challenge, {
-      status: 200,
-      headers: { 'Content-Type': 'text/plain' },
-    });
+  if (mode === 'subscribe' && challenge) {
+    if (verifyToken && token === verifyToken) {
+      return new Response(challenge, {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain' },
+      });
+    }
+    return new Response('Forbidden', { status: 403 });
   }
 
-  return new Response('Forbidden', { status: 403 });
+  // Browser / health check (does not leak secrets)
+  return Response.json({
+    ok: true,
+    service: 'NewsDash WhatsApp Cloud API webhook',
+    configured: isWhatsAppCloudConfigured(),
+    hasVerifyToken: Boolean(verifyToken),
+    hasAccessToken: Boolean(process.env.WHATSAPP_ACCESS_TOKEN?.trim()),
+    hasPhoneNumberId: Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID?.trim()),
+    hasAppSecret: Boolean(process.env.WHATSAPP_APP_SECRET?.trim()),
+    hint: isWhatsAppCloudConfigured()
+      ? 'Ready. Configure Meta webhook to this URL and message the test number.'
+      : 'Add WHATSAPP_VERIFY_TOKEN, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID on Vercel.',
+  });
 }
 
-/** Inbound WhatsApp Cloud API events. ACK fast; answer in after(). */
+/** POST — inbound WhatsApp Cloud API events. ACK fast; answer in after(). */
 export async function POST(request: Request) {
   const rawBody = await request.text();
   const signature = request.headers.get('x-hub-signature-256');
@@ -69,6 +91,14 @@ export async function POST(request: Request) {
           await replyToUser(msg);
         } catch (err) {
           console.error('[whatsapp webhook] reply failed', msg.messageId, err);
+          try {
+            await sendWhatsAppText(
+              msg.from,
+              '*NewsDash Analyst*\n\nSomething went wrong answering that. Please try again in a moment.',
+            );
+          } catch {
+            // ignore
+          }
         }
       }
     });
@@ -96,10 +126,19 @@ function extractInboundTexts(payload: unknown): InboundText[] {
 
       for (const m of value.messages) {
         if (!m?.from || !m.id) continue;
-        if (m.type !== 'text') continue; // phase 1: text only
+        if (m.type !== 'text') {
+          // Phase 1: text only — soft nudge for voice/media
+          if (m.type === 'audio' || m.type === 'image' || m.type === 'video' || m.type === 'document') {
+            out.push({
+              from: m.from,
+              messageId: m.id,
+              text: '__UNSUPPORTED_MEDIA__',
+            });
+          }
+          continue;
+        }
         const text = String(m.text?.body || '').trim();
         if (text.length < 2) continue;
-        // Ignore echo of our own analyst branding loops
         if (text.startsWith('*NewsDash Analyst*') || text.startsWith('NewsDash Analyst')) {
           continue;
         }
@@ -111,17 +150,31 @@ function extractInboundTexts(payload: unknown): InboundText[] {
 }
 
 async function replyToUser(msg: InboundText) {
-  const { accessToken, phoneNumberId } = getWhatsAppConfig();
-  if (!accessToken || !phoneNumberId) {
-    console.error('[whatsapp webhook] missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID');
+  if (!isWhatsAppCloudConfigured()) {
+    console.error('[whatsapp webhook] Cloud API env vars missing');
     return;
   }
 
+  await markWhatsAppRead(msg.messageId);
+
+  if (msg.text === '__UNSUPPORTED_MEDIA__') {
+    await sendWhatsAppText(
+      msg.from,
+      '*NewsDash Analyst*\n\nPlease send a *text* question for now (voice coming soon).\n\nTry: bitcoin price · gold price · diesel price · US iran war',
+    );
+    return;
+  }
+
+  // chatId = WhatsApp user phone (digits) — powers expert session memory on Vercel
   const queryRes = await queryPost(
     new Request('http://localhost/api/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: msg.text, limit: 3, chatId: msg.from }),
+      body: JSON.stringify({
+        q: msg.text,
+        limit: 3,
+        chatId: msg.from,
+      }),
     }),
   );
 
