@@ -121,7 +121,7 @@ async function replyToUser(msg: InboundText) {
     new Request('http://localhost/api/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: msg.text, limit: 2 }),
+      body: JSON.stringify({ q: msg.text, limit: 3, chatId: msg.from }),
     }),
   );
 

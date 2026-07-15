@@ -10,6 +10,10 @@ import {
   planNewsQuery,
   type GroundedSource,
 } from '@/lib/query/grounded-answer';
+import {
+  resolveEffectiveQuery,
+  setChatMemory,
+} from '@/lib/query/memory';
 import type { Category, NewsItem } from '@/types';
 
 
@@ -25,6 +29,10 @@ type QueryRequest = {
   q: string;
   limit?: number;
   categories?: Category[];
+  /** Previous user question in this WhatsApp chat (follow-ups). */
+  previousQ?: string;
+  /** WhatsApp chat id for short session memory. */
+  chatId?: string;
 };
 
 type QueryResultItem = NewsItem & {
@@ -1113,27 +1121,61 @@ function linkPreview(items: QueryResultItem[]): LinkPreview | undefined {
 
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => null)) as QueryRequest | null;
-  if (!body || typeof body.q !== 'string' || body.q.trim().length < 2) {
+  if (!body || typeof body.q !== 'string' || body.q.trim().length < 1) {
     return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
   }
 
-  const rawQ = body.q.trim();
+  const chatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
+  const incomingQ = body.q.trim();
+  const replyLangEarly = detectQueryLanguage(incomingQ);
+  const resolved = await resolveEffectiveQuery({
+    rawQ: incomingQ,
+    previousQ: typeof body.previousQ === 'string' ? body.previousQ : null,
+    chatId,
+    lang: replyLangEarly,
+  });
+
+  if (resolved.needsClarify && resolved.clarifyText) {
+    return Response.json({
+      query: incomingQ,
+      rawQuery: incomingQ,
+      displayTopic: 'Clarify',
+      intent: 'clarify',
+      brief: 'Need a clearer question',
+      items: [],
+      total: 0,
+      whatsappText: resolved.clarifyText,
+      usedMemory: false,
+      lastUpdated: new Date().toISOString(),
+    });
+  }
+
+  const rawQ = resolved.effectiveQ.trim();
+  if (rawQ.length < 2) {
+    return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
+  }
   const q = extractTopicQuery(rawQ);
   const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT_MAX);
   const plugin = detectPlugin(q);
   const topicLabel = displayTopic(q, plugin);
   const now = new Date().toISOString();
+  const remember = (topic: string) => {
+    // Remember the user-facing topic, not internal clarifiers.
+    if (plugin.kind === 'greeting') return;
+    setChatMemory(chatId, rawQ, topic);
+  };
 
   if (plugin.kind === 'greeting') {
     return Response.json({
       query: q,
-      rawQuery: rawQ,
+      rawQuery: incomingQ,
       displayTopic: topicLabel,
       intent: 'greeting',
       brief: 'Greeting',
       items: [],
       total: 0,
       whatsappText: buildGreeting(),
+      usedMemory: resolved.usedMemory,
       lastUpdated: now,
     });
   }
@@ -1163,9 +1205,10 @@ export async function POST(request: Request) {
         '• Checking again in a few minutes',
       ].join('\n');
     }
+    remember(topicLabel);
     return Response.json({
       query: q,
-      rawQuery: rawQ,
+      rawQuery: incomingQ,
       displayTopic: topicLabel,
       intent: 'weather',
       weather: weather ?? undefined,
@@ -1173,6 +1216,7 @@ export async function POST(request: Request) {
       items: [],
       total: weather && !weather.error ? 1 : 0,
       whatsappText,
+      usedMemory: resolved.usedMemory,
       lastUpdated: now,
     });
   }
@@ -1185,9 +1229,10 @@ export async function POST(request: Request) {
       if (!gate.ok) {
         whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
       }
+      remember(topicLabel);
       return Response.json({
         query: q,
-        rawQuery: rawQ,
+        rawQuery: incomingQ,
         displayTopic: topicLabel,
         intent: 'gold_price',
         brief: 'Live gold spot (international).',
@@ -1195,6 +1240,7 @@ export async function POST(request: Request) {
         total: 1,
         goldPrice: gold,
         whatsappText,
+        usedMemory: resolved.usedMemory,
         lastUpdated: now,
       });
     }
@@ -1209,9 +1255,10 @@ export async function POST(request: Request) {
       if (!gate.ok) {
         whatsappText = ['*NewsDash Analyst*', '', `*Topic:* ${topicLabel}`, gate.reason].join('\n');
       }
+      remember(topicLabel);
       return Response.json({
         query: q,
-        rawQuery: rawQ,
+        rawQuery: incomingQ,
         displayTopic: topicLabel,
         intent: 'crypto_price',
         brief: `Live ${quote.name} price.`,
@@ -1219,6 +1266,7 @@ export async function POST(request: Request) {
         total: 1,
         cryptoPrice: quote,
         whatsappText,
+        usedMemory: resolved.usedMemory,
         lastUpdated: now,
       });
     }
@@ -1326,9 +1374,11 @@ export async function POST(request: Request) {
 
   const preview = linkPreview(items);
 
+  remember(newsTopicLabel);
   return Response.json({
     query: q,
-    rawQuery: rawQ,
+    rawQuery: incomingQ,
+    effectiveQuery: rawQ,
     displayTopic: newsTopicLabel,
     intent: fuelAsk ? 'unsupported_live' : 'news',
     terms: { primary: ranked.tokens, expanded: ranked.expanded },
@@ -1340,6 +1390,7 @@ export async function POST(request: Request) {
     sourceButtons,
     linkPreview: preview,
     linkPreviewEnabled: true,
+    usedMemory: resolved.usedMemory,
     lastUpdated: now,
   });
 }
