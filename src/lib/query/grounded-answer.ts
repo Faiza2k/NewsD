@@ -111,8 +111,9 @@ export function resolveReplyLanguage(
 function systemPrompt(lang: ReplyLanguage): string {
   const languageRule =
     lang === 'ur'
-      ? `- Respond FULLY in Urdu (Nastaliq / Arabic script preferred). If the user wrote Roman Urdu, you may reply in clear Nastaliq Urdu.
-- Do NOT reply in English for the answer body.
+      ? `- Respond FULLY in Urdu (Nastaliq / Arabic script).
+- Do NOT output any Chinese, Japanese, or other non-Urdu/non-English characters under any circumstances (e.g. do not write "安排وں" or "交通").
+- If you need to write an English term, name, or concept that does not translate easily to Urdu, either write it in Urdu transliteration (e.g., "ٹریفک" or "ارینجمنٹس") or use the standard English word in Latin letters.
 - Keep publisher names, product names, and place names in their original form when needed.
 - Source titles stay as provided; you are only translating/adapting the answer narrative.`
       : `- Respond FULLY in English.`;
@@ -129,6 +130,7 @@ Rules:
 - Do not tell the user to open the link as the main answer; the brief itself must be useful.
 ${languageRule}`;
 }
+
 
 function formatSources(sources: GroundedSource[]): string {
   return sources
