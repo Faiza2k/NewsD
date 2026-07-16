@@ -40,6 +40,7 @@ export async function GET() {
     channel: 'discord',
     configured: isDiscordConfigured(),
     hasPublicKey: Boolean(c.publicKey),
+    publicKeyPrefix: c.publicKey ? c.publicKey.slice(0, 6) + '...' + c.publicKey.slice(-6) : '',
     hasBotToken: Boolean(c.botToken),
     hasApplicationId: Boolean(c.applicationId),
     allowedGuilds: c.allowedGuildIds.length || 'all',
