@@ -1,0 +1,149 @@
+{
+  "id": "import-ask-dm-1783678000000",
+  "name": "NewsDash -> Ask Agent (DM) FIXED",
+  "nodes": [
+    {
+      "id": "webhook",
+      "name": "WAHA Message Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300],
+      "webhookId": "newsdash-ask",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "newsdash-ask",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "parse",
+      "name": "Parse Incoming Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const BASE_URL = 'https://news-d.vercel.app';\nconst BUSINESS = '923439798418@c.us';\nconst LIMIT = 2;\n\nconst ALLOWED = new Set([\n  '923138308265@c.us',\n  '193277873631353@lid',\n]);\n\nconst root = $input.first()?.json || {};\nconst body = root.body || root;\nconst event = String(body.event || root.event || '');\nconst payload = body.payload || root.payload || body;\n\nif (event && event !== 'message') return [];\nif (!payload || typeof payload !== 'object') return [];\nif (payload.fromMe) return [];\n\nconst from = String(payload.from || '').trim();\nif (!from || from === BUSINESS) return [];\n\nif (ALLOWED.size > 0 && !ALLOWED.has(from)) {\n  const digits = from.replace(/\\\\D/g, '');\n  const ok = [...ALLOWED].some((a) => {\n    const ad = a.replace(/\\\\D/g, '');\n    return ad && digits && (digits.includes(ad) || ad.includes(digits));\n  });\n  if (!ok) return [];\n}\n\nconst text = String(payload.body || payload.caption || '').trim();\nconst media = payload.media || payload._data?.media || null;\nconst mime = String(\n  (media && (media.mimetype || media.mime_type || media.mimeType)) ||\n  payload.mimetype ||\n  payload._data?.mimetype ||\n  ''\n).toLowerCase();\nconst msgType = String(payload.type || payload._data?.type || payload.message?.type || '').toLowerCase();\nconst hasMedia = Boolean(payload.hasMedia || media?.url || media?.link);\nconst isVoice =\n  msgType === 'ptt' ||\n  msgType === 'audio' ||\n  msgType === 'voice' ||\n  mime.startsWith('audio/') ||\n  /\\\\b(ptt|audio|ogg|opus)\\\\b/i.test(mime);\n\nlet mediaUrl = '';\nif (isVoice && hasMedia) {\n  mediaUrl = String(\n    media?.url ||\n    media?.link ||\n    media?.path ||\n    payload.mediaUrl ||\n    payload._data?.deprecatedMms3Url ||\n    ''\n  ).trim();\n  // Rewrite localhost or relative paths → Docker service hostname\n  if (mediaUrl && mediaUrl.startsWith('/')) {\n    mediaUrl = 'http://waha:3000' + mediaUrl;\n  } else if (mediaUrl && /^https?:\\/\\/(localhost|127\\.0\\.0\\.1)(:\\d+)?/i.test(mediaUrl)) {\n    mediaUrl = mediaUrl.replace(/^https?:\\/\\/(localhost|127\\.0\\.0\\.1)(:\\d+)?/i, 'http://waha:3000');\n  }\n}\n\nif (!text && !mediaUrl) return [];\nif (text && (text.startsWith('NewsDash') || text.startsWith('*NewsDash'))) return [];\n\nconst msgId = typeof payload.id === 'string'\n  ? payload.id\n  : String((payload.id && (payload.id._serialized || payload.id.id)) || (payload.timestamp + ':' + (text || mediaUrl).slice(0, 40)));\n\ntry {\n  const staticData = $getWorkflowStaticData('global');\n  if (!staticData.seen) staticData.seen = {};\n  if (staticData.seen[msgId]) return [];\n  staticData.seen[msgId] = Date.now();\n  const cutoff = Date.now() - 6 * 60 * 60 * 1000;\n  for (const k of Object.keys(staticData.seen)) {\n    if (staticData.seen[k] < cutoff) delete staticData.seen[k];\n  }\n} catch (e) {}\n\nreturn [{\n  json: {\n    q: text,\n    mediaUrl,\n    mimeType: mime || (mediaUrl ? 'audio/ogg' : ''),\n    needsTranscribe: Boolean(mediaUrl && !text),\n    chatId: from,\n    baseUrl: BASE_URL,\n    limit: LIMIT,\n    messageId: msgId,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "resolve",
+      "name": "Resolve Text Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first()?.json || {};\nlet q = String(item.q || '').trim();\nconst chatId = String(item.chatId || '');\nconst baseUrl = String(item.baseUrl || 'https://news-d.vercel.app');\nconst limit = item.limit || 2;\nconst mediaUrl = String(item.mediaUrl || '').trim();\nconst mimeType = String(item.mimeType || 'audio/ogg').split(';')[0].trim() || 'audio/ogg';\n\nconst failHear = () => ([{\n  json: {\n    chatId,\n    baseUrl,\n    limit,\n    q: '',\n    skipQuery: true,\n    whatsappText: '*NewsDash Analyst*\\n\\nCould not hear that - please retry or type your question.',\n  },\n}]);\n\nif ((!q || item.needsTranscribe) && mediaUrl) {\n  try {\n    const audio = await this.helpers.httpRequest({\n      method: 'GET',\n      url: mediaUrl,\n      encoding: 'arraybuffer',\n      returnFullResponse: false,\n      json: false,\n      timeout: 30000,\n    });\n    const buf = Buffer.isBuffer(audio)\n      ? audio\n      : Buffer.from(audio?.data || audio || []);\n    if (!buf.length) return failHear();\n\n    const ext = mimeType.includes('mpeg') || mimeType.includes('mp3')\n      ? 'mp3'\n      : mimeType.includes('mp4') || mimeType.includes('m4a')\n        ? 'm4a'\n        : mimeType.includes('wav')\n          ? 'wav'\n          : 'ogg';\n\n    const resp = await this.helpers.httpRequest({\n      method: 'POST',\n      url: baseUrl + '/api/transcribe',\n      headers: {},\n      formData: {\n        file: {\n          value: buf,\n          options: { filename: 'voice.' + ext, contentType: mimeType },\n        },\n      },\n      json: true,\n      timeout: 60000,\n    });\n    q = String(resp?.text || '').trim();\n    if (!q) return failHear();\n  } catch (e) {\n    return failHear();\n  }\n}\n\nif (!q || q.length < 2) {\n  return [{\n    json: {\n      chatId,\n      baseUrl,\n      limit,\n      q: '',\n      skipQuery: true,\n      whatsappText: '*NewsDash Analyst*\\n\\nPlease send a short text or voice question.',\n    },\n  }];\n}\n\nreturn [{ json: { q, chatId, baseUrl, limit, skipQuery: false } }];\n"
+      }
+    },
+    {
+      "id": "load_history",
+      "name": "Load Chat History",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first()?.json || {};\nconst chatId = String(item.chatId || '');\n\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.history) staticData.history = {};\nif (!staticData.topicContext) staticData.topicContext = {};\n\nconst history = staticData.history[chatId] || [];\nconst lastTopic = staticData.topicContext[chatId] || '';\n\nreturn [{ json: { ...item, history, lastTopic } }];\n"
+      }
+    },
+    {
+      "id": "resolve_topic",
+      "name": "Resolve Query Topic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [980, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first()?.json || {};\nconst q = String(item.q || '').trim();\nconst lastTopic = String(item.lastTopic || '').trim();\nconst skipQuery = Boolean(item.skipQuery);\n\nif (skipQuery) {\n  return [{ json: { ...item, effectiveQuery: '', isFollowUp: false } }];\n}\n\n// Detect Urdu + English follow-up / continuation phrases\nconst FOLLOWUP_RE = /^(\\s*(\\u0627\\u0648\\u0631|\\u0645\\u0632\\u06CC\\u062F|\\u0622\\u06AF\\u06D2|\\u0628\\u062A\\u0627\\u0624|\\u0628\\u062A\\u0627\\u0626\\u06CC\\u06BA|\\u0627\\u06AF\\u0644\\u0627|\\u0627\\u06AF\\u0644\\u06CC|\\u067E\\u06BE\\u0631|\\u06C1\\u0627\\u06BA|okay|ok|more|next|go on|continue|and then|tell me more|what else|anything else|elaborate|details?|explain more|haan|theek hai|aur|mazeed|agay|batao|batain|phir|aur batao|aur kuch|kuch aur|show more|related|\\u0645\\u062A\\u0639\\u0644\\u0642|\\u0645\\u0632\\u06CC\\u062F \\u062E\\u0628\\u0631\\u06CC\\u06BA|\\u0645\\u0632\\u06CC\\u062F \\u0628\\u062A\\u0627\\u0626\\u06CC\\u06BA|\\u0627\\u0633 \\u06A9\\u06D2 \\u0628\\u0627\\u0631\\u06D2 \\u0645\\u06CC\\u06BA|\\u0627\\u0633 \\u0628\\u0627\\u0631\\u06D2 \\u0645\\u06CC\\u06BA)\\s*[?!]*\\s*)$/i;\n\nconst isUrduOnly = /^[\\u0600-\\u06FF\\s?!.,]+$/.test(q);\nconst isFollowUp = q.length < 50 && (FOLLOWUP_RE.test(q) || (q.length < 20 && lastTopic && isUrduOnly));\n\nconst effectiveQuery = isFollowUp && lastTopic ? lastTopic : q;\nconst extraLimit = isFollowUp ? 2 : 0;\n\nreturn [{ json: { ...item, effectiveQuery, isFollowUp, extraLimit } }];\n"
+      }
+    },
+    {
+      "id": "query",
+      "name": "Query NewsDash",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1220, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.baseUrl + '/api/query' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ q: $json.effectiveQuery || $json.q, limit: ($json.limit || 2) + ($json.extraLimit || 0) }) }}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "call_chat",
+      "name": "Call Groq Chat API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1460, 300],
+      "continueOnFail": true,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Resolve Text Query').first().json.baseUrl + '/api/chat' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ (function() {\n  const resolved  = $('Resolve Text Query').first().json || {};\n  const loaded    = $('Load Chat History').first().json || {};\n  const topicNode = $('Resolve Query Topic').first().json || {};\n  const history   = Array.isArray(loaded.history) ? loaded.history : [];\n  const isFollowUp  = Boolean(topicNode.isFollowUp);\n  const lastTopic   = String(topicNode.lastTopic || '');\n\n  let newsContext = '';\n  try {\n    const qResp = $('Query NewsDash').first()?.json;\n    const items = qResp?.items || qResp?.results || [];\n    if (Array.isArray(items) && items.length) {\n      newsContext = items.slice(0, 5).map((i, n) =>\n        (n+1) + '. ' + (i.title || '') + ' [' + (i.source || '') + '] -- ' + (i.description || '').slice(0, 120)\n      ).join('\\n');\n    } else if (typeof qResp?.whatsappText === 'string') {\n      newsContext = qResp.whatsappText.slice(0, 1000);\n    }\n  } catch(e) {}\n\n  if (isFollowUp && !newsContext && lastTopic) {\n    const lastAssistant = [...history].reverse().find(function(m) { return m.role === 'assistant'; });\n    if (lastAssistant) {\n      newsContext = '(Continuing previous discussion about: ' + lastTopic + ')';\n    }\n  }\n\n  let effectiveQ = String(resolved.q || '');\n  if (isFollowUp && lastTopic) {\n    effectiveQ = '[Follow-up about: ' + lastTopic + '] ' + effectiveQ;\n  }\n\n  return JSON.stringify({\n    q: effectiveQ,\n    history: history.slice(-40),\n    newsContext: newsContext,\n  });\n})() }}",
+        "options": {
+          "timeout": 90000
+        }
+      }
+    },
+    {
+      "id": "save_format",
+      "name": "Save History & Format Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1700, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const resolved  = $('Resolve Text Query').first().json || {};\nconst topicNode = $('Resolve Query Topic').first().json || {};\nconst chatId    = String(resolved.chatId || '');\nconst q         = String(resolved.q || '');\n\nif (resolved.skipQuery && resolved.whatsappText) {\n  return [{ json: { chatId, text: String(resolved.whatsappText) } }];\n}\n\nlet replyText = '';\ntry {\n  const chatResp = $('Call Groq Chat API').first()?.json;\n  replyText = String(chatResp?.text || '').trim();\n} catch (e) {}\n\nif (!replyText) {\n  try {\n    const newsResp = $('Query NewsDash').first()?.json;\n    replyText = String(newsResp?.whatsappText || '').trim();\n  } catch(e) {}\n}\n\nif (!replyText) {\n  replyText = '*NewsDash Analyst*\\n\\nSorry, could not get a response right now. Please try again.';\n}\n\ntry {\n  const staticData = $getWorkflowStaticData('global');\n  if (!staticData.history)      staticData.history      = {};\n  if (!staticData.topicContext) staticData.topicContext = {};\n\n  const hist = staticData.history[chatId] || [];\n  hist.push({ role: 'user',      content: q });\n  hist.push({ role: 'assistant', content: replyText });\n  staticData.history[chatId] = hist.slice(-40);\n\n  const isFollowUp     = Boolean(topicNode.isFollowUp);\n  const effectiveQuery = String(topicNode.effectiveQuery || q);\n  if (!isFollowUp && effectiveQuery.length > 3) {\n    staticData.topicContext[chatId] = effectiveQuery;\n  }\n} catch (e) {}\n\nreturn [{ json: { chatId, text: replyText } }];\n"
+      }
+    },
+    {
+      "id": "send",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1940, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "http://waha:3000/api/sendText",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ session: 'default', chatId: $json.chatId, text: $json.text, linkPreview: true }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "WAHA Message Webhook":    { "main": [[{ "node": "Parse Incoming Message", "type": "main", "index": 0 }]] },
+    "Parse Incoming Message":  { "main": [[{ "node": "Resolve Text Query",     "type": "main", "index": 0 }]] },
+    "Resolve Text Query":      { "main": [[{ "node": "Load Chat History",       "type": "main", "index": 0 }]] },
+    "Load Chat History":       { "main": [[{ "node": "Resolve Query Topic",     "type": "main", "index": 0 }]] },
+    "Resolve Query Topic":     { "main": [[{ "node": "Query NewsDash",          "type": "main", "index": 0 }]] },
+    "Query NewsDash":          { "main": [[{ "node": "Call Groq Chat API",      "type": "main", "index": 0 }]] },
+    "Call Groq Chat API":      { "main": [[{ "node": "Save History & Format Reply", "type": "main", "index": 0 }]] },
+    "Save History & Format Reply": { "main": [[{ "node": "Send Reply",          "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionTimeout": 180,
+    "timezone": "Asia/Karachi",
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "pinData": {}
+}

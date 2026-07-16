@@ -1,4 +1,5 @@
-import { POST as queryPost } from '@/app/api/query/route';
+import { whatsappChatId } from '@/lib/ask/chat-id';
+import { getAskFallbackReply, runAskQuery } from '@/lib/ask/brain';
 import {
   getWhatsAppConfig,
   isWhatsAppCloudConfigured,
@@ -57,13 +58,14 @@ export async function GET(request: Request) {
   return Response.json({
     ok: true,
     service: 'NewsDash WhatsApp Cloud API webhook',
+    channel: 'whatsapp_cloud',
     configured: isWhatsAppCloudConfigured(),
     hasVerifyToken: Boolean(verifyToken),
     hasAccessToken: Boolean(process.env.WHATSAPP_ACCESS_TOKEN?.trim()),
     hasPhoneNumberId: Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID?.trim()),
     hasAppSecret: Boolean(process.env.WHATSAPP_APP_SECRET?.trim()),
     hint: isWhatsAppCloudConfigured()
-      ? 'Ready. Configure Meta webhook to this URL and message the test number.'
+      ? 'Ready. Configure Meta webhook to this URL and message the test number. For business WhatsApp use WAHA+n8n — see DUAL_CHANNEL_SETUP.md.'
       : 'Add WHATSAPP_VERIFY_TOKEN, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID on Vercel.',
   });
 }
@@ -193,26 +195,13 @@ async function replyToUser(msg: InboundText) {
   }
 
   // chatId = WhatsApp user phone (digits) — powers expert session memory on Vercel
-  const queryRes = await queryPost(
-    new Request('http://localhost/api/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        q: msg.text,
-        limit: 3,
-        chatId: msg.from,
-      }),
-    }),
-  );
+  const data = await runAskQuery({
+    q: msg.text,
+    limit: 3,
+    chatId: whatsappChatId(msg.from),
+  });
 
-  const data = (await queryRes.json().catch(() => null)) as {
-    whatsappText?: string;
-    error?: string;
-  } | null;
-
-  const reply =
-    (data?.whatsappText && String(data.whatsappText).trim()) ||
-    '*NewsDash Analyst*\n\nCould not answer right now. Please try again.';
+  const reply = data.whatsappText?.trim() || getAskFallbackReply();
 
   const sent = await sendWhatsAppText(msg.from, reply);
   if (!sent.ok) {

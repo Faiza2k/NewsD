@@ -1,0 +1,45 @@
+# NewsDash Ask — WAHA + n8n (local WhatsApp channel)
+# Use alongside Discord on Vercel. See DUAL_CHANNEL_SETUP.md
+
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    container_name: newsdash-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:5678/
+      - GENERIC_TIMEZONE=Asia/Karachi
+      - TZ=Asia/Karachi
+    volumes:
+      - newsdash_n8n_data:/home/node/.n8n
+    networks:
+      - newsdash-ask
+
+  waha:
+    image: devlikeapro/waha
+    container_name: newsdash-waha
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - WHATSAPP_API_PORT=3000
+      - WAHA_DASHBOARD_USERNAME=${WAHA_DASHBOARD_USERNAME:-admin}
+      - WAHA_DASHBOARD_PASSWORD=${WAHA_DASHBOARD_PASSWORD:-admin}
+      - WAHA_API_KEY=${WAHA_API_KEY:-}
+    volumes:
+      - newsdash_waha_data:/app/.sessions
+    networks:
+      - newsdash-ask
+
+networks:
+  newsdash-ask:
+    name: newsdash-ask
+
+volumes:
+  newsdash_n8n_data:
+  newsdash_waha_data:

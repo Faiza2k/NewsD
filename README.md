@@ -18,6 +18,16 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## Ask bot (WhatsApp + Discord)
+
+Both channels share the same brain (`POST /api/query`):
+
+- **Discord** — `/ask` slash command on Vercel → see [DISCORD_SETUP.md](./DISCORD_SETUP.md)
+- **WhatsApp** — WAHA + n8n locally → see [DUAL_CHANNEL_SETUP.md](./DUAL_CHANNEL_SETUP.md)
+- **Status** — `GET /api/ask/status` after deploy
+
+You can run **both channels at the same time**.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.

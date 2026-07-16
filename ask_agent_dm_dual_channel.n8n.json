@@ -1,0 +1,174 @@
+{
+  "id": "import-ask-dm-dual-channel",
+  "name": "NewsDash Ask (WhatsApp DM — dual channel)",
+  "nodes": [
+    {
+      "id": "webhook",
+      "name": "WAHA Message Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "newsdash-ask",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "newsdash-ask",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "parse",
+      "name": "Parse Incoming Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const BASE_URL = 'https://news-d.vercel.app';\nconst BUSINESS = '923439798418@c.us';\nconst LIMIT = 3;\n\nconst ALLOWED = new Set([\n  '923138308265@c.us',\n  '193277873631353@lid',\n]);\n\nconst root = $input.first()?.json || {};\nconst body = root.body || root;\nconst event = String(body.event || root.event || '');\nconst payload = body.payload || root.payload || body;\n\nif (event && event !== 'message') return [];\nif (!payload || typeof payload !== 'object') return [];\nif (payload.fromMe) return [];\n\nconst from = String(payload.from || '').trim();\nif (!from || from === BUSINESS) return [];\n\nif (ALLOWED.size > 0 && !ALLOWED.has(from)) {\n  const digits = from.replace(/\\D/g, '');\n  const ok = [...ALLOWED].some((a) => {\n    const ad = a.replace(/\\D/g, '');\n    return ad && digits && (digits.includes(ad) || ad.includes(digits));\n  });\n  if (!ok) return [];\n}\n\nconst text = String(payload.body || payload.caption || '').trim();\nconst media = payload.media || payload._data?.media || null;\nconst mime = String(\n  (media && (media.mimetype || media.mime_type || media.mimeType)) ||\n  payload.mimetype ||\n  payload._data?.mimetype ||\n  ''\n).toLowerCase();\nconst msgType = String(payload.type || payload._data?.type || payload.message?.type || '').toLowerCase();\nconst hasMedia = Boolean(payload.hasMedia || media?.url || media?.link);\nconst isVoice =\n  msgType === 'ptt' ||\n  msgType === 'audio' ||\n  msgType === 'voice' ||\n  mime.startsWith('audio/') ||\n  /\\b(ptt|audio|ogg|opus)\\b/i.test(mime);\n\nlet mediaUrl = '';\nif (isVoice && hasMedia) {\n  mediaUrl = String(\n    media?.url ||\n    media?.link ||\n    media?.path ||\n    payload.mediaUrl ||\n    payload._data?.deprecatedMms3Url ||\n    ''\n  ).trim();\n  if (mediaUrl && mediaUrl.startsWith('/')) {\n    mediaUrl = 'http://waha:3000' + mediaUrl;\n  } else if (mediaUrl && /^https?:\\/\\/(localhost|127\\.0\\.0\\.1)(:\\d+)?/i.test(mediaUrl)) {\n    mediaUrl = mediaUrl.replace(/^https?:\\/\\/(localhost|127\\.0\\.0\\.1)(:\\d+)?/i, 'http://waha:3000');\n  }\n}\n\nif (!text && !mediaUrl) return [];\nif (text && (text.startsWith('NewsDash') || text.startsWith('*NewsDash'))) return [];\n\nconst msgId = typeof payload.id === 'string'\n  ? payload.id\n  : String((payload.id && (payload.id._serialized || payload.id.id)) || (payload.timestamp + ':' + (text || mediaUrl).slice(0, 40)));\n\ntry {\n  const staticData = $getWorkflowStaticData('global');\n  if (!staticData.seen) staticData.seen = {};\n  if (staticData.seen[msgId]) return [];\n  staticData.seen[msgId] = Date.now();\n  const cutoff = Date.now() - 6 * 60 * 60 * 1000;\n  for (const k of Object.keys(staticData.seen)) {\n    if (staticData.seen[k] < cutoff) delete staticData.seen[k];\n  }\n} catch (e) {}\n\nreturn [{\n  json: {\n    q: text,\n    mediaUrl,\n    mimeType: mime || (mediaUrl ? 'audio/ogg' : ''),\n    needsTranscribe: Boolean(mediaUrl && !text),\n    chatId: from,\n    baseUrl: BASE_URL,\n    limit: LIMIT,\n    messageId: msgId,\n  },\n}];"
+      }
+    },
+    {
+      "id": "resolve",
+      "name": "Resolve Text Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first()?.json || {};\nlet q = String(item.q || '').trim();\nlet chatId = String(item.chatId || '');\nconst baseUrl = String(item.baseUrl || 'https://news-d.vercel.app');\nconst limit = item.limit || 3;\nconst mediaUrl = String(item.mediaUrl || '').trim();\nconst mimeType = String(item.mimeType || 'audio/ogg').split(';')[0].trim() || 'audio/ogg';\n\nconst LID_TO_CUS = {\n  '193277873631353@lid': '923138308265@c.us',\n};\nif (LID_TO_CUS[chatId]) chatId = LID_TO_CUS[chatId];\n\nconst failHear = () => ([{\n  json: {\n    chatId,\n    baseUrl,\n    limit,\n    q: '',\n    skipQuery: true,\n    whatsappText: '*NewsDash Analyst*\\n\\nCould not hear that - please retry or type your question.',\n  },\n}]);\n\nlet voiceLang = '';\nif ((!q || item.needsTranscribe) && mediaUrl) {\n  try {\n    const audio = await this.helpers.httpRequest({\n      method: 'GET',\n      url: mediaUrl,\n      encoding: 'arraybuffer',\n      returnFullResponse: false,\n      json: false,\n      timeout: 30000,\n    });\n    const buf = Buffer.isBuffer(audio)\n      ? audio\n      : Buffer.from(audio?.data || audio || []);\n    if (!buf.length) return failHear();\n\n    const ext = mimeType.includes('mpeg') || mimeType.includes('mp3')\n      ? 'mp3'\n      : mimeType.includes('mp4') || mimeType.includes('m4a')\n        ? 'm4a'\n        : mimeType.includes('wav')\n          ? 'wav'\n          : 'ogg';\n\n    const resp = await this.helpers.httpRequest({\n      method: 'POST',\n      url: baseUrl + '/api/transcribe',\n      headers: {},\n      formData: {\n        file: {\n          value: buf,\n          options: { filename: 'voice.' + ext, contentType: mimeType },\n        },\n      },\n      json: true,\n      timeout: 60000,\n    });\n    q = String(resp?.text || '').trim();\n    voiceLang = String(resp?.language || '').trim();\n    if (!q) return failHear();\n  } catch (e) {\n    return failHear();\n  }\n}\n\nif (!q || q.length < 2) {\n  return [{\n    json: {\n      chatId,\n      baseUrl,\n      limit,\n      q: '',\n      skipQuery: true,\n      whatsappText: '*NewsDash Analyst*\\n\\nPlease send a short text or voice question.',\n    },\n  }];\n}\n\nlet previousQ = '';\nlet previousIntent = '';\nlet historyTurns = [];\ntry {\n  const staticData = $getWorkflowStaticData('global');\n  if (!staticData.lastQ) staticData.lastQ = {};\n  if (!staticData.lastIntent) staticData.lastIntent = {};\n  if (!staticData.history) staticData.history = {};\n  previousQ = String(staticData.lastQ[chatId] || '');\n  previousIntent = String(staticData.lastIntent[chatId] || '');\n  historyTurns = Array.isArray(staticData.history[chatId]) ? staticData.history[chatId].slice(-8) : [];\n} catch (e) {}\n\nreturn [{ json: { q, chatId, baseUrl, limit, previousQ, previousIntent, history: historyTurns, skipQuery: false, voiceLang } }];"
+      }
+    },
+    {
+      "id": "query",
+      "name": "Query NewsDash",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        300
+      ],
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.baseUrl + \"/api/query\" }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ q: $json.q, limit: $json.limit || 3, chatId: $json.chatId || \"\", previousQ: $json.previousQ || \"\", previousIntent: $json.previousIntent || \"\", history: $json.history || [], lang: $json.voiceLang || \"\" }) }}",
+        "options": {
+          "timeout": 90000
+        }
+      }
+    },
+    {
+      "id": "format",
+      "name": "Format Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const resolved = $('Resolve Text Query').first().json || {};\nconst resp = $('Query NewsDash').first()?.json || {};\nconst chatId = String(resolved.chatId || '');\nconst q = String(resolved.q || '');\n\nif (resolved.skipQuery && resolved.whatsappText) {\n  return [{ json: { chatId, text: String(resolved.whatsappText) } }];\n}\n\nlet text = String(resp?.whatsappText || '').trim();\nif (!text) {\n  text = '*NewsDash Analyst*\\n\\nSorry, could not get a response right now. Please try again.';\n}\n\ntry {\n  const staticData = $getWorkflowStaticData('global');\n  if (!staticData.lastQ) staticData.lastQ = {};\n  if (!staticData.lastIntent) staticData.lastIntent = {};\n  if (!staticData.history) staticData.history = {};\n  const remember = String(resp.effectiveQuery || resp.rawQuery || q || '').trim();\n  if (chatId && remember && resp.intent !== 'clarify' && resp.intent !== 'greeting') {\n    staticData.lastQ[chatId] = remember.slice(0, 400);\n    staticData.lastIntent[chatId] = String(resp.intent || '').slice(0, 40);\n    const hist = Array.isArray(staticData.history[chatId]) ? staticData.history[chatId] : [];\n    hist.push({ role: 'user', content: q.slice(0, 400) });\n    hist.push({ role: 'assistant', content: text.slice(0, 500) });\n    staticData.history[chatId] = hist.slice(-8);\n  }\n} catch (e) {}\n\nreturn [{ json: { chatId, text } }];"
+      }
+    },
+    {
+      "id": "send",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1280,
+        300
+      ],
+      "continueOnFail": true,
+      "parameters": {
+        "method": "POST",
+        "url": "http://waha:3000/api/sendText",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ session: \"default\", chatId: $json.chatId, text: $json.text, linkPreview: true }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      }
+    }
+  ],
+  "connections": {
+    "WAHA Message Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Incoming Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Incoming Message": {
+      "main": [
+        [
+          {
+            "node": "Resolve Text Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Text Query": {
+      "main": [
+        [
+          {
+            "node": "Query NewsDash",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query NewsDash": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Reply": {
+      "main": [
+        [
+          {
+            "node": "Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 180,
+    "timezone": "Asia/Karachi",
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "pinData": {}
+}
