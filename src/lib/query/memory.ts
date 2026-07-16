@@ -400,6 +400,22 @@ async function resolveEffectiveQueryInternal(args: {
   }
 
   if (!previousQ && !previousTopic && !histText) {
+    const isTrulyVague =
+      rawQ.split(/\s+/).length <= 3 ||
+      /^(more|aur|zyada|detail|details|continue|go on|batao|bataen|sunao|update|kyun|why|ok|okay|haan|han|yes|no|nahi|nahin|mazeed|that|this|it|those|these|here|there)$/i.test(
+        rawQ.toLowerCase().trim()
+      );
+
+    if (!isTrulyVague) {
+      return {
+        effectiveQ: rawQ,
+        usedMemory: false,
+        needsClarify: false,
+        preferredLang: memory?.preferredLang,
+        memoryIntent: undefined,
+      };
+    }
+
     const clarifyText =
       args.lang === 'ur'
         ? [
