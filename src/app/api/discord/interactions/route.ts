@@ -114,6 +114,7 @@ export async function POST(request: Request) {
       });
     }
 
+    // Defer first so Discord shows "NewsDash is thinking…"
     const deferred = await deferInteraction(interaction.id, interaction.token);
     if (!deferred) {
       return Response.json({
@@ -122,8 +123,12 @@ export async function POST(request: Request) {
       });
     }
 
+    // answerAsk MUST be awaited before we return — Vercel kills the invocation
+    // as soon as the HTTP response is sent, so any work after the return is lost.
+    console.log('[discord] deferred ok, running brain for:', question);
     try {
       await answerAsk(interaction, question);
+      console.log('[discord] brain done, reply sent');
     } catch (err) {
       console.error('[discord] answer failed', err);
       const { applicationId } = getDiscordConfig();
@@ -154,6 +159,7 @@ async function answerAsk(interaction: DiscordInteraction, question: string) {
   const { applicationId } = getDiscordConfig();
   const token = interaction.token!;
 
+  console.log('[discord] calling runAskQuery, q:', question);
   const data = await runAskQuery({
     q: question,
     limit: 3,
@@ -164,6 +170,7 @@ async function answerAsk(interaction: DiscordInteraction, question: string) {
     }),
   });
 
+  console.log('[discord] runAskQuery done, intent:', (data as any).intent, 'hasText:', Boolean(data.whatsappText));
   const reply = data.whatsappText?.trim() || getAskFallbackReply();
   const sent = await editOriginalInteraction(applicationId, token, reply, data.sourceButtons);
   if (!sent.ok) {
