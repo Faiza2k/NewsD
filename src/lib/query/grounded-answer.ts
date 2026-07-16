@@ -97,15 +97,30 @@ export function resolveReplyLanguage(
 ): ReplyLanguage {
   const inc = String(incomingQ || '').trim();
   const eff = String(effectiveQ || '').trim();
+
+  // 1. If user explicitly wrote in Nastaliq Urdu script, reply in Urdu
   if (/[\u0600-\u06FF]/.test(inc) || /[\u0600-\u06FF]/.test(eff)) return 'ur';
 
-  const hint = String(langHint || '')
-    .toLowerCase()
-    .trim();
-  if (hint === 'ur' || hint === 'urdu' || hint.startsWith('ur-')) return 'ur';
+  // 2. Detect language from current incoming query
+  const detected = detectQueryLanguage(inc);
 
-  if (detectQueryLanguage(inc) === 'ur' || detectQueryLanguage(eff) === 'ur') return 'ur';
-  return 'en';
+  // 3. If query contains clear English news markers with no Roman Urdu strong words, prioritize English
+  const tokens = inc.toLowerCase().match(/[a-z']+/g) || [];
+  const strongUrdu = tokens.filter((w) => ROMAN_URDU_STRONG.has(w)).length;
+  const hasEnglishNewsWords = /\b(price|rate|weather|gold|bitcoin|petrol|diesel|oil|today|now|up|down|go|why|what|how|who|news|india|pakistan)\b/i.test(inc);
+  
+  if (hasEnglishNewsWords && strongUrdu === 0) {
+    return 'en';
+  }
+
+  // 4. Otherwise, if it's a short/vague query (e.g. "or batao" / "more details"), fall back to the langHint/memory preference if available
+  if (langHint) {
+    const hint = String(langHint).toLowerCase().trim();
+    if (hint === 'ur' || hint === 'urdu' || hint.startsWith('ur-')) return 'ur';
+    if (hint === 'en' || hint === 'english') return 'en';
+  }
+
+  return detected;
 }
 
 function systemPrompt(lang: ReplyLanguage): string {

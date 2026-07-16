@@ -1491,7 +1491,6 @@ export async function POST(request: Request) {
     rawQ,
     body.replyLang || body.lang || resolved.preferredLang,
   );
-  if (resolved.preferredLang) replyLang = resolved.preferredLang;
 
   const q = extractTopicQuery(rawQ);
   const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT_MAX);
