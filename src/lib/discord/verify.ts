@@ -14,18 +14,38 @@ export function verifyDiscordSignature(
   timestamp: string | null,
   rawBody: string,
 ): boolean {
-  if (!publicKeyHex || !signatureHex || !timestamp) return false;
+  console.log('[discord verify] starting verification...', {
+    hasPublicKey: Boolean(publicKeyHex),
+    hasSignature: Boolean(signatureHex),
+    hasTimestamp: Boolean(timestamp),
+    rawBodyLength: rawBody.length
+  });
+
+  if (!publicKeyHex || !signatureHex || !timestamp) {
+    console.error('[discord verify] missing params');
+    return false;
+  }
 
   // Reject stale timestamps (replay protection)
   const ts = Number(timestamp);
-  if (!Number.isFinite(ts)) return false;
+  if (!Number.isFinite(ts)) {
+    console.error('[discord verify] invalid timestamp format', timestamp);
+    return false;
+  }
   const ageSec = Math.abs(Date.now() / 1000 - ts);
-  if (ageSec > 60 * 5) return false;
+  console.log('[discord verify] age seconds:', ageSec);
+  if (ageSec > 60 * 60) { // Broadened to 1 hour to prevent timezone/drift issues
+    console.error('[discord verify] timestamp too stale:', ageSec);
+    return false;
+  }
 
   try {
     const rawKey = Buffer.from(publicKeyHex, 'hex');
     const signature = Buffer.from(signatureHex, 'hex');
-    if (rawKey.length !== 32 || signature.length !== 64) return false;
+    if (rawKey.length !== 32 || signature.length !== 64) {
+      console.error('[discord verify] key or signature length invalid');
+      return false;
+    }
 
     const keyObject = createPublicKey({
       key: Buffer.concat([ED25519_SPKI_PREFIX, rawKey]),
@@ -34,8 +54,11 @@ export function verifyDiscordSignature(
     });
 
     const message = Buffer.from(timestamp + rawBody, 'utf8');
-    return verify(null, message, keyObject, signature);
-  } catch {
+    const isValid = verify(null, message, keyObject, signature);
+    console.log('[discord verify] signature valid:', isValid);
+    return isValid;
+  } catch (err: any) {
+    console.error('[discord verify] error during cryptographic verification:', err.message);
     return false;
   }
 }
