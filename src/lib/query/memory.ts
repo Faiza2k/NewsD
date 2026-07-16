@@ -315,7 +315,11 @@ function isLangOnlyFollowUp(q: string): boolean {
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  return /^(in\s+)?(english|urdu|roman(\s+urdu)?|اردو|انگریزی)(\s+(mein|me|please|pls))?$/i.test(s);
+  // "in urdu", "urdu mein", "urdu please"
+  if (/^(in\s+)?(english|urdu|roman(\s+urdu)?|اردو|انگریزی)(\s+(mein|me|mai|please|pls|mein\s+batao|mai\s+batao|mai\s+bolo|mein\s+bolo|mein\s+bata|mai\s+bata))?$/i.test(s)) return true;
+  // "urdu mai batao", "urdu mein bataen", "english mai samjhao" etc.
+  if (/^(english|urdu|roman\s+urdu|اردو|انگریزی)\s+(mai|mein|me)\s+(batao|bataen|bata|bataiye|samjhao|bolo|sunao|likho|likhein)$/i.test(s)) return true;
+  return false;
 }
 
 export type ResolvedQuery = {

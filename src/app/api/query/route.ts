@@ -1154,7 +1154,30 @@ async function buildNewsReply(
   }
 
   const sources = await enrichGroundedSources(items);
-  let answer = await buildGroundedAnswer(question, sources, lang, history);
+
+  // When usedLatestFallback is true, articles are NOT relevant to the question —
+  // they are the freshest items from the entire feed pool. Do NOT pass them to
+  // the LLM (it will hallucinate a confident answer about unrelated stories).
+  // Instead, skip grounding and show a honest "no direct match" note.
+  if (closestCoverage) {
+    const noMatchNote =
+      langOverride === 'ur'
+        ? `نیوزڈیش کی تازہ فیڈز میں "${question.trim().slice(0, 60)}" سے متعلق براہِ راست کوریج نہیں ملی۔ ذیل میں تازہ ترین عالمی خبریں ہیں — مزید مخصوص سوال پوچھیں تاکہ بہتر جواب مل سکے۔`
+        : `No direct coverage found for "${question.trim().slice(0, 60)}" in NewsDash feeds right now. Showing latest headlines instead — try a more specific keyword for a targeted answer.`;
+    const displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
+    const sourceButtons = buildSourceButtons(items, displayUrls);
+    const answerLabel = langOverride === 'ur' ? '*جواب:*' : '*Answer:*';
+    const sourcesLabel = langOverride === 'ur' ? '*ذرائع:*' : '*Sources*';
+    parts.push('', answerLabel, noMatchNote, '', sourcesLabel);
+    const showIndex = items.length > 1;
+    parts.push(
+      items.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
+    );
+    return { text: parts.join('\n'), answer: noMatchNote, sources, sourceButtons, displayUrls };
+  }
+
+  let answer = await buildGroundedAnswer(question, sources, langOverride ?? detectQueryLanguage(question), history);
+
   // Strip leading refusal sentences the model sometimes still emits
   if (answer) {
     answer = answer
