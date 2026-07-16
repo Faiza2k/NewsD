@@ -352,6 +352,23 @@ function isPriceClarifyQuery(q: string): boolean {
   return /^\d{3,7}(\s*(or|vs|versus|to|-|\/)\s*\d{3,7})?$/.test(s);
 }
 
+function isSimplePriceCheck(q: string): boolean {
+  const s = clean(q).toLowerCase();
+  // If it contains question words, analysis words, or intent to know reasons/causes
+  if (
+    /\b(why|how|reason|because|war|wars|news|explain|explanation|detail|details|predict|prediction|forecast|trend|affect|impact|batao|bataen|bataiye|sunao|sunayein|bolo|bolain|likho|likhein|kya\s+hua|kia\s+hua|kyun|kyu|ku|wajah|وجہ|کیوں|ہوا|did|is\s+it|up|down|going|go|drop|fell|fall|rose|rise|rally|dump|crash|change|percent|percentage)\b/i.test(
+      s,
+    )
+  ) {
+    return false;
+  }
+  // Vague follow-ups or general questions like "tell me more", "or", "and?", "aur?"
+  if (isVagueFollowUp(q)) {
+    return false;
+  }
+  return true;
+}
+
 function detectPlugin(q: string): Plugin {
   const s = clean(q);
   if (isGreeting(s)) return { kind: 'greeting' };
@@ -1123,6 +1140,7 @@ async function buildNewsReply(
   closestCoverage?: boolean,
   langOverride?: ReplyLanguage,
   history?: any[],
+  liveQuoteText?: string,
 ): Promise<{
   text: string;
   answer: string;
@@ -1154,6 +1172,14 @@ async function buildNewsReply(
   }
 
   const sources = await enrichGroundedSources(items);
+  if (liveQuoteText) {
+    sources.unshift({
+      title: lang === 'ur' ? 'لائیو ریٹ کارڈ' : 'Live Price Quote Card',
+      source: 'NewsDash Live API',
+      url: 'https://news-d.vercel.app',
+      body: liveQuoteText,
+    });
+  }
 
   // When usedLatestFallback is true, articles are NOT relevant to the question —
   // they are the freshest items from the entire feed pool. Do NOT pass them to
@@ -1608,7 +1634,7 @@ export async function POST(request: Request) {
     });
   }
 
-  if (plugin.kind === 'gold_price') {
+  if (plugin.kind === 'gold_price' && isSimplePriceCheck(incomingQ)) {
     const gold = await fetchGold();
     if (gold) {
       let whatsappText = buildGoldReply(topicLabel, gold, replyLang);
@@ -1635,7 +1661,7 @@ export async function POST(request: Request) {
     // Fall through to universal news if live quote fails.
   }
 
-  if (plugin.kind === 'crypto_price') {
+  if (plugin.kind === 'crypto_price' && isSimplePriceCheck(incomingQ)) {
     const quote = await fetchCrypto(plugin.cryptoId, replyLang === 'ur');
     if (quote) {
       let whatsappText = buildCryptoReply(topicLabel, quote, replyLang);
@@ -1661,7 +1687,7 @@ export async function POST(request: Request) {
     }
   }
 
-  if (plugin.kind === 'fuel_price') {
+  if (plugin.kind === 'fuel_price' && isSimplePriceCheck(incomingQ)) {
     const oil = await fetchOil();
     if (oil) {
       let whatsappText = buildFuelReply(topicLabel, oil, replyLang);
@@ -1778,6 +1804,31 @@ export async function POST(request: Request) {
     }
   }
 
+  let liveQuoteText: string | undefined;
+  if (plugin.kind === 'gold_price') {
+    const gold = await fetchGold();
+    if (gold) {
+      liveQuoteText = replyLang === 'ur'
+        ? `لائیو سونے کی قیمت: XAU/USD $${gold.price.toLocaleString('en-US')} / oz` + (gold.pkrPerTolaApprox ? `، تخمینہ Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} / تولہ` : '')
+        : `Live gold spot price: XAU/USD is $${gold.price.toLocaleString('en-US')} / oz` + (gold.pkrPerTolaApprox ? `, approx Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} / tola` : '');
+    }
+  } else if (plugin.kind === 'crypto_price') {
+    const quote = await fetchCrypto(plugin.cryptoId, replyLang === 'ur');
+    if (quote) {
+      const changeStr = quote.change24h != null ? ` (${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}% in 24h)` : '';
+      liveQuoteText = replyLang === 'ur'
+        ? `لائیو ${quote.name} قیمت: $${quote.usd.toLocaleString('en-US')}${changeStr}` + (quote.pkrApprox ? `، تخمینہ Rs ${quote.pkrApprox.toLocaleString('en-PK')}` : '')
+        : `Live ${quote.name} price: $${quote.usd.toLocaleString('en-US')}${changeStr}` + (quote.pkrApprox ? `, approx Rs ${quote.pkrApprox.toLocaleString('en-PK')}` : '');
+    }
+  } else if (plugin.kind === 'fuel_price') {
+    const oil = await fetchOil();
+    if (oil) {
+      liveQuoteText = replyLang === 'ur'
+        ? `لائیو بین الاقوامی تیل کی قیمت: WTI $${oil.wtiUsd.toLocaleString('en-US')} / barrel` + (oil.brentUsd ? `، Brent $${oil.brentUsd.toLocaleString('en-US')} / barrel` : '')
+        : `Live international oil prices: WTI is $${oil.wtiUsd.toLocaleString('en-US')} / barrel` + (oil.brentUsd ? `, Brent is $${oil.brentUsd.toLocaleString('en-US')} / barrel` : '');
+    }
+  }
+
   const built = await buildNewsReply(
     rawQ,
     newsTopicLabel,
@@ -1787,6 +1838,7 @@ export async function POST(request: Request) {
     Boolean(ranked.usedLatestFallback),
     replyLang,
     combinedHistory,
+    liveQuoteText,
   );
   let whatsappText = built.text;
   let sourceButtons = built.sourceButtons;
