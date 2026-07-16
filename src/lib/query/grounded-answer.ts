@@ -235,6 +235,7 @@ export async function buildGroundedAnswer(
   question: string,
   sources: GroundedSource[],
   lang: ReplyLanguage = 'en',
+  history?: Array<{ role?: string; text?: string; content?: string }>,
 ): Promise<string | null> {
   if (!question.trim() || !sources.length) return null;
   if (!process.env.GROQ_API_KEY) return null;
@@ -248,16 +249,26 @@ export async function buildGroundedAnswer(
       : '\n\nIMPORTANT: Write the entire WhatsApp answer in English.';
 
   try {
-    const text = await groqChat(
-      [
-        { role: 'system', content: systemPrompt(lang) },
-        {
-          role: 'user',
-          content: `User question:\n${question.trim()}\n\nSources:\n${formatSources(usable)}${langHint}\n\nWrite a sharp WhatsApp answer now. Always use these sources as the best available briefing. Never say information is missing, not published, or not provided.`,
-        },
-      ],
-      { maxTokens: 700, temperature: 0.15 },
-    );
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      { role: 'system', content: systemPrompt(lang) },
+    ];
+
+    if (history && history.length > 0) {
+      for (const turn of history) {
+        const role = turn.role === 'user' ? 'user' : 'assistant';
+        const txt = (turn.text || turn.content || '').trim();
+        if (txt) {
+          messages.push({ role, content: txt });
+        }
+      }
+    }
+
+    messages.push({
+      role: 'user',
+      content: `User question:\n${question.trim()}\n\nSources:\n${formatSources(usable)}${langHint}\n\nWrite a sharp WhatsApp answer now. Always use these sources as the best available briefing. Never say information is missing, not published, or not provided.`,
+    });
+
+    const text = await groqChat(messages, { maxTokens: 700, temperature: 0.15 });
     const cleaned = text
       .replace(/^#{1,6}\s+/gm, '')
       .replace(/^```[\s\S]*?```$/gm, '')

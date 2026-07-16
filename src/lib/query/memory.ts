@@ -1,5 +1,6 @@
 import { groqChat } from '@/lib/groq';
 import type { ReplyLanguage } from '@/lib/query/grounded-answer';
+import { getRedisClient } from '@/lib/kv/redis';
 
 export type MemoryTurn = {
   role: 'user' | 'assistant';
@@ -70,8 +71,21 @@ function memoryKeys(chatId: string): string[] {
   return [...keys];
 }
 
-export function getChatMemory(chatId: string | undefined | null): ChatMemory | null {
+export async function getChatMemory(chatId: string | undefined | null): Promise<ChatMemory | null> {
   if (!chatId) return null;
+  
+  const redis = getRedisClient();
+  if (redis) {
+    try {
+      for (const key of memoryKeys(chatId)) {
+        const row = await redis.get<ChatMemory>(key);
+        if (row) return row;
+      }
+    } catch (err) {
+      console.error('[redis] get memory failed', err);
+    }
+  }
+
   const map = store();
   for (const key of memoryKeys(chatId)) {
     const row = map.get(key);
@@ -112,7 +126,7 @@ function wantsPriceWords(text: string): boolean {
   return /\b(price|rate|keemat|praiz)\b/i.test(text) || /قیمت|ریٹ|پرائز/.test(text);
 }
 
-export function setChatMemory(
+export async function setChatMemory(
   chatId: string | undefined | null,
   lastQ: string,
   lastTopic: string,
@@ -122,11 +136,11 @@ export function setChatMemory(
     preferredLang?: ReplyLanguage;
     assistantText?: string;
   },
-): void {
+): Promise<void> {
   const key = normalizeChatId(chatId) || String(chatId || '').trim();
   if (!key || !lastQ.trim()) return;
 
-  const prev = getChatMemory(key);
+  const prev = await getChatMemory(key);
   const entities = extractEntities(`${lastQ} ${lastTopic}`);
   const turns: MemoryTurn[] = [...(prev?.turns || [])];
   turns.push({ role: 'user', text: lastQ.trim().slice(0, 400), at: Date.now() });
@@ -148,6 +162,18 @@ export function setChatMemory(
     turns: turns.slice(-MAX_TURNS),
     updatedAt: Date.now(),
   };
+
+  const redis = getRedisClient();
+  if (redis) {
+    try {
+      for (const k of memoryKeys(key)) {
+        await redis.set(k, row, { ex: 2700 }); // 45 min TTL
+      }
+      return;
+    } catch (err) {
+      console.error('[redis] set memory failed', err);
+    }
+  }
 
   const map = store();
   for (const k of memoryKeys(key)) map.set(k, row);
@@ -299,6 +325,7 @@ export type ResolvedQuery = {
   clarifyText?: string;
   preferredLang?: ReplyLanguage;
   memoryIntent?: string;
+  turns?: MemoryTurn[];
 };
 
 function historyToText(history?: HistoryTurn[] | null): string {
@@ -314,9 +341,6 @@ function historyToText(history?: HistoryTurn[] | null): string {
     .join('\n');
 }
 
-/**
- * Turn a follow-up / contextual ask into one clear lookup using session memory.
- */
 export async function resolveEffectiveQuery(args: {
   rawQ: string;
   previousQ?: string | null;
@@ -325,8 +349,27 @@ export async function resolveEffectiveQuery(args: {
   history?: HistoryTurn[] | null;
   previousIntent?: string | null;
 }): Promise<ResolvedQuery> {
+  const result = await resolveEffectiveQueryInternal(args);
+  const memory = await getChatMemory(args.chatId);
+  if (memory?.turns) {
+    result.turns = memory.turns;
+  }
+  return result;
+}
+
+/**
+ * Turn a follow-up / contextual ask into one clear lookup using session memory.
+ */
+async function resolveEffectiveQueryInternal(args: {
+  rawQ: string;
+  previousQ?: string | null;
+  chatId?: string | null;
+  lang?: 'en' | 'ur';
+  history?: HistoryTurn[] | null;
+  previousIntent?: string | null;
+}): Promise<ResolvedQuery> {
   const rawQ = String(args.rawQ || '').trim();
-  const memory = getChatMemory(args.chatId);
+  const memory = await getChatMemory(args.chatId);
   const previousQ = String(args.previousQ || memory?.lastQ || '').trim();
   const previousTopic = memory?.lastTopic || '';
   const previousIntent = String(args.previousIntent || memory?.lastIntent || '').trim();

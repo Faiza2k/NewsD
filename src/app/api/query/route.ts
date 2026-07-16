@@ -1122,6 +1122,7 @@ async function buildNewsReply(
   note?: string,
   closestCoverage?: boolean,
   langOverride?: ReplyLanguage,
+  history?: any[],
 ): Promise<{
   text: string;
   answer: string;
@@ -1153,7 +1154,7 @@ async function buildNewsReply(
   }
 
   const sources = await enrichGroundedSources(items);
-  let answer = await buildGroundedAnswer(question, sources, lang);
+  let answer = await buildGroundedAnswer(question, sources, lang, history);
   // Strip leading refusal sentences the model sometimes still emits
   if (answer) {
     answer = answer
@@ -1506,9 +1507,9 @@ export async function POST(request: Request) {
 
   const topicLabel = displayTopic(q, plugin);
   const now = new Date().toISOString();
-  const remember = (topic: string, intent: string, answerBrief?: string, assistantText?: string) => {
+  const remember = async (topic: string, intent: string, answerBrief?: string, assistantText?: string) => {
     if (plugin.kind === 'greeting') return;
-    setChatMemory(chatId, rawQ, topic, {
+    await setChatMemory(chatId, rawQ, topic, {
       intent,
       answerBrief,
       preferredLang: replyLang,
@@ -1569,7 +1570,7 @@ export async function POST(request: Request) {
               '• Checking again in a few minutes',
             ].join('\n');
     }
-    remember(topicLabel, 'weather', weather?.error || `Live weather for ${weather?.location || topicLabel}`, whatsappText);
+    await remember(topicLabel, 'weather', weather?.error || `Live weather for ${weather?.location || topicLabel}`, whatsappText);
     return Response.json({
       query: q,
       rawQuery: incomingQ,
@@ -1594,7 +1595,7 @@ export async function POST(request: Request) {
         const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
         whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
-      remember(topicLabel, 'gold_price', `Gold $${gold.price}/oz`, whatsappText);
+      await remember(topicLabel, 'gold_price', `Gold $${gold.price}/oz`, whatsappText);
       return Response.json({
         query: q,
         rawQuery: incomingQ,
@@ -1621,7 +1622,7 @@ export async function POST(request: Request) {
         const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
         whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
-      remember(topicLabel, 'crypto_price', `${quote.symbol} $${quote.usd}`, whatsappText);
+      await remember(topicLabel, 'crypto_price', `${quote.symbol} $${quote.usd}`, whatsappText);
       return Response.json({
         query: q,
         rawQuery: incomingQ,
@@ -1647,7 +1648,7 @@ export async function POST(request: Request) {
         const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
         whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
-      remember(
+      await remember(
         topicLabel,
         'fuel_price',
         `WTI $${oil.wtiUsd}${oil.brentUsd ? ` / Brent $${oil.brentUsd}` : ''}`,
@@ -1741,6 +1742,20 @@ export async function POST(request: Request) {
       : 'Note: live Pakistan pump rates are not connected yet. Sharing related oil/fuel coverage.'
     : undefined;
 
+  const combinedHistory: any[] = [];
+  if (resolved.turns) {
+    for (const t of resolved.turns) {
+      combinedHistory.push({ role: t.role, content: t.text });
+    }
+  }
+  for (const t of history) {
+    const role = t.role || 'user';
+    const text = t.content || t.text || '';
+    if (text) {
+      combinedHistory.push({ role, content: text });
+    }
+  }
+
   const built = await buildNewsReply(
     rawQ,
     newsTopicLabel,
@@ -1749,6 +1764,7 @@ export async function POST(request: Request) {
     note,
     Boolean(ranked.usedLatestFallback),
     replyLang,
+    combinedHistory,
   );
   let whatsappText = built.text;
   let sourceButtons = built.sourceButtons;
@@ -1795,11 +1811,11 @@ export async function POST(request: Request) {
 
   const preview = linkPreview(items);
 
-  remember(
+  await remember(
     newsTopicLabel,
     fuelAsk ? 'fuel_price' : 'news',
     built.answer || note || newsTopicLabel,
-    whatsappText,
+    built.answer || note || newsTopicLabel,
   );
   return Response.json({
     query: q,
