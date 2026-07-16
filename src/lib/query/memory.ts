@@ -195,7 +195,7 @@ export function isVagueFollowUp(q: string): boolean {
 
   // Pronoun-heavy / referring short asks
   if (
-    tokensHave(s, ['uska', 'uski', 'iska', 'iski', 'yeh', 'woh', 'us', 'is', 'that', 'this', 'it']) &&
+    tokensHave(s, ['uska', 'uski', 'iska', 'iski', 'yeh', 'woh', 'that', 'this', 'it']) &&
     s.split(/\s+/).length <= 8
   ) {
     return true;
