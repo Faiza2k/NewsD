@@ -150,6 +150,10 @@ const BASE_FEED_SOURCES: FeedSource[] = [
   { id: 'gizmodo', name: 'Gizmodo', url: 'https://gizmodo.com/rss', category: 'tech', subcategories: ['gadgets', 'science'], priority: 3 },
   { id: 'techradar', name: 'TechRadar', url: 'https://www.techradar.com/rss', category: 'tech', subcategories: ['hardware', 'reviews'], priority: 3 },
   { id: 'anandtech', name: 'AnandTech', url: 'https://www.anandtech.com/rss', category: 'tech', subcategories: ['hardware', 'chips'], priority: 4 },
+  { id: 'bleeping-computer', name: 'BleepingComputer', url: 'https://www.bleepingcomputer.com/feed/', category: 'tech', subcategories: ['security', 'vulnerabilities'], priority: 5 },
+  { id: 'the-hacker-news', name: 'The Hacker News', url: 'https://feeds.feedburner.com/TheHackersNews', category: 'tech', subcategories: ['security', 'cve'], priority: 5 },
+  { id: 'krebs-security', name: 'Krebs on Security', url: 'https://krebsonsecurity.com/feed/', category: 'tech', subcategories: ['security', 'breaches'], priority: 4 },
+  { id: 'layoffs-techcrunch', name: 'TechCrunch Layoffs', url: 'https://techcrunch.com/tag/layoffs/feed/', category: 'tech', subcategories: ['layoffs', 'industry'], priority: 4 },
 
   // ─── GitHub & Open Source (8 sources) ───
   { id: 'github-blog', name: 'GitHub Blog', url: 'https://github.blog/feed/', category: 'github', subcategories: ['platform', 'features'], priority: 5 },

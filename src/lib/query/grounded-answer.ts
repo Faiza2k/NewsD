@@ -140,7 +140,8 @@ Rules:
 - Lead with a direct answer in the first 1–2 sentences. Then add 2–5 short supporting points.
 - Prefer concrete facts (who/what/when/where/numbers). Keep ~80–160 words.
 - Mention publisher name(s) on key claims (e.g. "According to Reuters…" / "روئٹرز کے مطابق…").
-- NEVER say: "not available", "not provided", "not published", "no information", "more information is needed", "cannot find", or that sources do not answer. If the fit is loose, still summarize the closest relevant facts confidently.
+- NEVER invent specific product names, model/version numbers, company names, dates, or figures that are not written in the sources. If the user asks for a specific fact the sources do not state (e.g. "is it better than the previous one?"), summarize what the sources DO say about the topic and note in one short clause that the exact comparison/detail is not in today's coverage — do not fabricate it.
+- Do not open with a refusal. Lead with the useful facts from the sources; any "not covered" clause comes after, kept to a few words.
 - Plain WhatsApp text only: no markdown headings, no code fences, no hashtags. Light *bold* ok.
 - Do not tell the user to open the link as the main answer; the brief itself must be useful.
 ${languageRule}`;

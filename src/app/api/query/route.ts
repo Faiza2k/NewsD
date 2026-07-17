@@ -872,8 +872,28 @@ async function retrieveAndRank(
       }));
   }
 
+  const picked = pickDiverse(scored, limit);
+
+  // Relevance gate: soft/category fallbacks (passes 3-4) can select stories that
+  // never mention the actual topic (e.g. "layoffs", "CVE"). If none of the
+  // specific query terms appear in any picked title/description, treat the
+  // result as latest-fallback so the reply is honest instead of a confident
+  // grounded answer about unrelated articles.
+  if (!usedLatestFallback && picked.length) {
+    const meaningful = [
+      ...new Set([...tokens, ...expanded].filter((t) => t.length >= 4 && !GENERIC_QUERY_TOKENS.has(t))),
+    ];
+    if (meaningful.length) {
+      const anyDirect = picked.some((i) => {
+        const hay = `${i.title} ${i.description || ''}`.toLowerCase();
+        return meaningful.some((t) => hay.includes(t));
+      });
+      if (!anyDirect) usedLatestFallback = true;
+    }
+  }
+
   return {
-    items: pickDiverse(scored, limit),
+    items: picked,
     total: scored.length,
     poolSize: fresh.length,
     tokens,
@@ -881,6 +901,13 @@ async function retrieveAndRank(
     usedLatestFallback,
   };
 }
+
+/** Terms too generic to prove an article is actually about the user's topic. */
+const GENERIC_QUERY_TOKENS = new Set([
+  'tech', 'technology', 'technologies', 'news', 'today', 'latest', 'update', 'updates',
+  'new', 'daily', 'announced', 'announcement', 'price', 'prices', 'market', 'markets',
+  'world', 'global', 'breaking', 'report', 'reports', 'story', 'stories', 'about',
+]);
 
 /** Common Whisper/STT mishearings for cities we serve often */
 const CITY_ALIASES: Record<string, string> = {
@@ -1572,6 +1599,21 @@ function linkPreview(items: QueryResultItem[]): LinkPreview | undefined {
 }
 
 export async function POST(request: Request) {
+  try {
+    return await handleQueryPost(request);
+  } catch (err) {
+    // Always return JSON — an HTML 500 crashes channel clients mid-parse.
+    console.error('[query] unhandled error', err);
+    return Response.json({
+      error: 'internal_error',
+      intent: 'error',
+      whatsappText: '*NewsDash Analyst*\n\nSomething went wrong on my side. Please ask again in a moment.',
+      lastUpdated: new Date().toISOString(),
+    });
+  }
+}
+
+async function handleQueryPost(request: Request) {
   const body = (await request.json().catch(() => null)) as QueryRequest | null;
   if (!body || typeof body.q !== 'string' || body.q.trim().length < 1) {
     return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
@@ -1611,10 +1653,12 @@ export async function POST(request: Request) {
   if (rawQ.length < 2) {
     return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
   }
+  // Memory language preference only applies to vague follow-ups — a clear
+  // English (or Urdu) question always answers in its own language.
   let replyLang = resolveReplyLanguage(
     incomingQ,
     rawQ,
-    body.replyLang || body.lang || resolved.preferredLang,
+    body.replyLang || body.lang || (isVagueFollowUp(incomingQ) ? resolved.preferredLang : undefined),
   );
 
   const q = extractTopicQuery(rawQ);

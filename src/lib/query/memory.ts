@@ -126,6 +126,20 @@ function wantsPriceWords(text: string): boolean {
   return /\b(price|rate|keemat|praiz)\b/i.test(text) || /قیمت|ریٹ|پرائز/.test(text);
 }
 
+/**
+ * Strip follow-up decorations we append when resolving (e.g. "X — more detail /
+ * latest update", "Y (related to: X)"). Without this, each vague follow-up
+ * compounds onto lastQ and the session topic drifts within 2-3 turns.
+ */
+function stableAsk(q: string): string {
+  return String(q || '')
+    .replace(/\s*[—-]\s*more detail\s*\/\s*latest update.*$/i, '')
+    .replace(/\s*\((related to|follow-up after):[^)]*\)\s*$/i, '')
+    .replace(/\.\s*User follow-up:.*$/i, '')
+    .replace(/\s*latest details\s*$/i, '')
+    .trim();
+}
+
 export async function setChatMemory(
   chatId: string | undefined | null,
   lastQ: string,
@@ -138,7 +152,9 @@ export async function setChatMemory(
   },
 ): Promise<void> {
   const key = normalizeChatId(chatId) || String(chatId || '').trim();
-  if (!key || !lastQ.trim()) return;
+  const cleanQ = stableAsk(lastQ);
+  if (!key || !cleanQ) return;
+  lastQ = cleanQ;
 
   const prev = await getChatMemory(key);
   const entities = extractEntities(`${lastQ} ${lastTopic}`);
@@ -154,7 +170,7 @@ export async function setChatMemory(
 
   const row: ChatMemory = {
     lastQ: lastQ.trim().slice(0, 400),
-    lastTopic: (lastTopic || lastQ).trim().slice(0, 120),
+    lastTopic: (stableAsk(lastTopic) || lastQ).trim().slice(0, 120),
     lastIntent: extra?.intent || prev?.lastIntent,
     lastEntities: entities.length ? entities : prev?.lastEntities,
     lastAnswerBrief: (extra?.answerBrief || prev?.lastAnswerBrief || '').slice(0, 400),
@@ -202,6 +218,19 @@ export function isVagueFollowUp(q: string): boolean {
       s,
     )
   ) {
+    return true;
+  }
+
+  // "explain more", "elaborate", "expand on it", "describe that"
+  if (/^(explain|elaborate|expand|describe|clarify)(\s+(on|about))?(\s+(more|further|again|it|this|that))*\s*$/i.test(s)) {
+    return true;
+  }
+
+  // Roman Urdu continues: "or batao" (or = aur), "aur batao", "kuch aur", "aur sunao"
+  if (/^(or|aur|phir|acha|achha)\s+(batao|bataen|bata|sunao|sunaen|kuch|aur|kya)(\s+\S+)?$/i.test(s)) {
+    return true;
+  }
+  if (/^(kuch aur|aur kuch|more info|more information|more details?|more news|any more|anything else|what else)\s*$/i.test(s)) {
     return true;
   }
 
@@ -272,6 +301,25 @@ export function needsConversationContext(
 
   // Pure language-switch request with any leftovers
   if (/\b(in english|in urdu|english mein|urdu mein|انگریزی میں|اردو میں)\b/i.test(s)) {
+    return true;
+  }
+
+  // Short existential/auxiliary follow-ups with no named entity of their own:
+  // "is there a demo?", "does it work?", "can I try it?", "are there examples?"
+  if (
+    /^(is|are|was|were|does|do|did|can|could|will|would|has|have|any)\b/i.test(s) &&
+    s.split(/\s+/).filter(Boolean).length <= 7 &&
+    extractEntities(q).length === 0
+  ) {
+    return true;
+  }
+
+  // Short wh-selections referring to the previous answer: "which companies?", "who said that?"
+  if (
+    /^(which|who|whose|whom)\b/i.test(s) &&
+    s.split(/\s+/).filter(Boolean).length <= 5 &&
+    extractEntities(q).length === 0
+  ) {
     return true;
   }
 
@@ -465,7 +513,11 @@ async function resolveEffectiveQueryInternal(args: {
 
   // Fast path: more / detail
   const lower = rawQ.toLowerCase();
-  if (/^(more|aur|zyada|detail|details|continue|go on|batao|update|tell me more|mazeed)\b/i.test(lower)) {
+  if (
+    /^(more|aur|zyada|detail|details|continue|go on|batao|update|tell me more|mazeed)\b/i.test(lower) ||
+    /^(or|aur|phir)\s+(batao|bataen|sunao)\b/i.test(lower) ||
+    /^(explain|elaborate|expand)(\s+(on|about))?(\s+(more|further|again|it|this|that))*\s*$/i.test(lower)
+  ) {
     const base = previousQ || previousTopic;
     return {
       effectiveQ: `${base} — more detail / latest update`,
