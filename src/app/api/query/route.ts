@@ -140,9 +140,41 @@ const LIGHT_EXPAND: Record<string, string[]> = {
   diesel: ['oil', 'crude', 'fuel', 'petroleum'],
   gasoline: ['oil', 'crude', 'fuel', 'petroleum'],
   fuel: ['oil', 'crude', 'petroleum', 'petrol'],
-  ml: ['ai', 'machine learning'],
-  llm: ['ai'],
-  gpt: ['openai', 'ai'],
+  ml: ['machine learning', 'ai', 'model'],
+  llm: ['large language model', 'ai', 'gpt', 'claude', 'gemini'],
+  gpt: ['openai', 'ai', 'chatgpt'],
+  // GitHub / open-source
+  repo: ['repository', 'github', 'open source'],
+  repos: ['repository', 'repositories', 'github'],
+  trending: ['popular', 'top', 'github', 'repository'],
+  opensource: ['open source', 'github', 'repository'],
+  devops: ['docker', 'kubernetes', 'ci/cd', 'cloud', 'deployment'],
+  docker: ['container', 'devops', 'kubernetes'],
+  kubernetes: ['k8s', 'container', 'devops', 'cloud'],
+  // AI / LLM releases
+  gpt5: ['openai', 'gpt', 'ai model'],
+  claude: ['anthropic', 'ai', 'llm'],
+  gemini: ['google', 'ai', 'llm'],
+  llama: ['meta', 'open source', 'llm', 'ai'],
+  mistral: ['llm', 'ai', 'open source'],
+  // Framework / dev tools
+  nextjs: ['next.js', 'react', 'javascript', 'framework'],
+  react: ['javascript', 'framework', 'frontend'],
+  typescript: ['javascript', 'programming', 'developer'],
+  rust: ['programming', 'language', 'system'],
+  nodejs: ['node', 'javascript', 'backend'],
+  python: ['programming', 'language', 'developer'],
+  // Layoffs / jobs
+  layoffs: ['fired', 'job cuts', 'redundancy', 'tech layoffs', 'downsizing'],
+  layoff: ['fired', 'job cuts', 'tech layoffs'],
+  hiring: ['jobs', 'recruitment', 'engineering jobs'],
+  // Cybersecurity / CVE
+  cve: ['vulnerability', 'security', 'exploit', 'patch'],
+  vulnerability: ['cve', 'exploit', 'security', 'breach'],
+  breach: ['hack', 'security', 'data leak', 'cyberattack'],
+  hack: ['breach', 'security', 'cyberattack', 'exploit'],
+  ransomware: ['malware', 'security', 'cyberattack', 'breach'],
+  malware: ['virus', 'security', 'exploit', 'ransomware'],
   war: ['conflict', 'strike', 'attack', 'military', 'invasion', 'bombing'],
   wars: ['war', 'conflict', 'strike', 'attack'],
   jung: ['war', 'conflict', 'strike', 'attack', 'military', 'invasion'],
@@ -422,6 +454,73 @@ function detectPlugin(q: string): Plugin {
   }
 
   return { kind: 'news' };
+}
+
+/** Auto-detect professional domain for category-pinned retrieval. */
+type DomainHint = { category: string; searchOverride: string; topicLabel: string } | null;
+function detectDomainHint(q: string): DomainHint {
+  const s = clean(q);
+
+  // GitHub / Open-source / DevOps
+  if (
+    /\b(github|trending repo|trending repos|open.?source|repository|repositories|devops|docker|kubernetes|k8s|npm package|open source project|hacker news|hackernews|lobster|infoq)\b/i.test(s)
+  ) {
+    const isDevOps = /\b(docker|kubernetes|k8s|devops|ci.?cd|deployment|container)\b/i.test(s);
+    return {
+      category: 'github',
+      searchOverride: isDevOps
+        ? 'docker kubernetes devops ci/cd cloud deployment container'
+        : s.includes('hacker') ? 'hacker news tech'
+        : 'github open source trending repository developer tools',
+      topicLabel: isDevOps ? 'DevOps & Cloud' : 'GitHub & Open Source',
+    };
+  }
+
+  // AI / LLM model releases
+  if (
+    /\b(llm|large language model|gpt-?[45]|claude [34]|gemini [12]|llama [23]|mistral|grok|qwen|deepseek|phi-?[234]|new model|ai model|model release|model launch|foundation model|open source llm)\b/i.test(s)
+  ) {
+    return {
+      category: 'ai',
+      searchOverride: 'AI model release LLM GPT Claude Gemini Llama open source',
+      topicLabel: 'AI / LLM Releases',
+    };
+  }
+
+  // Framework / Developer tools releases
+  if (
+    /\b(next\.?js|react [0-9]+|vue [0-9]+|angular [0-9]+|svelte|bun|deno|node\.?js|typescript [0-9]+|python [0-9]+|rust [0-9]+|django|fastapi|laravel|rails|framework release|sdk release|library release|vs.?code|visual studio|jetbrains|github copilot)\b/i.test(s)
+  ) {
+    return {
+      category: 'github',
+      searchOverride: 'developer tools framework release update programming language',
+      topicLabel: 'Dev Tools & Framework Releases',
+    };
+  }
+
+  // Tech layoffs / job market
+  if (
+    /\b(layoffs?|laid off|job cuts?|fired engineers?|tech jobs?|hiring freeze|redundanc|reorg|workforce reduction|engineers? job|software jobs?|remote jobs?)\b/i.test(s)
+  ) {
+    return {
+      category: 'tech',
+      searchOverride: 'tech layoffs job cuts engineers fired hiring technology workforce',
+      topicLabel: 'Tech Jobs & Layoffs',
+    };
+  }
+
+  // Cybersecurity / CVE alerts
+  if (
+    /\b(cve|vulnerability|vulnerabilities|zero.?day|exploit|ransomware|malware|data breach|cyberattack|cyber attack|phishing|ddos|security flaw|patch tuesday|nvd|mitre|owasp|infosec|hack(ed|ing)?|breach(ed)?)\b/i.test(s)
+  ) {
+    return {
+      category: 'tech',
+      searchOverride: 'cybersecurity vulnerability CVE exploit breach ransomware malware security',
+      topicLabel: 'Cybersecurity & CVE Alerts',
+    };
+  }
+
+  return null;
 }
 
 function displayTopic(q: string, plugin: Plugin): string {
@@ -1745,19 +1844,28 @@ export async function POST(request: Request) {
     baseSearch = `${plan?.searchQuery || 'oil crude petroleum fuel gasoline'} oil crude petroleum fuel opec diesel`;
   }
 
+  // Professional domain auto-detection: pin category + override search for precision.
+  const domainHint = plugin.kind === 'news' && !fuelAsk ? detectDomainHint(rawQ) : null;
+  let pinnedCategories: string[] | undefined = body.categories?.length ? body.categories : undefined;
+  if (domainHint) {
+    baseSearch = domainHint.searchOverride;
+    pinnedCategories = [domainHint.category] as string[];
+  }
+
   const preferFresh =
     plan?.preferFreshHours ??
     (/\b(today|latest|now|breaking|just\s+in|aaj)\b/i.test(rawQ) ? 24 : null);
 
   const newsTopicLabel =
-    plugin.kind === 'news' && plan?.displayTopic
+    domainHint?.topicLabel ??
+    (plugin.kind === 'news' && plan?.displayTopic
       ? plan.displayTopic
-      : topicLabel;
+      : topicLabel);
 
   const ranked = await retrieveAndRank(
     baseSearch,
     limit,
-    body.categories && body.categories.length ? body.categories : undefined,
+    pinnedCategories as import('@/types').Category[] | undefined,
     preferFresh,
   );
 
