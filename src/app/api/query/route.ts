@@ -965,13 +965,14 @@ async function retrieveAndRank(
   // result as latest-fallback so the reply is honest instead of a confident
   // grounded answer about unrelated articles.
   if (!usedLatestFallback && picked.length) {
-    const meaningful = [
-      ...new Set([...tokens, ...expanded].filter((t) => t.length >= 4 && !GENERIC_QUERY_TOKENS.has(t))),
-    ];
-    if (meaningful.length) {
+    // Gate only on the user's OWN specific terms — synonym expansions of a
+    // generic word ("tech" → "software") must not make a generic ask strict.
+    const meaningfulBase = tokens.filter((t) => t.length >= 4 && !GENERIC_QUERY_TOKENS.has(t));
+    if (meaningfulBase.length) {
+      const probes = [...new Set(expandTokens(meaningfulBase))].filter((t) => t.length >= 4);
       const anyDirect = picked.some((i) => {
         const hay = `${i.title} ${i.description || ''}`.toLowerCase();
-        return meaningful.some((t) => hay.includes(t));
+        return probes.some((t) => hay.includes(t));
       });
       if (!anyDirect) usedLatestFallback = true;
     }
@@ -1826,6 +1827,23 @@ async function handleQueryPost(request: Request) {
     else if (stickyIntent === 'gold_price') plugin = { kind: 'gold_price' };
     else if (stickyIntent === 'crypto_price') {
       plugin = { kind: 'crypto_price', cryptoId: 'bitcoin' };
+    } else if (stickyIntent === 'weather') {
+      // "and lahore?" after "weather in karachi" — a bare place name
+      // continues the weather thread instead of falling into news search.
+      const cityGuess = incomingQ
+        .toLowerCase()
+        .replace(/\b(and|aur|or|what about|how about|weather|mosam|mausam|in|ka|ki|ke|mein|about|the)\b/gi, ' ')
+        .replace(/[^a-z\s]/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const notCity = /^(kyun|why|kab|when|how|kaisa|kya|ok|okay|more|batao|it|this|that|there|now|today)$/;
+      if (
+        cityGuess.length >= 3 &&
+        cityGuess.split(' ').length <= 3 &&
+        !cityGuess.split(' ').some((w) => notCity.test(w))
+      ) {
+        plugin = { kind: 'weather', city: normalizeCityQuery(cityGuess), cityAsked: true };
+      }
     }
   }
 
