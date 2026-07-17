@@ -922,11 +922,38 @@ async function retrieveAndRank(
   // brings NEW coverage (often from other sources). Only when enough unseen
   // items remain — repeating is still better than an empty reply.
   if (opts?.excludeUrls?.size && scored.length) {
-    const unseen = scored.filter((i) => !opts.excludeUrls!.has(i.url));
+    const seen = opts.excludeUrls;
+    let unseen = scored.filter((i) => !seen.has(i.url));
+    if (unseen.length < limit) {
+      // Strict scoring can leave zero unseen matches (all top stories already
+      // shown). Widen with soft topical matches from the rest of the pool so
+      // "more" still brings NEW coverage instead of repeating.
+      const already = new Set(scored.map((i) => i.url));
+      const soft = [...new Set([...tokens, ...expanded])].filter((t) => t.length >= 4);
+      const extras = fresh
+        .filter((i) => {
+          if (seen.has(i.url) || already.has(i.url)) return false;
+          const hay = `${i.title} ${i.description || ''}`;
+          return opts.mustMatch
+            ? opts.mustMatch.test(hay)
+            : soft.some((t) => hay.toLowerCase().includes(t));
+        })
+        .slice(0, limit * 3)
+        .map(
+          (i) =>
+            ({
+              ...i,
+              matchScore: 7,
+              score: 7 + Math.min(2, i.significance / 5) + freshnessBonus(i.publishedAt),
+              matchedTerms: ['related'],
+            }) as QueryResultItem,
+        );
+      unseen = [...unseen, ...extras];
+    }
     if (unseen.length >= Math.min(limit, 2)) {
       scored = unseen;
     } else if (unseen.length) {
-      scored = [...unseen, ...scored.filter((i) => opts.excludeUrls!.has(i.url))];
+      scored = [...unseen, ...scored.filter((i) => seen.has(i.url))];
     }
   }
 
@@ -967,6 +994,7 @@ const GENERIC_QUERY_TOKENS = new Set([
   'world', 'global', 'breaking', 'report', 'reports', 'story', 'stories', 'about',
   'more', 'detail', 'details', 'info', 'information', 'explain', 'follow', 'user',
   'question', 'prior', 'batao', 'bataen', 'sunao', 'mazeed',
+  'khabrein', 'khabren', 'khabar', 'khabrain', 'akhbar', 'khabarein', 'aaj', 'kal',
 ]);
 
 /** Common Whisper/STT mishearings for cities we serve often */
@@ -1887,12 +1915,28 @@ async function handleQueryPost(request: Request) {
       body: bodies[i] || s.body || s.title,
     }));
     const question = stableAsk(rawQ) || rawQ;
+    const sameAsPrev = (a: string) => {
+      const prev = (resolved.lastAnswer || '').toLowerCase();
+      if (!prev) return false;
+      const words = a.toLowerCase().match(/[a-z\u0600-\u06FF]{5,}/g) || [];
+      if (!words.length) return false;
+      const hits = words.filter((w) => prev.includes(w)).length;
+      return hits / words.length > 0.85;
+    };
     let answer = await buildGroundedAnswer(question, sources, replyLang, undefined, {
       previousAnswer: resolved.lastAnswer,
       focusAsk: incomingQ,
     });
-    if (!answer || answer.length < WA_ANSWER_MIN) {
-      answer = buildExtractiveAnswer(question, sources, replyLang);
+    if (!answer || answer.length < WA_ANSWER_MIN || sameAsPrev(answer)) {
+      // Extractive fallback: rotate to the later sources so the user gets
+      // material beyond what the first answer already quoted.
+      const rotated = sources.length > 1 ? [...sources.slice(1), sources[0]] : sources;
+      const extractive = buildExtractiveAnswer(question, rotated, replyLang);
+      if (!answer || answer.length < WA_ANSWER_MIN) {
+        answer = extractive;
+      } else if (sameAsPrev(answer) && !sameAsPrev(extractive)) {
+        answer = extractive;
+      }
     }
     const srcItems = evidenceSources as unknown as QueryResultItem[];
     const displayUrls = await Promise.all(evidenceSources.map((s) => shortenArticleUrl(s.url)));

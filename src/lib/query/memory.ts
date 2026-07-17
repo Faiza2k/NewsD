@@ -266,6 +266,9 @@ export function isVagueFollowUp(q: string): boolean {
   if (/^(go deeper|deeper|in depth|wazahat karo|tafseel (batao|se batao)|samjhao)\s*$/i.test(s)) {
     return true;
   }
+  if (/^what (should|can|do|would) (i|we|you) do( now| next| about (it|this|that))?\s*\??$/i.test(s)) {
+    return true;
+  }
 
   // Language preference only: "in English", "urdu mein", "in urdu"
   if (/^(in\s+)?(english|urdu|roman(\s+urdu)?|اردو)(\s+mein|\s+me)?$/i.test(s)) {
@@ -465,6 +468,10 @@ export function isElaborateFollowUp(q: string): boolean {
   ) {
     return true;
   }
+  // "what should I do?" after a security/news answer = advice on same topic
+  if (/^what (should|can|do|would) (i|we|you) do( now| next| about (it|this|that))?$/.test(s)) {
+    return true;
+  }
   // "explain the risk", "describe the impact" — short, no named entity of its own
   if (
     /^(explain|describe|clarify|summarize|summarise)\s+(the\s+)?[a-z]+(\s+[a-z]+)?$/.test(s) &&
@@ -640,6 +647,27 @@ async function resolveEffectiveQueryInternal(args: {
 
   // Elaborate: user wants deeper detail on the SAME answer/articles.
   if (isElaborateFollowUp(rawQ) && (previousQ || previousTopic)) {
+    return {
+      effectiveQ: previousQ || previousTopic,
+      usedMemory: true,
+      needsClarify: false,
+      preferredLang: langPref || memory?.preferredLang,
+      memoryIntent: previousIntent || undefined,
+      followUpKind: 'elaborate',
+    };
+  }
+
+  // Short pronoun/auxiliary questions about the previous answer ("is it
+  // better than the previous one?", "who made it?", "is there a demo?")
+  // are also elaborations — answer from the SAME evidence, don't re-search.
+  const lowerRaw = rawQ.toLowerCase();
+  if (
+    (previousQ || previousTopic) &&
+    /^(is|are|was|were|does|do|did|can|could|will|would|has|have|why|how|who)\b/i.test(lowerRaw) &&
+    /\b(it|this|that|these|those|one|its|there)\b/i.test(lowerRaw) &&
+    lowerRaw.split(/\s+/).filter(Boolean).length <= 10 &&
+    extractEntities(rawQ).length === 0
+  ) {
     return {
       effectiveQ: previousQ || previousTopic,
       usedMemory: true,

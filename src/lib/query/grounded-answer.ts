@@ -413,6 +413,8 @@ export function buildExtractiveAnswer(
     let body = (s.body || '').replace(/\s+/g, ' ').trim();
     if (
       /\b(toggle mega menu|subscribe to newsletter|cookie policy)\b/i.test(body) ||
+      // byline/nav soup with an embedded timestamp ("... Jul 16, 2026 6:17 PM ...")
+      /\b[A-Z][a-z]{2,8} \d{1,2}, 20\d{2},? \d{1,2}:\d{2} ?(AM|PM)\b/.test(body) ||
       (body.match(/\$\d/g) || []).length > 8
     ) {
       body = s.title;
