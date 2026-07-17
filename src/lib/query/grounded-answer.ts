@@ -141,6 +141,7 @@ Rules:
 - Prefer concrete facts (who/what/when/where/numbers). Keep ~80–160 words.
 - Mention publisher name(s) on key claims (e.g. "According to Reuters…" / "روئٹرز کے مطابق…").
 - NEVER invent specific product names, model/version numbers, company names, dates, or figures that are not written in the sources. If the user asks for a specific fact the sources do not state (e.g. "is it better than the previous one?"), summarize what the sources DO say about the topic and note in one short clause that the exact comparison/detail is not in today's coverage — do not fabricate it.
+- NEVER assert that something did NOT happen or was NOT announced (e.g. "there are no layoffs today", "no new CVEs were found") — you only see a small slice of coverage. Report what the sources actually say instead.
 - Do not open with a refusal. Lead with the useful facts from the sources; any "not covered" clause comes after, kept to a few words.
 - Plain WhatsApp text only: no markdown headings, no code fences, no hashtags. Light *bold* ok.
 - Do not tell the user to open the link as the main answer; the brief itself must be useful.
@@ -248,6 +249,34 @@ No markdown, no extra keys.`,
   }
 }
 
+/**
+ * Detect version-like tokens in the answer (e.g. "GPT-5.6", "Llama 4") that
+ * appear in neither the sources nor the user's question — a hard signal the
+ * model fabricated a product/version. Normalized (lowercase, no spaces/dashes)
+ * substring check keeps false rejects rare.
+ */
+function fabricatedVersionTokens(
+  answer: string,
+  question: string,
+  sources: GroundedSource[],
+): string[] {
+  const corpus = (
+    question +
+    ' ' +
+    sources.map((s) => `${s.title} ${s.body || ''}`).join(' ')
+  )
+    .toLowerCase()
+    .replace(/[\s\u200b\u200c\u200d\ufeff_-]+/g, '');
+  const bad = new Set<string>();
+  const re =
+    /\b(gpt[\s-]?\d+(?:\.\d+)?[a-z]{0,6}|claude[\s-]?\d+(?:\.\d+)?|gemini[\s-]?\d+(?:\.\d+)?|llama[\s-]?\d+(?:\.\d+)?|grok[\s-]?\d+(?:\.\d+)?|[a-z]{2,}[\s-]?\d+\.\d+(?:\.\d+)?)\b/gi;
+  for (const m of answer.matchAll(re)) {
+    const norm = m[1].toLowerCase().replace(/[\s_-]+/g, '');
+    if (!corpus.includes(norm)) bad.add(m[1]);
+  }
+  return [...bad];
+}
+
 /** Groq grounded brief; returns null on failure / empty. */
 export async function buildGroundedAnswer(
   question: string,
@@ -293,6 +322,13 @@ export async function buildGroundedAnswer(
       .replace(/\*\*([^*]+)\*\*/g, '*$1*')
       .trim();
     if (cleaned.length < 40) return null;
+    const fabricated = fabricatedVersionTokens(cleaned, question, usable);
+    if (fabricated.length) {
+      // Model invented a product/version not present in sources — reject so
+      // the caller falls back to the extractive (never-inventing) answer.
+      console.warn('[grounded] rejected answer with fabricated tokens:', fabricated.join(', '));
+      return null;
+    }
     return cleaned;
   } catch {
     return null;

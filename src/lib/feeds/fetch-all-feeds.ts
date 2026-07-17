@@ -60,11 +60,16 @@ async function fetchSingleFeed(source: (typeof FEED_SOURCES)[number]): Promise<N
 
     for (const item of (feed.items || []).slice(0, MAX_ITEMS_PER_FEED)) {
       const rssItem = item as RSSItem;
-      const title = rssItem.title?.trim() || '';
-      const description =
-        rssItem.contentSnippet?.trim() ||
-        rssItem.content?.replace(/<[^>]*>/g, '').trim() ||
-        '';
+      // Strip zero-width/invisible chars (BOM, ZWSP, soft hyphen) some feeds
+      // embed in titles — they render as mojibake on WhatsApp/Discord.
+      const stripInvisible = (s: string) =>
+        s.replace(/[\u200B-\u200F\u2060\uFEFF\u00AD]/g, '').replace(/\s+/g, ' ').trim();
+      const title = stripInvisible(rssItem.title || '');
+      const description = stripInvisible(
+        rssItem.contentSnippet ||
+          rssItem.content?.replace(/<[^>]*>/g, '') ||
+          '',
+      );
       const url = rssItem.link || '';
 
       // Never fabricate freshness: require a real, verifiable publish date.

@@ -15,6 +15,8 @@ export type ChatMemory = {
   lastEntities?: string[];
   lastAnswerBrief?: string;
   preferredLang?: ReplyLanguage;
+  /** Article URLs already sent to this chat — used to avoid repeating the same stories on "more". */
+  shownUrls?: string[];
   turns: MemoryTurn[];
   updatedAt: number;
 };
@@ -131,7 +133,7 @@ function wantsPriceWords(text: string): boolean {
  * latest update", "Y (related to: X)"). Without this, each vague follow-up
  * compounds onto lastQ and the session topic drifts within 2-3 turns.
  */
-function stableAsk(q: string): string {
+export function stableAsk(q: string): string {
   return String(q || '')
     .replace(/\s*[—-]\s*more detail\s*\/\s*latest update.*$/i, '')
     .replace(/\s*\((related to|follow-up after):[^)]*\)\s*$/i, '')
@@ -149,6 +151,7 @@ export async function setChatMemory(
     answerBrief?: string;
     preferredLang?: ReplyLanguage;
     assistantText?: string;
+    shownUrls?: string[];
   },
 ): Promise<void> {
   const key = normalizeChatId(chatId) || String(chatId || '').trim();
@@ -168,6 +171,12 @@ export async function setChatMemory(
     });
   }
 
+  // Keep a rolling window of already-shown article URLs so follow-ups
+  // ("more", "aur batao") surface NEW stories instead of repeating.
+  const shownUrls = [...(prev?.shownUrls || []), ...(extra?.shownUrls || [])]
+    .filter((u, i, arr) => u && arr.indexOf(u) === i)
+    .slice(-40);
+
   const row: ChatMemory = {
     lastQ: lastQ.trim().slice(0, 400),
     lastTopic: (stableAsk(lastTopic) || lastQ).trim().slice(0, 120),
@@ -175,6 +184,7 @@ export async function setChatMemory(
     lastEntities: entities.length ? entities : prev?.lastEntities,
     lastAnswerBrief: (extra?.answerBrief || prev?.lastAnswerBrief || '').slice(0, 400),
     preferredLang: extra?.preferredLang || prev?.preferredLang,
+    shownUrls,
     turns: turns.slice(-MAX_TURNS),
     updatedAt: Date.now(),
   };
@@ -323,6 +333,31 @@ export function needsConversationContext(
     return true;
   }
 
+  // Quantity follow-ups about the previous answer: "how many employees are affected?"
+  if (
+    /^how (many|much)\b/i.test(s) &&
+    s.split(/\s+/).filter(Boolean).length <= 8 &&
+    extractEntities(q).length === 0
+  ) {
+    return true;
+  }
+
+  // Explain/describe asks without a topic of their own: "explain the risk", "describe the changes"
+  if (
+    /^(explain|describe|elaborate|clarify|summarize|summarise)\b/i.test(s) &&
+    s.split(/\s+/).filter(Boolean).length <= 6 &&
+    extractEntities(q).length === 0
+  ) {
+    return true;
+  }
+
+  // Ordinal references to listed items: "tell me about the first one", "the second story"
+  if (
+    /\b(first|second|third|fourth|last|1st|2nd|3rd)\s+(one|item|story|article|source|repo|news|headline)\b/i.test(s)
+  ) {
+    return true;
+  }
+
   // Comparative follow-ups after a live price thread
   const liveIntent = memory?.lastIntent || '';
   if (
@@ -378,6 +413,8 @@ export type ResolvedQuery = {
   preferredLang?: ReplyLanguage;
   memoryIntent?: string;
   turns?: MemoryTurn[];
+  /** Article URLs already sent in this chat — exclude on follow-ups so "more" brings new stories. */
+  shownUrls?: string[];
 };
 
 function historyToText(history?: HistoryTurn[] | null): string {
@@ -405,6 +442,9 @@ export async function resolveEffectiveQuery(args: {
   const memory = await getChatMemory(args.chatId);
   if (memory?.turns) {
     result.turns = memory.turns;
+  }
+  if (memory?.shownUrls?.length) {
+    result.shownUrls = memory.shownUrls;
   }
   return result;
 }

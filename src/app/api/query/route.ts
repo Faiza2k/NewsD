@@ -17,12 +17,24 @@ import {
   normalizeChatId,
   resolveEffectiveQuery,
   setChatMemory,
+  stableAsk,
   type HistoryTurn,
 } from '@/lib/query/memory';
 import type { Category, NewsItem } from '@/types';
+import { getRedisClient } from '@/lib/kv/redis';
 
 
 export const dynamic = 'force-dynamic';
+
+// A single stray rejected promise (feed fetch, URL shortener, …) must never
+// crash the whole serverless instance — that produced clusters of HTML 500s.
+const rejectionGuard = globalThis as typeof globalThis & { __newsdashRejectionGuard?: boolean };
+if (!rejectionGuard.__newsdashRejectionGuard && typeof process?.on === 'function') {
+  rejectionGuard.__newsdashRejectionGuard = true;
+  process.on('unhandledRejection', (err) => {
+    console.error('[query] unhandled rejection (suppressed)', err);
+  });
+}
 
 /**
  * Universal NewsDash query brain:
@@ -457,7 +469,13 @@ function detectPlugin(q: string): Plugin {
 }
 
 /** Auto-detect professional domain for category-pinned retrieval. */
-type DomainHint = { category: string; searchOverride: string; topicLabel: string } | null;
+type DomainHint = {
+  category: string;
+  searchOverride: string;
+  topicLabel: string;
+  /** Items must literally match this or we serve the honest latest-fallback. */
+  mustMatch?: RegExp;
+} | null;
 function detectDomainHint(q: string): DomainHint {
   const s = clean(q);
 
@@ -506,6 +524,7 @@ function detectDomainHint(q: string): DomainHint {
       category: 'tech',
       searchOverride: 'tech layoffs job cuts engineers fired hiring technology workforce',
       topicLabel: 'Tech Jobs & Layoffs',
+      mustMatch: /\b(layoffs?|laid off|lay off|job cuts?|jobs? cut|workforce reduction|redundanc\w*|downsizing|fires?d? \d|cutting \d+[,\d]* (jobs|roles|positions)|hiring freeze)\b/i,
     };
   }
 
@@ -517,6 +536,7 @@ function detectDomainHint(q: string): DomainHint {
       category: 'tech',
       searchOverride: 'cybersecurity vulnerability CVE exploit breach ransomware malware security',
       topicLabel: 'Cybersecurity & CVE Alerts',
+      mustMatch: /\b(cve-?\d*|vulnerabilit\w*|zero.?day|exploit\w*|ransomware|malware|breach\w*|cyber.?attack|phishing|ddos|patch(es|ed)?|security (flaw|hole|bug|update)|hack(ed|ers?|ing)?|infosec|threat actor)\b/i,
     };
   }
 
@@ -731,6 +751,12 @@ async function retrieveAndRank(
   limit: number,
   categories?: Category[],
   preferFreshHours?: number | null,
+  opts?: {
+    /** URLs already shown to this chat — skipped when newer coverage exists so "more" never repeats. */
+    excludeUrls?: Set<string>;
+    /** Hard topical gate (from domain hints): items must match or we fall back honestly. */
+    mustMatch?: RegExp;
+  },
 ): Promise<{
   items: QueryResultItem[];
   total: number;
@@ -752,7 +778,10 @@ async function retrieveAndRank(
 
   if (!tokens.length) {
     // Still serve freshest headlines rather than refusing
-    const latest = [...fresh]
+    const pool = opts?.excludeUrls?.size
+      ? fresh.filter((i) => !opts.excludeUrls!.has(i.url)) 
+      : fresh;
+    const latest = [...(pool.length ? pool : fresh)]
       .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime())
       .slice(0, Math.max(limit * 4, 12))
       .map((i) => ({
@@ -857,8 +886,23 @@ async function retrieveAndRank(
       .sort((a, b) => b.score - a.score);
   }
 
-  // Pass 5: never return empty when the feed pool has stories — serve freshest as best available
+  // Hard topical gate for domain-hint searches (layoffs, CVE, …): the broad
+  // keyword override can match stories that never mention the actual topic.
+  // Only keep items that literally cover it; otherwise fall through to the
+  // honest latest-fallback path instead of grounding on unrelated articles.
   let usedLatestFallback = false;
+  if (opts?.mustMatch && scored.length) {
+    const direct = scored.filter((i) =>
+      opts.mustMatch!.test(`${i.title} ${i.description || ''}`),
+    );
+    if (direct.length) {
+      scored = direct;
+    } else {
+      scored = [];
+    }
+  }
+
+  // Pass 5: never return empty when the feed pool has stories — serve freshest as best available
   if (!scored.length && fresh.length) {
     usedLatestFallback = true;
     scored = [...fresh]
@@ -870,6 +914,18 @@ async function retrieveAndRank(
         score: 6 + Math.min(2, i.significance / 5) + freshnessBonus(i.publishedAt),
         matchedTerms: ['latest'],
       }));
+  }
+
+  // Variety on follow-ups: skip stories this chat has already seen so "more"
+  // brings NEW coverage (often from other sources). Only when enough unseen
+  // items remain — repeating is still better than an empty reply.
+  if (opts?.excludeUrls?.size && scored.length) {
+    const unseen = scored.filter((i) => !opts.excludeUrls!.has(i.url));
+    if (unseen.length >= Math.min(limit, 2)) {
+      scored = unseen;
+    } else if (unseen.length) {
+      scored = [...unseen, ...scored.filter((i) => opts.excludeUrls!.has(i.url))];
+    }
   }
 
   const picked = pickDiverse(scored, limit);
@@ -907,6 +963,8 @@ const GENERIC_QUERY_TOKENS = new Set([
   'tech', 'technology', 'technologies', 'news', 'today', 'latest', 'update', 'updates',
   'new', 'daily', 'announced', 'announcement', 'price', 'prices', 'market', 'markets',
   'world', 'global', 'breaking', 'report', 'reports', 'story', 'stories', 'about',
+  'more', 'detail', 'details', 'info', 'information', 'explain', 'follow', 'user',
+  'question', 'prior', 'batao', 'bataen', 'sunao', 'mazeed',
 ]);
 
 /** Common Whisper/STT mishearings for cities we serve often */
@@ -1138,6 +1196,29 @@ function isFuelStory(item: Pick<NewsItem, 'title' | 'description'>): boolean {
   );
 }
 
+/**
+ * A live-price question (gold/bitcoin/…) must never be grounded on stories
+ * that merely share a keyword (e.g. the arXiv "Gold Path" paper). Only keep
+ * items that are actually about the asset or its market.
+ */
+function isAssetStory(
+  item: Pick<NewsItem, 'title' | 'description'>,
+  kind: 'gold' | 'crypto',
+  cryptoId?: string,
+): boolean {
+  const hay = `${item.title} ${item.description || ''}`.toLowerCase();
+  if (kind === 'gold') {
+    return /\b(gold|xau|bullion|precious metals?|سونا|سونے)\b/i.test(hay);
+  }
+  const asset =
+    cryptoId === 'ethereum'
+      ? /\b(ethereum|ether|eth)\b/i
+      : cryptoId === 'solana'
+        ? /\b(solana|sol)\b/i
+        : /\b(bitcoin|btc)\b/i;
+  return asset.test(hay) || /\b(crypto|cryptocurrency|stablecoin|digital asset)\b/i.test(hay);
+}
+
 function localizedTopicLabel(label: string, lang: ReplyLanguage): string {
   if (lang !== 'ur') return label;
   const map: Record<string, string> = {
@@ -1288,6 +1369,22 @@ async function buildNewsReply(
   }
 
   if (!items.length) {
+    // Live-price ask with no relevant news: the quote alone is a complete answer.
+    if (liveQuoteText) {
+      const answerLabel = lang === 'ur' ? '*جواب:*' : '*Answer:*';
+      const tail =
+        lang === 'ur'
+          ? 'اس وقت فیڈز میں اس پر کوئی براہِ راست خبر نہیں — اوپر تازہ لائیو ریٹ ہے۔'
+          : 'No directly related news in the feeds right now — the live rate above is the freshest data.';
+      parts.push('', answerLabel, liveQuoteText, tail);
+      return {
+        text: parts.join('\n'),
+        answer: liveQuoteText,
+        sources: [],
+        sourceButtons: [],
+        displayUrls: [],
+      };
+    }
     // Only when the whole feed pool is empty (syncing). Never claim the topic was "not published".
     const syncing =
       lang === 'ur'
@@ -1661,7 +1758,9 @@ async function handleQueryPost(request: Request) {
     body.replyLang || body.lang || (isVagueFollowUp(incomingQ) ? resolved.preferredLang : undefined),
   );
 
-  const q = extractTopicQuery(rawQ);
+  // Strip follow-up decorations ("— more detail / latest update", "User follow-up: …")
+  // before tokenizing, so retrieval ranks on the real topic, not filler words.
+  const q = extractTopicQuery(stableAsk(rawQ));
   const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT_MAX);
   let plugin = detectPlugin(q);
 
@@ -1698,13 +1797,20 @@ async function handleQueryPost(request: Request) {
 
   const topicLabel = displayTopic(q, plugin);
   const now = new Date().toISOString();
-  const remember = async (topic: string, intent: string, answerBrief?: string, assistantText?: string) => {
+  const remember = async (
+    topic: string,
+    intent: string,
+    answerBrief?: string,
+    assistantText?: string,
+    shownUrls?: string[],
+  ) => {
     if (plugin.kind === 'greeting') return;
     await setChatMemory(chatId, rawQ, topic, {
       intent,
       answerBrief,
       preferredLang: replyLang,
       assistantText,
+      shownUrls,
     });
   };
 
@@ -1906,14 +2012,27 @@ async function handleQueryPost(request: Request) {
       ? plan.displayTopic
       : topicLabel);
 
+  // On memory follow-ups, exclude stories the chat has already seen so "more"
+  // surfaces new articles (usually from other sources) instead of repeating.
+  const excludeUrls =
+    resolved.usedMemory && resolved.shownUrls?.length
+      ? new Set(resolved.shownUrls)
+      : undefined;
+
   const ranked = await retrieveAndRank(
     baseSearch,
     limit,
     pinnedCategories as import('@/types').Category[] | undefined,
     preferFresh,
+    { excludeUrls, mustMatch: domainHint?.mustMatch },
   );
 
   let items = ranked.items;
+  if (plugin.kind === 'gold_price') {
+    items = items.filter((i) => isAssetStory(i, 'gold'));
+  } else if (plugin.kind === 'crypto_price') {
+    items = items.filter((i) => isAssetStory(i, 'crypto', plugin.cryptoId));
+  }
   if (fuelAsk || plugin.kind === 'fuel_price') {
     let fuelish = items.filter(isFuelStory);
     if (!fuelish.length) {
@@ -2043,7 +2162,13 @@ async function handleQueryPost(request: Request) {
     : plugin.kind === 'crypto_price' ? 'crypto_price'
     : 'news';
   const answerBrief = (built.answer || note || newsTopicLabel).split(/[.!?]/)[0].trim().slice(0, 200);
-  await remember(newsTopicLabel, savedIntent, answerBrief, built.answer || note || newsTopicLabel);
+  await remember(
+    newsTopicLabel,
+    savedIntent,
+    answerBrief,
+    built.answer || note || newsTopicLabel,
+    items.map((i) => i.url).filter(isValidArticleUrl),
+  );
   return Response.json({
     query: q,
     rawQuery: incomingQ,
@@ -2060,6 +2185,7 @@ async function handleQueryPost(request: Request) {
     linkPreview: preview,
     linkPreviewEnabled: true,
     usedMemory: resolved.usedMemory,
+    memoryBackend: getRedisClient() ? 'redis' : 'in-process',
     lastUpdated: now,
   });
 }
