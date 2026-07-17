@@ -1885,18 +1885,19 @@ export async function POST(request: Request) {
 
   const preview = linkPreview(items);
 
-  await remember(
-    newsTopicLabel,
-    fuelAsk ? 'fuel_price' : 'news',
-    built.answer || note || newsTopicLabel,
-    built.answer || note || newsTopicLabel,
-  );
+  const savedIntent =
+    fuelAsk ? 'fuel_price'
+    : plugin.kind === 'gold_price' ? 'gold_price'
+    : plugin.kind === 'crypto_price' ? 'crypto_price'
+    : 'news';
+  const answerBrief = (built.answer || note || newsTopicLabel).split(/[.!?]/)[0].trim().slice(0, 200);
+  await remember(newsTopicLabel, savedIntent, answerBrief, built.answer || note || newsTopicLabel);
   return Response.json({
     query: q,
     rawQuery: incomingQ,
     effectiveQuery: rawQ,
     displayTopic: newsTopicLabel,
-    intent: fuelAsk ? 'unsupported_live' : 'news',
+    intent: savedIntent,
     terms: { primary: ranked.tokens, expanded: ranked.expanded },
     brief: built.answer || note || (items.length ? 'Matching stories from NewsDash.' : 'No strong match.'),
     items,
