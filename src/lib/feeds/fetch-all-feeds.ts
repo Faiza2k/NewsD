@@ -178,6 +178,29 @@ export async function getAllFeedItems(force = false): Promise<NewsItem[]> {
 }
 
 /**
+ * Background catalog refresh, throttled per instance. Firing a full ~60-feed
+ * crawl on EVERY request stacked concurrent crawls and exhausted the
+ * instance's sockets/file descriptors (EMFILE / getaddrinfo EBUSY), which
+ * crashed the function and produced HTML 500s. One refresh in flight, at
+ * most every 2 minutes, keeps feeds current without the stampede.
+ */
+const refreshState = globalThis as typeof globalThis & {
+  __newsdashFeedRefresh?: { inFlight: boolean; lastStartedAt: number };
+};
+
+function startBackgroundRefresh(): void {
+  const st = (refreshState.__newsdashFeedRefresh ??= { inFlight: false, lastStartedAt: 0 });
+  if (st.inFlight || Date.now() - st.lastStartedAt < 2 * 60 * 1000) return;
+  st.inFlight = true;
+  st.lastStartedAt = Date.now();
+  void getAllFeedItems(true)
+    .catch(() => undefined)
+    .finally(() => {
+      st.inFlight = false;
+    });
+}
+
+/**
  * Fast path for WhatsApp /api/query.
  * Keep the request path fast: use cache when possible, otherwise a bounded
  * bootstrap that prioritizes global + high-priority feeds. Never block on a
@@ -187,9 +210,8 @@ export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
   const MIN_HEALTHY = 120;
   const cached = getCached<NewsItem[]>(ALL_FEEDS_CACHE_KEY);
   if (cached && cached.length >= MIN_HEALTHY) {
-    // Keep answering from cache, but refresh the full catalog in the background
-    // so price/geopolitics/tech stories stay current across all sources.
-    void getAllFeedItems(true).catch(() => undefined);
+    // Keep answering from cache; refresh the catalog in the background (throttled).
+    startBackgroundRefresh();
     return cached;
   }
 
@@ -203,7 +225,7 @@ export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
   if (merged.size >= MIN_HEALTHY) {
     const items = processItems([...merged.values()]);
     setCache(ALL_FEEDS_CACHE_KEY, items, CACHE_TTL);
-    void getAllFeedItems(true).catch(() => undefined);
+    startBackgroundRefresh();
     return items;
   }
 
@@ -233,12 +255,12 @@ export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
       const catItems = items.filter((i) => i.category === cat);
       if (catItems.length) setCache(`feeds_v5:${cat}`, catItems, CACHE_TTL);
     }
-    void getAllFeedItems(true).catch(() => undefined);
+    startBackgroundRefresh();
     return items;
   }
 
   if (merged.size > 0) return processItems([...merged.values()]);
 
-  void getAllFeedItems(false).catch(() => undefined);
+  startBackgroundRefresh();
   return getCached<NewsItem[]>(ALL_FEEDS_CACHE_KEY) || [];
 }
