@@ -9,6 +9,7 @@ import {
   isWeakGroundedAnswer,
   planNewsQuery,
   resolveReplyLanguage,
+  translateAnswerText,
   type GroundedSource,
   type ReplyLanguage,
 } from '@/lib/query/grounded-answer';
@@ -19,6 +20,7 @@ import {
   setChatMemory,
   stableAsk,
   type HistoryTurn,
+  type StoredSource,
 } from '@/lib/query/memory';
 import type { Category, NewsItem } from '@/types';
 import { getRedisClient } from '@/lib/kv/redis';
@@ -1752,11 +1754,15 @@ async function handleQueryPost(request: Request) {
   }
   // Memory language preference only applies to vague follow-ups — a clear
   // English (or Urdu) question always answers in its own language.
-  let replyLang = resolveReplyLanguage(
-    incomingQ,
-    rawQ,
-    body.replyLang || body.lang || (isVagueFollowUp(incomingQ) ? resolved.preferredLang : undefined),
-  );
+  // Translate asks always take the requested target language verbatim.
+  let replyLang =
+    resolved.followUpKind === 'translate' && resolved.preferredLang
+      ? resolved.preferredLang
+      : resolveReplyLanguage(
+          incomingQ,
+          rawQ,
+          body.replyLang || body.lang || (isVagueFollowUp(incomingQ) ? resolved.preferredLang : undefined),
+        );
 
   // Strip follow-up decorations ("— more detail / latest update", "User follow-up: …")
   // before tokenizing, so retrieval ranks on the real topic, not filler words.
@@ -1803,6 +1809,7 @@ async function handleQueryPost(request: Request) {
     answerBrief?: string,
     assistantText?: string,
     shownUrls?: string[],
+    evidence?: { answer?: string; sources?: StoredSource[] },
   ) => {
     if (plugin.kind === 'greeting') return;
     await setChatMemory(chatId, rawQ, topic, {
@@ -1811,8 +1818,121 @@ async function handleQueryPost(request: Request) {
       preferredLang: replyLang,
       assistantText,
       shownUrls,
+      answerFull: evidence?.answer,
+      sources: evidence?.sources,
     });
   };
+
+  // ── Evidence-based follow-ups ──
+  // "explain it in Urdu" / "explain more" must reuse the PREVIOUS answer's
+  // stored evidence, not re-run retrieval (which drifts to other articles).
+  // Only for news threads: price threads re-run live so quotes stay fresh.
+  const evidenceSources = resolved.lastSources || [];
+  const hasNewsEvidence =
+    evidenceSources.length > 0 && (!resolved.memoryIntent || resolved.memoryIntent === 'news');
+
+  if (resolved.followUpKind === 'translate' && resolved.lastAnswer && hasNewsEvidence) {
+    const translated =
+      (await translateAnswerText(resolved.lastAnswer, replyLang)) || resolved.lastAnswer;
+    const srcItems = evidenceSources as unknown as QueryResultItem[];
+    const displayUrls = await Promise.all(evidenceSources.map((s) => shortenArticleUrl(s.url)));
+    const sourceButtons = buildSourceButtons(srcItems, displayUrls);
+    const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+    const aLabel = replyLang === 'ur' ? '*جواب:*' : '*Answer:*';
+    const sLabel = replyLang === 'ur' ? '*ذرائع:*' : '*Sources*';
+    const showIndex = evidenceSources.length > 1;
+    const whatsappText = [
+      '*NewsDash Analyst*',
+      '',
+      `${topicKey} ${topicLabel}`,
+      '',
+      aLabel,
+      translated,
+      '',
+      sLabel,
+      srcItems.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
+    ].join('\n');
+    await remember(topicLabel, 'news', translated.split(/[.!?۔]/)[0].trim().slice(0, 200), translated, undefined, {
+      answer: translated,
+      sources: evidenceSources,
+    });
+    return Response.json({
+      query: q,
+      rawQuery: incomingQ,
+      effectiveQuery: rawQ,
+      displayTopic: topicLabel,
+      intent: 'news',
+      followUpKind: 'translate',
+      brief: translated.slice(0, 200),
+      items: [],
+      total: evidenceSources.length,
+      whatsappText,
+      sourceButtons,
+      usedMemory: true,
+      memoryBackend: getRedisClient() ? 'redis' : 'in-process',
+      lastUpdated: now,
+    });
+  }
+
+  if (resolved.followUpKind === 'elaborate' && hasNewsEvidence) {
+    // Fetch fuller article bodies so the answer can actually go deeper.
+    const bodies = await resolveArticleBodies(
+      evidenceSources.map((s) => ({ url: s.url, description: s.body || '', title: s.title })),
+    );
+    const sources: GroundedSource[] = evidenceSources.map((s, i) => ({
+      title: s.title,
+      source: s.source,
+      url: s.url,
+      publishedAt: s.publishedAt,
+      body: bodies[i] || s.body || s.title,
+    }));
+    const question = stableAsk(rawQ) || rawQ;
+    let answer = await buildGroundedAnswer(question, sources, replyLang, undefined, {
+      previousAnswer: resolved.lastAnswer,
+      focusAsk: incomingQ,
+    });
+    if (!answer || answer.length < WA_ANSWER_MIN) {
+      answer = buildExtractiveAnswer(question, sources, replyLang);
+    }
+    const srcItems = evidenceSources as unknown as QueryResultItem[];
+    const displayUrls = await Promise.all(evidenceSources.map((s) => shortenArticleUrl(s.url)));
+    const sourceButtons = buildSourceButtons(srcItems, displayUrls);
+    const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+    const aLabel = replyLang === 'ur' ? '*جواب:*' : '*Answer:*';
+    const sLabel = replyLang === 'ur' ? '*ذرائع:*' : '*Sources*';
+    const showIndex = evidenceSources.length > 1;
+    const whatsappText = [
+      '*NewsDash Analyst*',
+      '',
+      `${topicKey} ${topicLabel}`,
+      '',
+      aLabel,
+      answer,
+      '',
+      sLabel,
+      srcItems.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
+    ].join('\n');
+    await remember(topicLabel, 'news', answer.split(/[.!?۔]/)[0].trim().slice(0, 200), answer, undefined, {
+      answer,
+      sources: evidenceSources,
+    });
+    return Response.json({
+      query: q,
+      rawQuery: incomingQ,
+      effectiveQuery: rawQ,
+      displayTopic: topicLabel,
+      intent: 'news',
+      followUpKind: 'elaborate',
+      brief: answer.slice(0, 200),
+      items: [],
+      total: evidenceSources.length,
+      whatsappText,
+      sourceButtons,
+      usedMemory: true,
+      memoryBackend: getRedisClient() ? 'redis' : 'in-process',
+      lastUpdated: now,
+    });
+  }
 
   if (plugin.kind === 'greeting') {
     return Response.json({
@@ -2004,7 +2124,11 @@ async function handleQueryPost(request: Request) {
 
   const preferFresh =
     plan?.preferFreshHours ??
-    (/\b(today|latest|now|breaking|just\s+in|aaj)\b/i.test(rawQ) ? 24 : null);
+    (/\b(today|latest|now|breaking|just\s+in|aaj)\b/i.test(rawQ)
+      ? 24
+      : /\b(recent|recently|this week|new)\b/i.test(rawQ)
+        ? 72
+        : null);
 
   const newsTopicLabel =
     domainHint?.topicLabel ??
@@ -2014,8 +2138,11 @@ async function handleQueryPost(request: Request) {
 
   // On memory follow-ups, exclude stories the chat has already seen so "more"
   // surfaces new articles (usually from other sources) instead of repeating.
+  // Never on elaborate fall-through — those need the SAME articles.
   const excludeUrls =
-    resolved.usedMemory && resolved.shownUrls?.length
+    resolved.usedMemory &&
+    resolved.followUpKind !== 'elaborate' &&
+    resolved.shownUrls?.length
       ? new Set(resolved.shownUrls)
       : undefined;
 
@@ -2162,12 +2289,31 @@ async function handleQueryPost(request: Request) {
     : plugin.kind === 'crypto_price' ? 'crypto_price'
     : 'news';
   const answerBrief = (built.answer || note || newsTopicLabel).split(/[.!?]/)[0].trim().slice(0, 200);
+  // Store the answer + cited articles as evidence for translate/elaborate
+  // follow-ups — but not when we fell back to unrelated latest headlines.
+  const evidence =
+    savedIntent === 'news' && !ranked.usedLatestFallback && built.answer
+      ? {
+          answer: built.answer,
+          sources: built.sources
+            .filter((s) => s.url !== 'https://news-d.vercel.app')
+            .slice(0, 3)
+            .map((s) => ({
+              title: s.title,
+              source: s.source,
+              url: s.url,
+              publishedAt: s.publishedAt,
+              body: (s.body || '').slice(0, 2000),
+            })),
+        }
+      : undefined;
   await remember(
     newsTopicLabel,
     savedIntent,
     answerBrief,
     built.answer || note || newsTopicLabel,
     items.map((i) => i.url).filter(isValidArticleUrl),
+    evidence,
   );
   return Response.json({
     query: q,

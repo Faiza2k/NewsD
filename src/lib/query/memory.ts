@@ -8,6 +8,15 @@ export type MemoryTurn = {
   at: number;
 };
 
+/** One cited article kept as evidence for translate/elaborate follow-ups. */
+export type StoredSource = {
+  title: string;
+  source: string;
+  url: string;
+  publishedAt?: string;
+  body?: string;
+};
+
 export type ChatMemory = {
   lastQ: string;
   lastTopic: string;
@@ -17,6 +26,10 @@ export type ChatMemory = {
   preferredLang?: ReplyLanguage;
   /** Article URLs already sent to this chat — used to avoid repeating the same stories on "more". */
   shownUrls?: string[];
+  /** Full text of the last answer — reused verbatim for "explain it in Urdu" style asks. */
+  lastAnswer?: string;
+  /** The articles the last answer was grounded on — reused for "explain more". */
+  lastSources?: StoredSource[];
   turns: MemoryTurn[];
   updatedAt: number;
 };
@@ -152,6 +165,9 @@ export async function setChatMemory(
     preferredLang?: ReplyLanguage;
     assistantText?: string;
     shownUrls?: string[];
+    /** Full answer text + cited articles for translate/elaborate follow-ups. */
+    answerFull?: string;
+    sources?: StoredSource[];
   },
 ): Promise<void> {
   const key = normalizeChatId(chatId) || String(chatId || '').trim();
@@ -185,6 +201,10 @@ export async function setChatMemory(
     lastAnswerBrief: (extra?.answerBrief || prev?.lastAnswerBrief || '').slice(0, 400),
     preferredLang: extra?.preferredLang || prev?.preferredLang,
     shownUrls,
+    lastAnswer: (extra?.answerFull || prev?.lastAnswer || '').slice(0, 2500) || undefined,
+    lastSources: extra?.sources?.length
+      ? extra.sources.slice(0, 3).map((s) => ({ ...s, body: (s.body || '').slice(0, 2000) }))
+      : prev?.lastSources,
     turns: turns.slice(-MAX_TURNS),
     updatedAt: Date.now(),
   };
@@ -241,6 +261,9 @@ export function isVagueFollowUp(q: string): boolean {
     return true;
   }
   if (/^(kuch aur|aur kuch|more info|more information|more details?|more news|any more|anything else|what else)\s*$/i.test(s)) {
+    return true;
+  }
+  if (/^(go deeper|deeper|in depth|wazahat karo|tafseel (batao|se batao)|samjhao)\s*$/i.test(s)) {
     return true;
   }
 
@@ -392,18 +415,67 @@ function detectLangPreference(q: string): ReplyLanguage | null {
   return null;
 }
 
-function isLangOnlyFollowUp(q: string): boolean {
+/**
+ * Translate-only ask: the user wants the SAME answer in another language
+ * ("explain it in Urdu", "urdu mein batao", "now say that in English",
+ * "translate to urdu"). Detected by requiring a language name and then
+ * checking nothing substantive remains after stripping translate phrasing.
+ */
+export function translateAskTarget(q: string): ReplyLanguage | null {
   const s = String(q || '')
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  // "in urdu", "urdu mein", "urdu please"
-  if (/^(in\s+)?(english|urdu|roman(\s+urdu)?|اردو|انگریزی)(\s+(mein|me|mai|please|pls|mein\s+batao|mai\s+batao|mai\s+bolo|mein\s+bolo|mein\s+bata|mai\s+bata))?$/i.test(s)) return true;
-  // "urdu mai batao", "urdu mein bataen", "english mai samjhao" etc.
-  if (/^(english|urdu|roman\s+urdu|اردو|انگریزی)\s+(mai|mein|me)\s+(batao|bataen|bata|bataiye|samjhao|bolo|sunao|likho|likhein)$/i.test(s)) return true;
+  if (!s) return null;
+  const hasUrdu = /\b(urdu)\b/.test(s) || /اردو/.test(q);
+  const hasEnglish = /\b(english)\b/.test(s) || /انگریزی/.test(q);
+  if (!hasUrdu && !hasEnglish) return null;
+  const target: ReplyLanguage | null = hasUrdu && !hasEnglish ? 'ur' : hasEnglish && !hasUrdu ? 'en' : null;
+  if (!target) return null;
+  const leftovers = s
+    .replace(/\b(english|urdu|roman)\b/g, ' ')
+    .replace(/اردو|انگریزی/g, ' ')
+    .replace(
+      /\b(please|pls|now|ab|phir|again|same|answer|reply|say|tell|write|explain|repeat|translate|convert|give|dobara|wohi|whi|me|mujhe|it|this|that|in|into|to|mein|me|mai|main|batao|bataen|bataiye|bata|samjhao|samjha|bolo|bol|sunao|likho|likhein|kar|karo|kro|do|us|is|ye|yeh|and|the|a)\b/g,
+      ' ',
+    )
+    .replace(/\s+/g, ' ')
+    .trim();
+  return leftovers.length <= 2 ? target : null;
+}
+
+/**
+ * Elaborate ask: the user wants DEEPER detail on the same answer/articles
+ * ("explain more", "elaborate", "explain the risk", "more details") —
+ * not new stories and not a translation.
+ */
+export function isElaborateFollowUp(q: string): boolean {
+  const s = String(q || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!s) return false;
+  if (/^(explain|elaborate|expand|describe|clarify)(\s+(on|about))?(\s+(more|further|again|it|this|that))*$/.test(s)) {
+    return true;
+  }
+  if (
+    /^(tell me more|more detail|more details|in detail|in more detail|go deeper|deeper|more info|more information|samjhao|wazahat karo|tafseel batao|tafseel se batao|is ko samjhao|explain karo)$/.test(s)
+  ) {
+    return true;
+  }
+  // "explain the risk", "describe the impact" — short, no named entity of its own
+  if (
+    /^(explain|describe|clarify|summarize|summarise)\s+(the\s+)?[a-z]+(\s+[a-z]+)?$/.test(s) &&
+    extractEntities(q).length === 0
+  ) {
+    return true;
+  }
   return false;
 }
+
+export type FollowUpKind = 'translate' | 'elaborate' | 'more';
 
 export type ResolvedQuery = {
   effectiveQ: string;
@@ -415,6 +487,11 @@ export type ResolvedQuery = {
   turns?: MemoryTurn[];
   /** Article URLs already sent in this chat — exclude on follow-ups so "more" brings new stories. */
   shownUrls?: string[];
+  /** How to treat this follow-up: reuse evidence (translate/elaborate) vs. fresh retrieval (more). */
+  followUpKind?: FollowUpKind;
+  /** Previous answer text + cited articles, for evidence-based follow-ups. */
+  lastAnswer?: string;
+  lastSources?: StoredSource[];
 };
 
 function historyToText(history?: HistoryTurn[] | null): string {
@@ -445,6 +522,12 @@ export async function resolveEffectiveQuery(args: {
   }
   if (memory?.shownUrls?.length) {
     result.shownUrls = memory.shownUrls;
+  }
+  if (memory?.lastAnswer) {
+    result.lastAnswer = memory.lastAnswer;
+  }
+  if (memory?.lastSources?.length) {
+    result.lastSources = memory.lastSources;
   }
   return result;
 }
@@ -479,6 +562,21 @@ async function resolveEffectiveQueryInternal(args: {
         }
       : null;
   const histText = historyToText(args.history);
+
+  // Translate-only ask: reuse the previous answer, just switch language.
+  // Checked before the context gate so "translate to urdu" always resolves.
+  const translateTo = translateAskTarget(rawQ);
+  if (translateTo && (previousQ || previousTopic)) {
+    return {
+      effectiveQ: previousQ || previousTopic,
+      usedMemory: true,
+      needsClarify: false,
+      preferredLang: translateTo,
+      memoryIntent: previousIntent || undefined,
+      followUpKind: 'translate',
+    };
+  }
+
   const wantsContext = needsConversationContext(rawQ, memoryView, previousQ);
 
   if (!wantsContext) {
@@ -540,23 +638,24 @@ async function resolveEffectiveQueryInternal(args: {
 
   const langPref = detectLangPreference(rawQ);
 
-  // Language-only follow-up: keep the same question, switch reply language
-  if (isLangOnlyFollowUp(rawQ) && previousQ) {
+  // Elaborate: user wants deeper detail on the SAME answer/articles.
+  if (isElaborateFollowUp(rawQ) && (previousQ || previousTopic)) {
     return {
-      effectiveQ: previousQ,
+      effectiveQ: previousQ || previousTopic,
       usedMemory: true,
       needsClarify: false,
       preferredLang: langPref || memory?.preferredLang,
       memoryIntent: previousIntent || undefined,
+      followUpKind: 'elaborate',
     };
   }
 
-  // Fast path: more / detail
+  // More: user wants NEW stories on the same topic.
   const lower = rawQ.toLowerCase();
   if (
-    /^(more|aur|zyada|detail|details|continue|go on|batao|update|tell me more|mazeed)\b/i.test(lower) ||
+    /^(more|aur|zyada|continue|go on|batao|update|mazeed)\b/i.test(lower) ||
     /^(or|aur|phir)\s+(batao|bataen|sunao)\b/i.test(lower) ||
-    /^(explain|elaborate|expand)(\s+(on|about))?(\s+(more|further|again|it|this|that))*\s*$/i.test(lower)
+    /^(kuch aur|aur kuch|more news|any more|anything else|what else)\s*$/i.test(lower)
   ) {
     const base = previousQ || previousTopic;
     return {
@@ -565,6 +664,7 @@ async function resolveEffectiveQueryInternal(args: {
       needsClarify: false,
       preferredLang: langPref || memory?.preferredLang,
       memoryIntent: previousIntent || undefined,
+      followUpKind: 'more',
     };
   }
 

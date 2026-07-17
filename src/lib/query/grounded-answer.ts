@@ -277,12 +277,49 @@ function fabricatedVersionTokens(
   return [...bad];
 }
 
+/**
+ * Translate an existing answer into the target language, keeping names,
+ * numbers, and URLs unchanged. Returns null when Groq is unavailable.
+ */
+export async function translateAnswerText(
+  text: string,
+  target: ReplyLanguage,
+): Promise<string | null> {
+  const t = String(text || '').trim();
+  if (!t || !process.env.GROQ_API_KEY) return null;
+  try {
+    const out = await groqChat(
+      [
+        {
+          role: 'system',
+          content:
+            target === 'ur'
+              ? 'Translate the user message into natural Urdu (Nastaliq / Arabic script). Keep publisher names, product names, numbers, prices, and URLs unchanged. Do not add or remove facts. Output ONLY the translation.'
+              : 'Translate the user message into natural English. Keep publisher names, product names, numbers, prices, and URLs unchanged. Do not add or remove facts. Output ONLY the translation.',
+        },
+        { role: 'user', content: t.slice(0, 2400) },
+      ],
+      { maxTokens: 800, temperature: 0 },
+    );
+    const cleaned = out.trim();
+    return cleaned.length >= 10 ? cleaned : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Groq grounded brief; returns null on failure / empty. */
 export async function buildGroundedAnswer(
   question: string,
   sources: GroundedSource[],
   lang: ReplyLanguage = 'en',
   history?: Array<{ role?: string; text?: string; content?: string }>,
+  opts?: {
+    /** Previous answer — set for "explain more": demand NEW depth, no repetition. */
+    previousAnswer?: string;
+    /** The literal follow-up the user typed ("explain the risk"). */
+    focusAsk?: string;
+  },
 ): Promise<string | null> {
   if (!question.trim() || !sources.length) return null;
   if (!process.env.GROQ_API_KEY) return null;
@@ -310,9 +347,13 @@ export async function buildGroundedAnswer(
       }
     }
 
+    const elaborateBlock = opts?.previousAnswer
+      ? `\n\nThe user ALREADY received this answer:\n"""${opts.previousAnswer.slice(0, 1500)}"""\nThey now ask: "${(opts.focusAsk || 'explain more').slice(0, 120)}". Go DEEPER using the source bodies: add specifics, numbers, names, background, and implications that were NOT in the previous answer. Do not repeat its sentences.`
+      : '';
+
     messages.push({
       role: 'user',
-      content: `User question:\n${question.trim()}\n\nSources:\n${formatSources(usable)}${langHint}\n\nWrite a sharp WhatsApp answer now. Always use these sources as the best available briefing. Never say information is missing, not published, or not provided.`,
+      content: `User question:\n${question.trim()}\n\nSources:\n${formatSources(usable)}${elaborateBlock}${langHint}\n\nWrite a sharp WhatsApp answer now. Always use these sources as the best available briefing. Never say information is missing, not published, or not provided.`,
     });
 
     const text = await groqChat(messages, { maxTokens: 700, temperature: 0.15 });
