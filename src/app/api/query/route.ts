@@ -1860,8 +1860,12 @@ async function handleQueryPost(request: Request) {
     evidenceSources.length > 0 && (!resolved.memoryIntent || resolved.memoryIntent === 'news');
 
   if (resolved.followUpKind === 'translate' && resolved.lastAnswer && hasNewsEvidence) {
-    const translated =
-      (await translateAnswerText(resolved.lastAnswer, replyLang)) || resolved.lastAnswer;
+    // Already in the target language? Reuse as-is (also the safe fallback).
+    const answerIsUrdu = /[\u0600-\u06FF]/.test(resolved.lastAnswer);
+    const alreadyTarget = (replyLang === 'ur') === answerIsUrdu;
+    const translated = alreadyTarget
+      ? resolved.lastAnswer
+      : (await translateAnswerText(resolved.lastAnswer, replyLang)) || resolved.lastAnswer;
     const srcItems = evidenceSources as unknown as QueryResultItem[];
     const displayUrls = await Promise.all(evidenceSources.map((s) => shortenArticleUrl(s.url)));
     const sourceButtons = buildSourceButtons(srcItems, displayUrls);
@@ -1880,8 +1884,10 @@ async function handleQueryPost(request: Request) {
       sLabel,
       srcItems.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
     ].join('\n');
+    // Keep the ORIGINAL answer as evidence so "now in English" after
+    // "in Urdu" restores it losslessly without another translation.
     await remember(topicLabel, 'news', translated.split(/[.!?۔]/)[0].trim().slice(0, 200), translated, undefined, {
-      answer: translated,
+      answer: resolved.lastAnswer,
       sources: evidenceSources,
     });
     return Response.json({

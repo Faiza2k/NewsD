@@ -287,25 +287,29 @@ export async function translateAnswerText(
 ): Promise<string | null> {
   const t = String(text || '').trim();
   if (!t || !process.env.GROQ_API_KEY) return null;
-  try {
-    const out = await groqChat(
-      [
-        {
-          role: 'system',
-          content:
-            target === 'ur'
-              ? 'Translate the user message into natural Urdu (Nastaliq / Arabic script). Keep publisher names, product names, numbers, prices, and URLs unchanged. Do not add or remove facts. Output ONLY the translation.'
-              : 'Translate the user message into natural English. Keep publisher names, product names, numbers, prices, and URLs unchanged. Do not add or remove facts. Output ONLY the translation.',
-        },
-        { role: 'user', content: t.slice(0, 2400) },
-      ],
-      { maxTokens: 800, temperature: 0 },
-    );
-    const cleaned = out.trim();
-    return cleaned.length >= 10 ? cleaned : null;
-  } catch {
-    return null;
+  const messages = [
+    {
+      role: 'system' as const,
+      content:
+        target === 'ur'
+          ? 'Translate the user message into natural Urdu (Nastaliq / Arabic script). Keep publisher names, product names, numbers, prices, and URLs unchanged. Do not add or remove facts. Output ONLY the translation.'
+          : 'Translate the user message into natural English. Keep publisher names, product names, numbers, prices, and URLs unchanged. Do not add or remove facts. Output ONLY the translation.',
+    },
+    { role: 'user' as const, content: t.slice(0, 2400) },
+  ];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const out = await groqChat(messages, { maxTokens: 800, temperature: 0 });
+      const cleaned = out.trim();
+      // Reject non-translations (e.g. model echoing the input language back).
+      const isUrduOut = /[\u0600-\u06FF]/.test(cleaned);
+      if (cleaned.length >= 10 && (target === 'ur') === isUrduOut) return cleaned;
+    } catch {
+      // retry once after a short pause (rate limits)
+    }
+    await new Promise((r) => setTimeout(r, 800));
   }
+  return null;
 }
 
 /** Groq grounded brief; returns null on failure / empty. */
