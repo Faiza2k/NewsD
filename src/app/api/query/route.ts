@@ -1881,9 +1881,27 @@ async function handleQueryPost(request: Request) {
     // Already in the target language? Reuse as-is (also the safe fallback).
     const answerIsUrdu = /[\u0600-\u06FF]/.test(resolved.lastAnswer);
     const alreadyTarget = (replyLang === 'ur') === answerIsUrdu;
-    const translated = alreadyTarget
+    let translated = alreadyTarget
       ? resolved.lastAnswer
-      : (await translateAnswerText(resolved.lastAnswer, replyLang)) || resolved.lastAnswer;
+      : (await translateAnswerText(resolved.lastAnswer, replyLang));
+    // If Groq translation failed / returned wrong language, rebuild an
+    // extractive answer from the SAME sources in the target language so the
+    // user still gets a correct-language reply without new retrieval.
+    if (!translated) {
+      const bodies = await resolveArticleBodies(
+        evidenceSources.map((s) => ({ url: s.url, description: s.body || '', title: s.title })),
+      );
+      const sources: GroundedSource[] = evidenceSources.map((s, i) => ({
+        title: s.title,
+        source: s.source,
+        url: s.url,
+        publishedAt: s.publishedAt,
+        body: bodies[i] || s.body || s.title,
+      }));
+      translated =
+        (await buildGroundedAnswer(stableAsk(rawQ) || rawQ, sources, replyLang)) ||
+        buildExtractiveAnswer(stableAsk(rawQ) || rawQ, sources, replyLang);
+    }
     const srcItems = evidenceSources as unknown as QueryResultItem[];
     const displayUrls = await Promise.all(evidenceSources.map((s) => shortenArticleUrl(s.url)));
     const sourceButtons = buildSourceButtons(srcItems, displayUrls);
