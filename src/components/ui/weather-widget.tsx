@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useState } from 'react';
 
 interface WeatherData {
   location: string;
@@ -10,86 +10,86 @@ interface WeatherData {
   windKmh: number;
   condition: string;
   theme: string;
-  source?: 'gps' | 'ip';
 }
 
 type WidgetPhase =
   | { status: 'loading' }
-  | { status: 'need_permission'; reason: 'denied' | 'unavailable' | 'timeout' | 'unknown' }
+  | { status: 'ask_permission' }
+  | { status: 'ask_city'; message: string }
   | { status: 'ready'; weather: WeatherData };
 
-function geoErrorReason(code?: number): 'denied' | 'unavailable' | 'timeout' | 'unknown' {
-  if (code === 1) return 'denied';
-  if (code === 2) return 'unavailable';
-  if (code === 3) return 'timeout';
-  return 'unknown';
-}
-
 export function WeatherWidget() {
-  const [phase, setPhase] = useState<WidgetPhase>({ status: 'loading' });
+  const [phase, setPhase] = useState<WidgetPhase>({ status: 'ask_permission' });
+  const [cityInput, setCityInput] = useState('');
 
-  const fetchByCoords = useCallback((lat: number, lon: number) => {
+  const loadWeather = useCallback(async (params: { lat?: number; lon?: number; city?: string }) => {
     setPhase({ status: 'loading' });
-    return fetch(`/api/weather?lat=${lat}&lon=${lon}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (data && !data.error) {
-          setPhase({ status: 'ready', weather: data as WeatherData });
-          return true;
-        }
-        return false;
-      })
-      .catch(() => false);
+    const qs = new URLSearchParams();
+    if (params.lat != null && params.lon != null) {
+      qs.set('lat', String(params.lat));
+      qs.set('lon', String(params.lon));
+    }
+    if (params.city?.trim()) qs.set('city', params.city.trim());
+
+    try {
+      const res = await fetch(`/api/weather?${qs.toString()}`);
+      const data = await res.json().catch(() => null);
+      if (res.ok && data && !data.error) {
+        setPhase({ status: 'ready', weather: data as WeatherData });
+        return true;
+      }
+      setPhase({
+        status: 'ask_city',
+        message: data?.error || 'Could not load weather for that location. Try another city.',
+      });
+      return false;
+    } catch {
+      setPhase({
+        status: 'ask_city',
+        message: 'Could not load weather. Enter your city to continue.',
+      });
+      return false;
+    }
   }, []);
 
-  /** Approximate weather from visitor IP — works on HTTP Coolify without browser GPS. */
-  const fetchByIp = useCallback(() => {
-    setPhase({ status: 'loading' });
-    return fetch('/api/weather')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (data && !data.error) {
-          setPhase({ status: 'ready', weather: data as WeatherData });
-          return true;
-        }
-        return false;
-      })
-      .catch(() => false);
-  }, []);
-
-  const requestLocation = useCallback(async () => {
+  const askBrowserPermission = useCallback(() => {
     if (typeof window === 'undefined') return;
 
-    // On plain HTTP (Coolify sslip.io), browsers block GPS — use IP approx instead.
-    if (!window.isSecureContext) {
-      const ok = await fetchByIp();
-      if (!ok) setPhase({ status: 'need_permission', reason: 'unavailable' });
-      return;
-    }
-
     if (!navigator.geolocation) {
-      const ok = await fetchByIp();
-      if (!ok) setPhase({ status: 'need_permission', reason: 'unavailable' });
+      setPhase({
+        status: 'ask_city',
+        message: 'This browser cannot share GPS. Enter your city for local weather.',
+      });
       return;
     }
 
     setPhase({ status: 'loading' });
     navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const ok = await fetchByCoords(pos.coords.latitude, pos.coords.longitude);
-        if (!ok) await fetchByIp();
+      (pos) => {
+        void loadWeather({ lat: pos.coords.latitude, lon: pos.coords.longitude });
       },
-      async (err) => {
-        const ok = await fetchByIp();
-        if (!ok) setPhase({ status: 'need_permission', reason: geoErrorReason(err?.code) });
+      () => {
+        // Permission denied / blocked / unavailable — ask the user for their city.
+        setPhase({
+          status: 'ask_city',
+          message: 'Location permission was not granted. Type your city to see local weather.',
+        });
       },
-      { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 },
     );
-  }, [fetchByCoords, fetchByIp]);
+  }, [loadWeather]);
 
+  // On first visit, immediately request the browser location permission prompt.
   useEffect(() => {
-    void requestLocation();
-  }, [requestLocation]);
+    askBrowserPermission();
+  }, [askBrowserPermission]);
+
+  const onCitySubmit = (e: FormEvent) => {
+    e.preventDefault();
+    const city = cityInput.trim();
+    if (city.length < 2) return;
+    void loadWeather({ city });
+  };
 
   if (phase.status === 'loading') {
     return (
@@ -98,32 +98,63 @@ export function WeatherWidget() {
           <div className="wx-loader" />
         </div>
         <div className="weather-data">
-          <div className="weather-location">Detecting your location…</div>
+          <div className="weather-location">Waiting for location…</div>
         </div>
       </div>
     );
   }
 
-  if (phase.status === 'need_permission') {
-    const hint =
-      phase.reason === 'denied'
-        ? 'Location permission was blocked. Allow it, or retry IP-based weather.'
-        : 'Could not detect your location. Retry to load local weather.';
-
+  if (phase.status === 'ask_permission') {
     return (
       <div
         className="weather-widget weather-widget--prompt"
         id="weather-widget"
-        aria-label="Allow location for local weather"
+        aria-label="Allow location for weather"
       >
         <div className="weather-visual" aria-hidden="true">
           <div className="wx-loader" />
         </div>
         <div className="weather-data">
-          <div className="weather-location">Your location</div>
-          <div className="weather-condition weather-prompt-text">{hint}</div>
-          <button type="button" className="weather-allow-btn" onClick={() => void requestLocation()}>
-            Retry weather
+          <div className="weather-location">Location needed</div>
+          <div className="weather-condition weather-prompt-text">
+            Allow location access to show weather where you are.
+          </div>
+          <button type="button" className="weather-allow-btn" onClick={askBrowserPermission}>
+            Allow location
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (phase.status === 'ask_city') {
+    return (
+      <div
+        className="weather-widget weather-widget--prompt"
+        id="weather-widget"
+        aria-label="Enter your city for weather"
+      >
+        <div className="weather-visual" aria-hidden="true">
+          <div className="wx-loader" />
+        </div>
+        <div className="weather-data">
+          <div className="weather-location">Your city</div>
+          <div className="weather-condition weather-prompt-text">{phase.message}</div>
+          <form className="weather-city-form" onSubmit={onCitySubmit}>
+            <input
+              className="weather-city-input"
+              value={cityInput}
+              onChange={(e) => setCityInput(e.target.value)}
+              placeholder="e.g. Karachi, Islamabad"
+              aria-label="City name"
+              autoComplete="address-level2"
+            />
+            <button type="submit" className="weather-allow-btn">
+              Show weather
+            </button>
+          </form>
+          <button type="button" className="weather-allow-btn weather-allow-btn--ghost" onClick={askBrowserPermission}>
+            Allow location instead
           </button>
         </div>
       </div>
@@ -175,7 +206,7 @@ export function WeatherWidget() {
           </span>
         </div>
       </div>
-      <span className="weather-updated">{weather.source === 'ip' ? 'NEAR YOU' : 'LIVE'}</span>
+      <span className="weather-updated">LIVE</span>
     </div>
   );
 }
