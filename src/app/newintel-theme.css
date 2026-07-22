@@ -2946,8 +2946,38 @@
     opacity: 0.35;
   }
 
-  .weather-widget--loading {
+  .weather-widget--loading,
+  .weather-widget--prompt {
     min-height: 88px;
+  }
+
+  .weather-prompt-text {
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: var(--text-secondary);
+    text-transform: none;
+    letter-spacing: 0;
+    margin-bottom: 8px;
+    white-space: normal;
+  }
+
+  .weather-allow-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 2px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+    background: color-mix(in srgb, var(--accent-cyan) 16%, transparent);
+    color: var(--text-primary);
+    font-size: 0.7rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .weather-allow-btn:hover {
+    border-color: var(--accent-cyan);
   }
 
   .weather-visual {

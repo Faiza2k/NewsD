@@ -43,17 +43,18 @@ export async function GET(request: NextRequest) {
   let lon: number;
   let locationHint = searchParams.get('city')?.trim() || '';
 
-  if (latArg && lonArg) {
-    lat = parseFloat(latArg);
-    lon = parseFloat(lonArg);
-    if (Number.isNaN(lat) || Number.isNaN(lon)) {
-      return Response.json({ error: 'Invalid coordinates' }, { status: 400 });
-    }
-  } else {
-    // Default: approximate global HQ fallback (London)
-    lat = 51.5074;
-    lon = -0.1278;
-    locationHint = locationHint || 'London, UK';
+  if (!latArg || !lonArg) {
+    // Never invent a default city (e.g. London). The widget must send browser coords.
+    return Response.json(
+      { error: 'Location required. Pass lat and lon query params.' },
+      { status: 400 },
+    );
+  }
+
+  lat = parseFloat(latArg);
+  lon = parseFloat(lonArg);
+  if (Number.isNaN(lat) || Number.isNaN(lon)) {
+    return Response.json({ error: 'Invalid coordinates' }, { status: 400 });
   }
 
   lat = Math.max(-90, Math.min(90, lat));
