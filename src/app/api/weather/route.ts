@@ -34,6 +34,73 @@ function weatherThemeAndLabel(code: number, isDay: number): { theme: string; lab
   return entry;
 }
 
+function isPublicIp(ip: string): boolean {
+  if (!ip || ip === '::1' || ip === '127.0.0.1') return false;
+  if (ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('169.254.')) return false;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(ip)) return false;
+  if (ip.startsWith('fc') || ip.startsWith('fd') || ip.startsWith('fe80')) return false;
+  return true;
+}
+
+/** Visitor IP from Coolify / Traefik / proxy headers (not the server's own IP). */
+function clientIp(request: NextRequest): string | null {
+  const candidates = [
+    request.headers.get('cf-connecting-ip'),
+    request.headers.get('x-real-ip'),
+    request.headers.get('x-forwarded-for')?.split(',')[0],
+    request.headers.get('x-vercel-forwarded-for')?.split(',')[0],
+  ];
+  for (const raw of candidates) {
+    const ip = String(raw || '')
+      .trim()
+      .replace(/^::ffff:/i, '');
+    if (ip && isPublicIp(ip)) return ip;
+  }
+  return null;
+}
+
+async function coordsFromClientIp(
+  request: NextRequest,
+): Promise<{ lat: number; lon: number; locationHint: string } | null> {
+  const ip = clientIp(request);
+  if (!ip) return null;
+
+  const cacheKey = `weather:ipgeo:${ip}`;
+  const cached = getCached<{ lat: number; lon: number; locationHint: string }>(cacheKey);
+  if (cached) return cached;
+
+  try {
+    // Free IP geolocation (server-side). Uses the visitor IP from proxy headers.
+    const res = await fetch(
+      `http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,lat,lon,city,regionName,countryCode`,
+      { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(5000) },
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      status?: string;
+      lat?: number;
+      lon?: number;
+      city?: string;
+      regionName?: string;
+      countryCode?: string;
+    };
+    if (data.status !== 'success' || typeof data.lat !== 'number' || typeof data.lon !== 'number') {
+      return null;
+    }
+    const city = data.city || data.regionName || 'Your area';
+    const cc = data.countryCode ? `, ${data.countryCode}` : '';
+    const resolved = {
+      lat: data.lat,
+      lon: data.lon,
+      locationHint: `${city}${cc}`,
+    };
+    setCache(cacheKey, resolved, CACHE_TTL);
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const latArg = searchParams.get('lat');
@@ -42,26 +109,37 @@ export async function GET(request: NextRequest) {
   let lat: number;
   let lon: number;
   let locationHint = searchParams.get('city')?.trim() || '';
+  let source: 'gps' | 'ip' = 'gps';
 
-  if (!latArg || !lonArg) {
-    // Never invent a default city (e.g. London). The widget must send browser coords.
-    return Response.json(
-      { error: 'Location required. Pass lat and lon query params.' },
-      { status: 400 },
-    );
-  }
-
-  lat = parseFloat(latArg);
-  lon = parseFloat(lonArg);
-  if (Number.isNaN(lat) || Number.isNaN(lon)) {
-    return Response.json({ error: 'Invalid coordinates' }, { status: 400 });
+  if (latArg && lonArg) {
+    lat = parseFloat(latArg);
+    lon = parseFloat(lonArg);
+    if (Number.isNaN(lat) || Number.isNaN(lon)) {
+      return Response.json({ error: 'Invalid coordinates' }, { status: 400 });
+    }
+  } else {
+    // HTTP / blocked GPS: approximate from visitor IP (Coolify proxy headers).
+    const fromIp = await coordsFromClientIp(request);
+    if (!fromIp) {
+      return Response.json(
+        {
+          error:
+            'Could not detect your location. Allow browser location on HTTPS, or check proxy IP headers.',
+        },
+        { status: 400 },
+      );
+    }
+    lat = fromIp.lat;
+    lon = fromIp.lon;
+    locationHint = locationHint || fromIp.locationHint;
+    source = 'ip';
   }
 
   lat = Math.max(-90, Math.min(90, lat));
   lon = Math.max(-180, Math.min(180, lon));
   const cacheKey = `weather:${lat.toFixed(2)},${lon.toFixed(2)}`;
   const cached = getCached<Record<string, unknown>>(cacheKey);
-  if (cached) return Response.json(cached);
+  if (cached) return Response.json({ ...cached, source });
 
   let locationName = locationHint || 'Your Location';
 
@@ -115,6 +193,7 @@ export async function GET(request: NextRequest) {
       isDay: Boolean(isDay),
       timezone: payload.timezone ?? 'UTC',
       updatedAt: current.time ?? new Date().toISOString(),
+      source,
     };
 
     setCache(cacheKey, result, CACHE_TTL);

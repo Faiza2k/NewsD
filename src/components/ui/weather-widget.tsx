@@ -10,11 +10,11 @@ interface WeatherData {
   windKmh: number;
   condition: string;
   theme: string;
+  source?: 'gps' | 'ip';
 }
 
 type WidgetPhase =
   | { status: 'loading' }
-  | { status: 'need_https' }
   | { status: 'need_permission'; reason: 'denied' | 'unavailable' | 'timeout' | 'unknown' }
   | { status: 'ready'; weather: WeatherData };
 
@@ -28,44 +28,67 @@ function geoErrorReason(code?: number): 'denied' | 'unavailable' | 'timeout' | '
 export function WeatherWidget() {
   const [phase, setPhase] = useState<WidgetPhase>({ status: 'loading' });
 
-  const fetchWeather = useCallback((lat: number, lon: number) => {
+  const fetchByCoords = useCallback((lat: number, lon: number) => {
     setPhase({ status: 'loading' });
-    fetch(`/api/weather?lat=${lat}&lon=${lon}`)
+    return fetch(`/api/weather?lat=${lat}&lon=${lon}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (data && !data.error) {
           setPhase({ status: 'ready', weather: data as WeatherData });
-        } else {
-          setPhase({ status: 'need_permission', reason: 'unavailable' });
+          return true;
         }
+        return false;
       })
-      .catch(() => setPhase({ status: 'need_permission', reason: 'unavailable' }));
+      .catch(() => false);
   }, []);
 
-  const requestLocation = useCallback(() => {
+  /** Approximate weather from visitor IP — works on HTTP Coolify without browser GPS. */
+  const fetchByIp = useCallback(() => {
+    setPhase({ status: 'loading' });
+    return fetch('/api/weather')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data && !data.error) {
+          setPhase({ status: 'ready', weather: data as WeatherData });
+          return true;
+        }
+        return false;
+      })
+      .catch(() => false);
+  }, []);
+
+  const requestLocation = useCallback(async () => {
     if (typeof window === 'undefined') return;
 
-    // Browsers only allow geolocation on HTTPS or localhost.
+    // On plain HTTP (Coolify sslip.io), browsers block GPS — use IP approx instead.
     if (!window.isSecureContext) {
-      setPhase({ status: 'need_https' });
+      const ok = await fetchByIp();
+      if (!ok) setPhase({ status: 'need_permission', reason: 'unavailable' });
       return;
     }
 
     if (!navigator.geolocation) {
-      setPhase({ status: 'need_permission', reason: 'unavailable' });
+      const ok = await fetchByIp();
+      if (!ok) setPhase({ status: 'need_permission', reason: 'unavailable' });
       return;
     }
 
     setPhase({ status: 'loading' });
     navigator.geolocation.getCurrentPosition(
-      (pos) => fetchWeather(pos.coords.latitude, pos.coords.longitude),
-      (err) => setPhase({ status: 'need_permission', reason: geoErrorReason(err?.code) }),
-      { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 },
+      async (pos) => {
+        const ok = await fetchByCoords(pos.coords.latitude, pos.coords.longitude);
+        if (!ok) await fetchByIp();
+      },
+      async (err) => {
+        const ok = await fetchByIp();
+        if (!ok) setPhase({ status: 'need_permission', reason: geoErrorReason(err?.code) });
+      },
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 },
     );
-  }, [fetchWeather]);
+  }, [fetchByCoords, fetchByIp]);
 
   useEffect(() => {
-    requestLocation();
+    void requestLocation();
   }, [requestLocation]);
 
   if (phase.status === 'loading') {
@@ -81,31 +104,11 @@ export function WeatherWidget() {
     );
   }
 
-  if (phase.status === 'need_https') {
-    return (
-      <div
-        className="weather-widget weather-widget--prompt"
-        id="weather-widget"
-        aria-label="Local weather needs a secure connection"
-      >
-        <div className="weather-visual" aria-hidden="true">
-          <div className="wx-loader" />
-        </div>
-        <div className="weather-data">
-          <div className="weather-location">Local weather unavailable</div>
-          <div className="weather-condition weather-prompt-text">
-            Open this site with HTTPS so your browser can share location.
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   if (phase.status === 'need_permission') {
     const hint =
       phase.reason === 'denied'
-        ? 'Location permission was blocked. Allow it for this site, then retry.'
-        : 'Allow location access to see weather where you are.';
+        ? 'Location permission was blocked. Allow it, or retry IP-based weather.'
+        : 'Could not detect your location. Retry to load local weather.';
 
     return (
       <div
@@ -119,8 +122,8 @@ export function WeatherWidget() {
         <div className="weather-data">
           <div className="weather-location">Your location</div>
           <div className="weather-condition weather-prompt-text">{hint}</div>
-          <button type="button" className="weather-allow-btn" onClick={requestLocation}>
-            Allow location
+          <button type="button" className="weather-allow-btn" onClick={() => void requestLocation()}>
+            Retry weather
           </button>
         </div>
       </div>
@@ -172,7 +175,7 @@ export function WeatherWidget() {
           </span>
         </div>
       </div>
-      <span className="weather-updated">LIVE</span>
+      <span className="weather-updated">{weather.source === 'ip' ? 'NEAR YOU' : 'LIVE'}</span>
     </div>
   );
 }
