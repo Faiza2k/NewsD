@@ -145,7 +145,7 @@ export function WeatherWidget() {
               className="weather-city-input"
               value={cityInput}
               onChange={(e) => setCityInput(e.target.value)}
-              placeholder="e.g. Karachi, Islamabad"
+              placeholder="Zhob"
               aria-label="City name"
               autoComplete="address-level2"
             />
