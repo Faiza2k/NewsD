@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useRef, useEffect, useState } from 'react';
+import { useRef, useEffect, useState } from 'react';
 import { Bot, Send, Sparkles, X } from 'lucide-react';
 
 const SUGGESTIONS = [
@@ -9,9 +9,52 @@ const SUGGESTIONS = [
   'Explain the biggest market-moving story',
 ];
 
+const DASHBOARD_CHAT_KEY = 'newsdash.ask.chatId';
+
+type SourceButton = { type?: string; text?: string; url?: string };
+
+function dashboardChatId(): string {
+  if (typeof window === 'undefined') return 'dashboard:web';
+  try {
+    const existing = sessionStorage.getItem(DASHBOARD_CHAT_KEY)?.trim();
+    if (existing) return existing;
+    const id = `dashboard:web:${crypto.randomUUID()}`;
+    sessionStorage.setItem(DASHBOARD_CHAT_KEY, id);
+    return id;
+  } catch {
+    return 'dashboard:web';
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Same Ask text Discord shows: *bold*, _italic_, and [title](url) source links. */
+function askTextToHtml(text: string): string {
+  let s = escapeHtml(String(text || ''));
+  const links: string[] = [];
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_m, label: string, url: string) => {
+    const token = `\u0000L${links.length}\u0000`;
+    links.push(
+      `<a href="${url}" target="_blank" rel="noopener noreferrer" class="ai-ask-link">${label}</a>`,
+    );
+    return token;
+  });
+  s = s.replace(/\*([^*\n]+)\*/g, '<strong>$1</strong>');
+  s = s.replace(/_([^_\n]+)_/g, '<em>$1</em>');
+  s = s.replace(/\u0000L(\d+)\u0000/g, (_m, i: string) => links[Number(i)] || '');
+  return s;
+}
+
 interface Message {
   role: 'user' | 'assistant';
   content: string;
+  sourceButtons?: SourceButton[];
 }
 
 interface AIAssistantPanelProps {
@@ -23,14 +66,10 @@ export function AIAssistantPanel({ open, onClose }: AIAssistantPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [mode, setMode] = useState<'groq' | 'offline' | null>(null);
+  const [mode, setMode] = useState<'ask' | 'groq' | 'offline' | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
 
   const hasMessages = messages.length > 0;
-  const wireMessages = useMemo(
-    () => messages.map((m) => ({ role: m.role, content: m.content })),
-    [messages],
-  );
 
   useEffect(() => {
     if (chatRef.current) {
@@ -47,16 +86,27 @@ export function AIAssistantPanel({ open, onClose }: AIAssistantPanelProps) {
     setLoading(true);
 
     try {
-      const outgoing = [...wireMessages, { role: 'user' as const, content: query }];
       const res = await fetch('/api/ai/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: outgoing }),
+        body: JSON.stringify({ q: query, chatId: dashboardChatId() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Request failed');
-      setMode(data.mode ?? null);
-      setMessages((prev) => [...prev, { role: 'assistant', content: data.content }]);
+      setMode(data.mode ?? 'ask');
+      const buttons: SourceButton[] = Array.isArray(data.sourceButtons)
+        ? data.sourceButtons.filter(
+            (b: SourceButton) => b?.url && /^https?:\/\//i.test(b.url),
+          )
+        : [];
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: data.content,
+          sourceButtons: buttons.length ? buttons.slice(0, 5) : undefined,
+        },
+      ]);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Something went wrong';
       setMessages((prev) => [...prev, { role: 'assistant', content: msg }]);
@@ -81,7 +131,7 @@ export function AIAssistantPanel({ open, onClose }: AIAssistantPanelProps) {
             <div className="ai-title-text">
               <h3>AI Assistant</h3>
               <span className={`ai-mode${mode === 'offline' ? ' is-offline' : ''}`}>
-                {mode === 'offline' ? 'Offline analyst' : 'Live analyst'}
+                {mode === 'offline' ? 'Offline analyst' : 'NewsDash Ask'}
               </span>
             </div>
           </div>
@@ -108,13 +158,37 @@ export function AIAssistantPanel({ open, onClose }: AIAssistantPanelProps) {
                 </button>
               ))}
               <div className="ai-setup-hint">
-                If you see “GROQ_API_KEY is not set”, add it to your `.env.local` and restart the dev server.
+                Same Ask brain as Discord — grounded answers with Sources.
               </div>
             </div>
           )}
           {messages.map((m, i) => (
             <div key={i} className={`chat-message ${m.role} chat-anim-in`}>
-              {m.content}
+              {m.role === 'assistant' ? (
+                <>
+                  <div
+                    className="ai-ask-body"
+                    dangerouslySetInnerHTML={{ __html: askTextToHtml(m.content) }}
+                  />
+                  {m.sourceButtons && m.sourceButtons.length > 0 ? (
+                    <div className="ai-source-buttons" aria-label="Sources">
+                      {m.sourceButtons.map((b, j) => (
+                        <a
+                          key={`${b.url}-${j}`}
+                          className="ai-source-btn"
+                          href={b.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          {b.text || `Source ${j + 1}`}
+                        </a>
+                      ))}
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                m.content
+              )}
             </div>
           ))}
           {loading && (

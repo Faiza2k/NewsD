@@ -2174,6 +2174,46 @@
     border-bottom-left-radius: 4px;
   }
 
+  .chat-message .ai-ask-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .chat-message .ai-ask-link {
+    color: var(--accent-blue);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .chat-message .ai-source-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .chat-message .ai-source-btn {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border-primary, rgba(255, 255, 255, 0.12));
+    background: var(--bg-secondary, rgba(0, 0, 0, 0.2));
+    color: var(--text-primary);
+    font-size: 0.75rem;
+    line-height: 1.3;
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chat-message .ai-source-btn:hover {
+    border-color: var(--accent-blue);
+    color: var(--accent-blue);
+  }
+
   .chat-message.assistant .typing-indicator {
     display: inline-flex;
     gap: 4px;
