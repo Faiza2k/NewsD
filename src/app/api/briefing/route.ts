@@ -5,7 +5,7 @@ import { getAllFeedItems } from '@/lib/feeds/fetch-all-feeds';
 import { buildDailyBriefing, type DailyBriefing } from '@/lib/briefing/build-briefing';
 import { getCached, setCache } from '@/lib/feeds/cache';
 
-const BRIEFING_CACHE_KEY = 'daily-briefing:v1';
+const BRIEFING_CACHE_KEY = 'daily-briefing:v2';
 const BRIEFING_CACHE_TTL = 3 * 60 * 1000;
 
 export async function GET(request: NextRequest) {

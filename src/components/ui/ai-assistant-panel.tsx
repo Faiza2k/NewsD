@@ -157,9 +157,6 @@ export function AIAssistantPanel({ open, onClose }: AIAssistantPanelProps) {
                   {s}
                 </button>
               ))}
-              <div className="ai-setup-hint">
-                Same Ask brain as Discord — grounded answers with Sources.
-              </div>
             </div>
           )}
           {messages.map((m, i) => (

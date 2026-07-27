@@ -17,7 +17,7 @@ export async function GET(request: NextRequest) {
   const limit = Math.min(parseInt(searchParams.get('limit') || '30'), 100);
   const offset = parseInt(searchParams.get('offset') || '0');
 
-  const cacheKey = `feeds_v6:${moduleId || category || 'all'}`;
+  const cacheKey = `feeds_v7:${moduleId || category || 'all'}`;
   const cached = force ? null : getCached<NewsItem[]>(cacheKey);
 
   if (cached) {
@@ -30,7 +30,7 @@ export async function GET(request: NextRequest) {
   }
 
   if (force) {
-    invalidateCache('feeds_v6:');
+    invalidateCache('feeds_v7:');
   }
 
   // Shared ingestion path (also kicks hybrid RAG background ingest).
@@ -39,7 +39,7 @@ export async function GET(request: NextRequest) {
   let processed = all;
   if (moduleId && isIntelligenceModule(moduleId)) {
     const allowed = new Set(getFeedsForModule(moduleId).map((f) => f.name));
-    processed = all.filter((i) => allowed.has(i.source) || getFeedsForModule(moduleId).some((f) => f.category === i.category));
+    processed = all.filter((i) => allowed.has(i.source));
   } else if (category) {
     processed = all.filter((i) => i.category === category);
   }

@@ -158,7 +158,16 @@ function BriefingContent({ briefing }: { briefing: DailyBriefing }) {
                 margin: 0,
               }}
             >
-              {briefing.date} &bull; Last synced {briefing.lastUpdated}
+              {briefing.date} &bull; Last synced{' '}
+              {(() => {
+                const synced = new Date(briefing.lastUpdated);
+                if (Number.isNaN(synced.getTime())) return briefing.lastUpdated;
+                return synced.toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit',
+                });
+              })()}
             </p>
           </div>
         </div>

@@ -277,20 +277,18 @@ export function buildDailyBriefing(articles: NewsItem[]): DailyBriefing {
     .slice(0, 8);
 
   const now = new Date();
-  const timeStr = now.toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
 
   return {
+    // Date string is display-only; sync time is ISO so the client can
+    // format it in the user's local timezone (server UTC ≠ browser clock).
     date: now.toLocaleDateString('en-US', {
       weekday: 'long',
       year: 'numeric',
       month: 'long',
       day: 'numeric',
+      timeZone: 'UTC',
     }),
-    lastUpdated: timeStr,
+    lastUpdated: now.toISOString(),
     breakingHighlights: criticalArticles.map(toBriefingArticle),
     techUpdates: techArticles.map(toBriefingArticle),
     githubUpdates: githubArticles.map(toBriefingArticle),
