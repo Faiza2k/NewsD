@@ -6,11 +6,19 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "lint:rag": "eslint src/lib/rag src/lib/query src/lib/groq.ts src/lib/feeds/fetch-all-feeds.ts src/lib/ask/channels.ts src/app/api/query/route.ts src/app/api/feeds/route.ts src/app/api/ask/status/route.ts src/app/api/ai/chat/route.ts scripts/rag-eval vitest.config.ts",
+    "test:rag": "vitest run --config vitest.config.ts",
+    "test:rag:watch": "vitest --config vitest.config.ts",
+    "test:prod-gates": "vitest run --config vitest.config.ts src/lib/query/plugin-gates.test.ts scripts/rag-eval/golden.test.ts src/lib/query/conversation.test.ts",
+    "test:golden": "node scripts/prod-readiness/run-golden.mjs",
+    "test:scenarios": "node scripts/scenario-transcripts.mjs",
+    "test:ci": "npm run lint:rag && npm run test:rag && npm run build"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.1",
     "@upstash/redis": "^1.38.0",
+    "@upstash/vector": "^1.2.3",
     "clsx": "^2.1.1",
     "date-fns": "^4.4.0",
     "framer-motion": "^12.42.0",
@@ -30,6 +38,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.9",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.10"
   }
 }

@@ -1,64 +1,21 @@
 import { groqChat } from '@/lib/groq';
 import type { ReplyLanguage } from '@/lib/query/grounded-answer';
-import { getRedisClient } from '@/lib/kv/redis';
+import {
+  applyConversationTurn,
+  conversationStateToChatMemory,
+  getConversationState,
+  saveConversationState,
+  type ConversationState,
+} from '@/lib/query/conversation-state';
+import type { ChatMemory, HistoryTurn, MemoryTurn, StoredSource } from '@/lib/query/memory-types';
 
-export type MemoryTurn = {
-  role: 'user' | 'assistant';
-  text: string;
-  at: number;
-};
-
-/** One cited article kept as evidence for translate/elaborate follow-ups. */
-export type StoredSource = {
-  title: string;
-  source: string;
-  url: string;
-  publishedAt?: string;
-  body?: string;
-};
-
-export type ChatMemory = {
-  lastQ: string;
-  lastTopic: string;
-  lastIntent?: string;
-  lastEntities?: string[];
-  lastAnswerBrief?: string;
-  preferredLang?: ReplyLanguage;
-  /** Article URLs already sent to this chat — used to avoid repeating the same stories on "more". */
-  shownUrls?: string[];
-  /** Full text of the last answer — reused verbatim for "explain it in Urdu" style asks. */
-  lastAnswer?: string;
-  /** The articles the last answer was grounded on — reused for "explain more". */
-  lastSources?: StoredSource[];
-  turns: MemoryTurn[];
-  updatedAt: number;
-};
-
-export type HistoryTurn = {
-  role?: string;
-  content?: string;
-  text?: string;
-};
-
-const TTL_MS = 45 * 60 * 1000; // 45 minutes
-const MAX_TURNS = 8;
-
-const globalStore = globalThis as typeof globalThis & {
-  __newsdashChatMemory?: Map<string, ChatMemory>;
-};
+export type { ChatMemory, HistoryTurn, MemoryTurn, StoredSource };
 
 /** Map known LID aliases ↔ phone JIDs so memory stays on one key. */
 const CHAT_ALIASES: Record<string, string> = {
   '193277873631353@lid': '923138308265@c.us',
   '923138308265@c.us': '923138308265@c.us',
 };
-
-function store(): Map<string, ChatMemory> {
-  if (!globalStore.__newsdashChatMemory) {
-    globalStore.__newsdashChatMemory = new Map();
-  }
-  return globalStore.__newsdashChatMemory;
-}
 
 export function normalizeChatId(chatId: string | undefined | null): string {
   const id = String(chatId || '').trim();
@@ -72,7 +29,7 @@ export function normalizeChatId(chatId: string | undefined | null): string {
   return id;
 }
 
-function memoryKeys(chatId: string): string[] {
+export function memoryKeys(chatId: string): string[] {
   const primary = normalizeChatId(chatId);
   const keys = new Set<string>();
   if (primary) keys.add(primary);
@@ -86,32 +43,15 @@ function memoryKeys(chatId: string): string[] {
   return [...keys];
 }
 
-export async function getChatMemory(chatId: string | undefined | null): Promise<ChatMemory | null> {
-  if (!chatId) return null;
-  
-  const redis = getRedisClient();
-  if (redis) {
-    try {
-      for (const key of memoryKeys(chatId)) {
-        const row = await redis.get<ChatMemory>(key);
-        if (row) return row;
-      }
-    } catch (err) {
-      console.error('[redis] get memory failed', err);
-    }
-  }
+export async function getConversationStateForChat(
+  chatId: string | undefined | null,
+): Promise<ConversationState | null> {
+  return getConversationState(chatId, memoryKeys);
+}
 
-  const map = store();
-  for (const key of memoryKeys(chatId)) {
-    const row = map.get(key);
-    if (!row) continue;
-    if (Date.now() - row.updatedAt > TTL_MS) {
-      map.delete(key);
-      continue;
-    }
-    return row;
-  }
-  return null;
+export async function getChatMemory(chatId: string | undefined | null): Promise<ChatMemory | null> {
+  const state = await getConversationStateForChat(chatId);
+  return state ? conversationStateToChatMemory(state) : null;
 }
 
 function extractEntities(text: string): string[] {
@@ -128,6 +68,11 @@ function extractEntities(text: string): string[] {
     [/\b(israel|اسرائیل)\b/i, 'israel'],
     [/\b(ukraine|یوکرین)\b/i, 'ukraine'],
     [/\b(openai|chatgpt)\b/i, 'openai'],
+    [/\b(dawn)\b/i, 'dawn'],
+    [/\b(bbc)\b/i, 'bbc'],
+    [/\b(reuters)\b/i, 'reuters'],
+    [/\b(guardian)\b/i, 'guardian'],
+    [/\b(al\s*jazeera|aljazeera)\b/i, 'aljazeera'],
     [/\b(weather|mosam|موسم)\b/i, 'weather'],
     [/\b(pakistan|پاکستان)\b/i, 'pakistan'],
   ];
@@ -164,10 +109,15 @@ export async function setChatMemory(
     answerBrief?: string;
     preferredLang?: ReplyLanguage;
     assistantText?: string;
+    /** Literal user turn; lastQ remains the stable topic used for retrieval. */
+    userText?: string;
     shownUrls?: string[];
     /** Full answer text + cited articles for translate/elaborate follow-ups. */
     answerFull?: string;
     sources?: StoredSource[];
+    /** Continue this topic id (from classifier) instead of heuristic match. */
+    topicId?: string | null;
+    forceNewTopic?: boolean;
   },
 ): Promise<void> {
   const key = normalizeChatId(chatId) || String(chatId || '').trim();
@@ -175,54 +125,23 @@ export async function setChatMemory(
   if (!key || !cleanQ) return;
   lastQ = cleanQ;
 
-  const prev = await getChatMemory(key);
-  const entities = extractEntities(`${lastQ} ${lastTopic}`);
-  const turns: MemoryTurn[] = [...(prev?.turns || [])];
-  turns.push({ role: 'user', text: lastQ.trim().slice(0, 400), at: Date.now() });
-  if (extra?.assistantText?.trim()) {
-    turns.push({
-      role: 'assistant',
-      text: extra.assistantText.trim().slice(0, 500),
-      at: Date.now(),
-    });
-  }
-
-  // Keep a rolling window of already-shown article URLs so follow-ups
-  // ("more", "aur batao") surface NEW stories instead of repeating.
-  const shownUrls = [...(prev?.shownUrls || []), ...(extra?.shownUrls || [])]
-    .filter((u, i, arr) => u && arr.indexOf(u) === i)
-    .slice(-40);
-
-  const row: ChatMemory = {
-    lastQ: lastQ.trim().slice(0, 400),
-    lastTopic: (stableAsk(lastTopic) || lastQ).trim().slice(0, 120),
-    lastIntent: extra?.intent || prev?.lastIntent,
-    lastEntities: entities.length ? entities : prev?.lastEntities,
-    lastAnswerBrief: (extra?.answerBrief || prev?.lastAnswerBrief || '').slice(0, 400),
-    preferredLang: extra?.preferredLang || prev?.preferredLang,
-    shownUrls,
-    lastAnswer: (extra?.answerFull || prev?.lastAnswer || '').slice(0, 2500) || undefined,
-    lastSources: extra?.sources?.length
-      ? extra.sources.slice(0, 3).map((s) => ({ ...s, body: (s.body || '').slice(0, 2000) }))
-      : prev?.lastSources,
-    turns: turns.slice(-MAX_TURNS),
-    updatedAt: Date.now(),
-  };
-
-  const redis = getRedisClient();
-  if (redis) {
-    try {
-      for (const k of memoryKeys(key)) {
-        await redis.set(k, row, { ex: 2700 }); // 45 min TTL
-      }
-      return;
-    } catch (err) {
-      console.error('[redis] set memory failed', err);
-    }
-  }
-
-  const map = store();
-  for (const k of memoryKeys(key)) map.set(k, row);
+  const prev = await getConversationStateForChat(key);
+  const next = await applyConversationTurn(prev, {
+    chatId: key,
+    topicLabel: stableAsk(lastTopic) || lastQ,
+    lastQ,
+    intent: extra?.intent,
+    answerBrief: extra?.answerBrief,
+    preferredLang: extra?.preferredLang,
+    assistantText: extra?.assistantText,
+    userText: extra?.userText,
+    shownUrls: extra?.shownUrls,
+    answerFull: extra?.answerFull,
+    sources: extra?.sources,
+    topicId: extra?.topicId,
+    forceNewTopic: extra?.forceNewTopic,
+  });
+  await saveConversationState(next, memoryKeys);
 }
 
 /** Short / referring messages that need the previous topic. */
@@ -359,6 +278,23 @@ export function needsConversationContext(
     return true;
   }
 
+  // A short question with no new recognized entity normally refers to the
+  // active conversation. This is structural conversation handling, not a
+  // topic list: "what should users do?", "when did it happen?", etc.
+  // Strip leading discourse markers ("so", "well", "ok") so B4-style follow-ups
+  // like "so what do you think happens next?" still resolve against memory.
+  const stripped = s.replace(/^(so|well|ok|okay|alright|and|then|anyway)\s+/i, '');
+  if (
+    memory &&
+    /^(why|how|when|where|who|which|what|is|are|was|were|do|does|did|can|could|should|would|will|has|have)\b/i.test(
+      stripped,
+    ) &&
+    s.split(/\s+/).filter(Boolean).length <= 14 &&
+    extractEntities(q).length === 0
+  ) {
+    return true;
+  }
+
   // Quantity follow-ups about the previous answer: "how many employees are affected?"
   if (
     /^how (many|much)\b/i.test(s) &&
@@ -436,11 +372,22 @@ export function translateAskTarget(q: string): ReplyLanguage | null {
   if (!hasUrdu && !hasEnglish) return null;
   const target: ReplyLanguage | null = hasUrdu && !hasEnglish ? 'ur' : hasEnglish && !hasUrdu ? 'en' : null;
   if (!target) return null;
+  // Common Roman-Urdu "say this in Urdu" forms: isy/isay/usay urdu mai
+  if (
+    /\b(isy|isay|usay|usey|ise|isko|usko|yeh|ye|woh|wo)\b.*\b(urdu|english)\b/.test(s) ||
+    /\b(urdu|english)\b.*\b(mai|mein|main|me)\b/.test(s)
+  ) {
+    const heavy = s
+      .replace(/\b(isy|isay|usay|usey|ise|isko|usko|yeh|ye|woh|wo|urdu|english|roman|mai|mein|main|me|batao|bolo|bol|karo|kar|please|pls|ab|phir|dobara)\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (heavy.length <= 8) return target;
+  }
   const leftovers = s
     .replace(/\b(english|urdu|roman)\b/g, ' ')
     .replace(/اردو|انگریزی/g, ' ')
     .replace(
-      /\b(please|pls|now|ab|phir|again|same|answer|reply|say|tell|write|explain|repeat|translate|convert|give|dobara|wohi|whi|me|mujhe|it|this|that|in|into|to|mein|me|mai|main|batao|bataen|bataiye|bata|samjhao|samjha|bolo|bol|sunao|likho|likhein|kar|karo|kro|do|us|is|ye|yeh|and|the|a)\b/g,
+      /\b(please|pls|now|ab|phir|again|same|answer|reply|say|tell|write|explain|repeat|translate|convert|give|dobara|wohi|whi|me|mujhe|it|this|that|in|into|to|mein|me|mai|main|batao|bataen|bataiye|bata|samjhao|samjha|bolo|bol|sunao|likho|likhein|kar|karo|kro|do|us|is|isy|isay|usay|usey|ise|isko|usko|ye|yeh|woh|wo|and|the|a|can|you|your|could|would|will|just|once|previous|earlier|last|one|back|again)\b/g,
       ' ',
     )
     .replace(/\s+/g, ' ')
@@ -449,9 +396,8 @@ export function translateAskTarget(q: string): ReplyLanguage | null {
 }
 
 /**
- * Elaborate ask: the user wants DEEPER detail on the same answer/articles
- * ("explain more", "elaborate", "explain the risk", "more details") —
- * not new stories and not a translation.
+ * Elaborate ask: deepen the SAME articles ("why?", "explain that", "who's involved?").
+ * NOT for "more" / "tell me more" / repeated surveys — those need fresh retrieval.
  */
 export function isElaborateFollowUp(q: string): boolean {
   const s = String(q || '')
@@ -460,15 +406,18 @@ export function isElaborateFollowUp(q: string): boolean {
     .replace(/\s+/g, ' ')
     .trim();
   if (!s) return false;
+  // Explicit deepeners — not "more news" requests.
   if (/^(explain|elaborate|expand|describe|clarify)(\s+(on|about))?(\s+(more|further|again|it|this|that))*$/.test(s)) {
     return true;
   }
   if (
-    /^(tell me more|more detail|more details|in detail|in more detail|go deeper|deeper|more info|more information|samjhao|wazahat karo|tafseel batao|tafseel se batao|is ko samjhao|explain karo)$/.test(s)
+    /^(in detail|in more detail|go deeper|deeper|samjhao|wazahat karo|tafseel batao|tafseel se batao|is ko samjhao|explain karo|kyun|kyun aisa|why is that|why so|how so)$/.test(
+      s,
+    )
   ) {
     return true;
   }
-  // "what should I do?" after a security/news answer = advice on same topic
+  // "what should I do?" after a security/news answer = advice on same evidence
   if (/^what (should|can|do|would) (i|we|you) do( now| next| about (it|this|that))?$/.test(s)) {
     return true;
   }
@@ -476,6 +425,69 @@ export function isElaborateFollowUp(q: string): boolean {
   if (
     /^(explain|describe|clarify|summarize|summarise)\s+(the\s+)?[a-z]+(\s+[a-z]+)?$/.test(s) &&
     extractEntities(q).length === 0
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** True when the user is re-asking essentially the same survey/question. */
+export function isNearDuplicateAsk(a: string, b: string): boolean {
+  const norm = (s: string) =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  const na = norm(a);
+  const nb = norm(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const stop = new Set([
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'what', 'whats', 'me', 'tell', 'please',
+    'any', 'some', 'of', 'on', 'in', 'for', 'to', 'do', 'does', 'did', 'with', 'from',
+  ]);
+  const tokens = (s: string) =>
+    s
+      .split(/\s+/)
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 3 && !stop.has(t));
+  const ta = [...new Set(tokens(na))];
+  const tb = new Set(tokens(nb));
+  if (!ta.length || !tb.size) return false;
+  const weakShared = new Set([
+    'price', 'prices', 'news', 'latest', 'today', 'update', 'updates', 'market', 'markets', 'now',
+  ]);
+  const strongA = ta.filter((t) => !weakShared.has(t));
+  const strongB = [...tb].filter((t) => !weakShared.has(t));
+  if (!strongA.length || !strongB.length) return false;
+  const [shorter, longerSet] =
+    strongA.length <= strongB.length ? [strongA, new Set(strongB)] : [strongB, new Set(strongA)];
+  // Survey re-ask: all distinctive topic tokens of the shorter ask appear in the longer.
+  return shorter.every((t) => longerSet.has(t));
+}
+
+/** "more" / "anything else" → fetch additional stories (not reuse same evidence). */
+export function isMoreNewsFollowUp(q: string): boolean {
+  const lower = String(q || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s?]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!lower) return false;
+  if (
+    /^(more|aur|zyada|continue|go on|batao|update|mazeed)\b/i.test(lower) ||
+    /^(or|aur|phir)\s+(batao|bataen|sunao)\b/i.test(lower) ||
+    /^(kuch aur|aur kuch|more news|any more|anything else|what else|tell me more|more detail|more details|more info|more information)(\s+.*)?$/i.test(
+      lower,
+    )
+  ) {
+    return true;
+  }
+  // "more on X" / "anything else on macro"
+  if (
+    /\b(anything else|what else|more|any more|another|other)\b/i.test(lower) &&
+    lower.split(/\s+/).length <= 10
   ) {
     return true;
   }
@@ -496,9 +508,15 @@ export type ResolvedQuery = {
   shownUrls?: string[];
   /** How to treat this follow-up: reuse evidence (translate/elaborate) vs. fresh retrieval (more). */
   followUpKind?: FollowUpKind;
+  /** Literal follow-up, kept separate so topic normalization cannot erase its meaning. */
+  followUpText?: string;
   /** Previous answer text + cited articles, for evidence-based follow-ups. */
   lastAnswer?: string;
   lastSources?: StoredSource[];
+  /** Rolling summary of older turns (outside the raw recent window). */
+  rollingSummary?: string;
+  /** Active topic id in the conversation stack. */
+  activeTopicId?: string | null;
 };
 
 function historyToText(history?: HistoryTurn[] | null): string {
@@ -523,7 +541,8 @@ export async function resolveEffectiveQuery(args: {
   previousIntent?: string | null;
 }): Promise<ResolvedQuery> {
   const result = await resolveEffectiveQueryInternal(args);
-  const memory = await getChatMemory(args.chatId);
+  const state = await getConversationStateForChat(args.chatId);
+  const memory = state ? conversationStateToChatMemory(state) : null;
   if (memory?.turns) {
     result.turns = memory.turns;
   }
@@ -535,6 +554,12 @@ export async function resolveEffectiveQuery(args: {
   }
   if (memory?.lastSources?.length) {
     result.lastSources = memory.lastSources;
+  }
+  if (state?.rollingSummary) {
+    result.rollingSummary = state.rollingSummary;
+  }
+  if (state) {
+    result.activeTopicId = state.activeTopicId;
   }
   return result;
 }
@@ -581,6 +606,7 @@ async function resolveEffectiveQueryInternal(args: {
       preferredLang: translateTo,
       memoryIntent: previousIntent || undefined,
       followUpKind: 'translate',
+      followUpText: rawQ,
     };
   }
 
@@ -645,7 +671,7 @@ async function resolveEffectiveQueryInternal(args: {
 
   const langPref = detectLangPreference(rawQ);
 
-  // Elaborate: user wants deeper detail on the SAME answer/articles.
+  // Elaborate: deepen the SAME answer/articles ("why?", "explain that").
   if (isElaborateFollowUp(rawQ) && (previousQ || previousTopic)) {
     return {
       effectiveQ: previousQ || previousTopic,
@@ -654,12 +680,11 @@ async function resolveEffectiveQueryInternal(args: {
       preferredLang: langPref || memory?.preferredLang,
       memoryIntent: previousIntent || undefined,
       followUpKind: 'elaborate',
+      followUpText: rawQ,
     };
   }
 
-  // Short pronoun/auxiliary questions about the previous answer ("is it
-  // better than the previous one?", "who made it?", "is there a demo?")
-  // are also elaborations — answer from the SAME evidence, don't re-search.
+  // Short pronoun questions about the previous answer ("is it better?", "who made it?").
   const lowerRaw = rawQ.toLowerCase();
   if (
     (previousQ || previousTopic) &&
@@ -675,15 +700,16 @@ async function resolveEffectiveQueryInternal(args: {
       preferredLang: langPref || memory?.preferredLang,
       memoryIntent: previousIntent || undefined,
       followUpKind: 'elaborate',
+      followUpText: rawQ,
     };
   }
 
-  // More: user wants NEW stories on the same topic.
+  // "more" / "anything else" / near-duplicate re-ask → NEW stories, exclude shown URLs.
+  // Never rewrite the same headlines for a repeated survey question.
   const lower = rawQ.toLowerCase();
   if (
-    /^(more|aur|zyada|continue|go on|batao|update|mazeed)\b/i.test(lower) ||
-    /^(or|aur|phir)\s+(batao|bataen|sunao)\b/i.test(lower) ||
-    /^(kuch aur|aur kuch|more news|any more|anything else|what else)\s*$/i.test(lower)
+    (previousQ || previousTopic) &&
+    (isMoreNewsFollowUp(rawQ) || isNearDuplicateAsk(rawQ, previousQ || ''))
   ) {
     const base = previousQ || previousTopic;
     return {
@@ -693,8 +719,30 @@ async function resolveEffectiveQueryInternal(args: {
       preferredLang: langPref || memory?.preferredLang,
       memoryIntent: previousIntent || undefined,
       followUpKind: 'more',
+      followUpText: rawQ,
     };
   }
+
+  // Legacy short "more" patterns (Roman Urdu continuations).
+  if (
+    /^(more|aur|zyada|continue|go on|batao|update|mazeed)\b/i.test(lower) ||
+    /^(or|aur|phir)\s+(batao|bataen|sunao)\b/i.test(lower) ||
+    /^(kuch aur|aur kuch|more news|any more|anything else|what else)\s*\??$/i.test(lower)
+  ) {
+    const base = previousQ || previousTopic;
+    return {
+      effectiveQ: `${base} — more detail / latest update`,
+      usedMemory: true,
+      needsClarify: false,
+      preferredLang: langPref || memory?.preferredLang,
+      memoryIntent: previousIntent || undefined,
+      followUpKind: 'more',
+      followUpText: rawQ,
+    };
+  }
+
+  // Intentionally NO catch-all "short what-question → elaborate".
+  // That forced repeated surveys ("latest macro news today?") onto memory_evidence.
 
   if (/^(and|aur|also|plus)\s+(.+)$/i.test(rawQ)) {
     const add = rawQ.replace(/^(and|aur|also|plus)\s+/i, '').trim();
@@ -722,6 +770,19 @@ async function resolveEffectiveQueryInternal(args: {
 
   if (/^(what about|how about|about)\s+(.+)$/i.test(rawQ)) {
     const add = rawQ.replace(/^(what about|how about|about)\s+/i, '').trim();
+    const addEntities = extractEntities(add);
+    const priceSwitch = addEntities.some((e) =>
+      ['bitcoin', 'ethereum', 'solana', 'gold', 'fuel', 'oil'].includes(e),
+    );
+    if (priceSwitch) {
+      return {
+        effectiveQ: wantsPriceWords(add) || /\bprice\b/i.test(add) ? add : `${add} price`,
+        usedMemory: true,
+        needsClarify: false,
+        preferredLang: langPref || memory?.preferredLang,
+        memoryIntent: undefined,
+      };
+    }
     return {
       effectiveQ: `${add} (follow-up after: ${previousQ || previousTopic})`,
       usedMemory: true,
@@ -743,9 +804,35 @@ async function resolveEffectiveQueryInternal(args: {
   }
 
   // Domain sticky: if last intent was a live plugin, keep short comparisons on that asset
+  // NEVER when the user names a different entity or uses an explicit topic-switch cue.
+  const switchCueSticky =
+    /\b(switching gears|switch(?:ing)? topics?|one more thing|last one|by the way|btw|anything on|any recent)\b/i.test(
+      lower,
+    );
+  const stickyEntities = extractEntities(rawQ);
+  const stickyPrevEntities = memory?.lastEntities || extractEntities(previousQ || previousTopic);
+  const stickyNovel = stickyEntities.filter((e) => !stickyPrevEntities.includes(e));
+  // Catalog-free novelty: "what about Apple?" after gold/crypto must not stay sticky.
+  const stickyStop = new Set([
+    'what', 'about', 'how', 'tell', 'please', 'latest', 'today', 'price', 'more', 'again', 'still', 'now', 'and', 'aur',
+  ]);
+  const prevTok = new Set(
+    `${previousQ || ''} ${previousTopic || ''}`
+      .toLowerCase()
+      .split(/[^a-z0-9\u0600-\u06ff]+/i)
+      .filter((w) => w.length >= 3 && !stickyStop.has(w)),
+  );
+  const novelContent = rawQ
+    .toLowerCase()
+    .split(/[^a-z0-9\u0600-\u06ff]+/i)
+    .filter((w) => w.length >= 4 && !stickyStop.has(w))
+    .some((w) => !prevTok.has(w));
   if (
     previousIntent &&
     /^(gold_price|crypto_price|fuel_price|weather)$/.test(previousIntent) &&
+    !switchCueSticky &&
+    stickyNovel.length === 0 &&
+    !novelContent &&
     (isVagueFollowUp(rawQ) ||
       /\b(increase|decrease|up|down|zyada|kam|rose|fell|aaj|today|latest|pkr|usd)\b/i.test(lower) ||
       /زیادہ|کم|آج|انکریز|ڈیکریز|پرائز|قیمت/.test(rawQ))
@@ -764,6 +851,7 @@ async function resolveEffectiveQueryInternal(args: {
       needsClarify: false,
       preferredLang: langPref || memory?.preferredLang,
       memoryIntent: previousIntent,
+      followUpText: rawQ,
     };
   }
 
