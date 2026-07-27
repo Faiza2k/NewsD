@@ -5,7 +5,6 @@ export const maxDuration = 60;
 import { getCached, invalidateCache, setCache } from '@/lib/feeds/cache';
 import { getAllFeedItems, getFeedItemsForQuery } from '@/lib/feeds/fetch-all-feeds';
 import { getFeedsForModule, isIntelligenceModule } from '@/lib/feeds/module-feeds';
-import { startBackgroundIngest } from '@/lib/rag/ingest';
 import type { Category, NewsItem } from '@/types';
 
 const CACHE_TTL = 5 * 60 * 1000;
@@ -22,8 +21,6 @@ export async function GET(request: NextRequest) {
   const cached = force ? null : getCached<NewsItem[]>(cacheKey);
 
   if (cached) {
-    // Keep the vector corpus warm even when HTTP cache hits.
-    startBackgroundIngest(cached);
     return Response.json({
       items: cached.slice(offset, offset + limit),
       total: cached.length,

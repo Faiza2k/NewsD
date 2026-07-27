@@ -3,7 +3,6 @@ import { FEED_SOURCES } from '@/lib/feeds/registry';
 import { scoreSignificance, deduplicateByUrl, deduplicateByTitle } from '@/lib/utils/relevance-scorer';
 import { extractValidDate, isFresh } from '@/lib/feeds/date-utils';
 import { extractRssImageUrl } from '@/lib/feeds/rss-image';
-import { startBackgroundIngest } from '@/lib/rag/ingest';
 import type { NewsItem, Category } from '@/types';
 import Parser from 'rss-parser';
 
@@ -166,14 +165,12 @@ export async function getAllFeedItems(force = false): Promise<NewsItem[]> {
   const bootstrapItems = await fetchFeedsUntil(prioritized, 320);
   const processed = processItems(bootstrapItems);
   setCache(ALL_FEEDS_CACHE_KEY, processed, CACHE_TTL);
-  startBackgroundIngest(processed);
 
   void (async () => {
     try {
       const allItems = await fetchFeedsBatch(prioritized);
       const fullProcessed = processItems(allItems);
       setCache(ALL_FEEDS_CACHE_KEY, fullProcessed, CACHE_TTL);
-      startBackgroundIngest(fullProcessed);
 
       for (const cat of ['ai', 'crypto', 'trading', 'github', 'tech', 'research', 'startups', 'global'] as Category[]) {
         const catItems = fullProcessed.filter((i) => i.category === cat);
@@ -222,7 +219,6 @@ export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
   if (cached && cached.length >= MIN_HEALTHY) {
     // Keep answering from cache; refresh the catalog in the background (throttled).
     startBackgroundRefresh();
-    startBackgroundIngest(cached);
     return cached;
   }
 
