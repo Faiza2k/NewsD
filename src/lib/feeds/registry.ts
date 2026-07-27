@@ -194,6 +194,8 @@ const BASE_FEED_SOURCES: FeedSource[] = [
   { id: 'bbc-tech', name: 'BBC Technology', url: 'https://feeds.bbci.co.uk/news/technology/rss.xml', category: 'global', subcategories: ['technology'], priority: 4 },
   { id: 'ap-tech', name: 'AP Technology', url: 'https://rsshub.app/apnews/topics/technology', category: 'global', subcategories: ['technology'], priority: 3 },
   { id: 'bbc-world', name: 'BBC World', url: 'https://feeds.bbci.co.uk/news/world/rss.xml', category: 'global', subcategories: ['world', 'geopolitics'], priority: 5 },
+  { id: 'bbc-top', name: 'BBC News', url: 'https://feeds.bbci.co.uk/news/rss.xml', category: 'global', subcategories: ['world', 'news'], priority: 5 },
+  { id: 'bbc-asia', name: 'BBC News', url: 'https://feeds.bbci.co.uk/news/world/asia/rss.xml', category: 'global', subcategories: ['asia', 'world'], priority: 4 },
   { id: 'al-jazeera', name: 'Al Jazeera', url: 'https://www.aljazeera.com/xml/rss/all.xml', category: 'global', subcategories: ['world', 'middle-east'], priority: 4 },
   { id: 'guardian-world', name: 'The Guardian World', url: 'https://www.theguardian.com/world/rss', category: 'global', subcategories: ['world', 'politics'], priority: 4 },
   { id: 'guardian-tech', name: 'The Guardian Tech', url: 'https://www.theguardian.com/technology/rss', category: 'global', subcategories: ['technology', 'policy'], priority: 4 },
@@ -202,6 +204,9 @@ const BASE_FEED_SOURCES: FeedSource[] = [
   { id: 'scmp-tech', name: 'South China Morning Post Tech', url: 'https://www.scmp.com/rss/91/feed', category: 'global', subcategories: ['china', 'technology'], priority: 4 },
   { id: 'nikkei-asia', name: 'Nikkei Asia', url: 'https://asia.nikkei.com/.rss/feed', category: 'global', subcategories: ['asia', 'business'], priority: 4 },
   { id: 'politico', name: 'Politico', url: 'https://rss.politico.com/politics-news.xml', category: 'global', subcategories: ['politics', 'policy'], priority: 4 },
+  // Dawn (Pakistan) — business + technology only (no home/pakistan/opinion/world in catalog)
+  { id: 'dawn-business', name: 'Dawn', url: 'https://www.dawn.com/feeds/business', category: 'trading', subcategories: ['pakistan', 'business'], priority: 4 },
+  { id: 'dawn-tech', name: 'Dawn', url: 'https://www.dawn.com/feeds/tech', category: 'tech', subcategories: ['pakistan', 'technology'], priority: 4 },
 
   // ─── Reddit (community sources by category) ───
   { id: 'reddit-artificial', name: 'Reddit r/artificial', url: 'https://www.reddit.com/r/artificial/.rss', category: 'ai', subcategories: ['news', 'discussion'], priority: 3 },
