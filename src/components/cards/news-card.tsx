@@ -20,6 +20,21 @@ export function NewsCard({ item }: { item: NewsItem; index?: number }) {
       role="button"
       aria-label={`Open article: ${item.title}`}
     >
+      {item.imageUrl ? (
+        <div className="news-card-media">
+          <img
+            src={item.imageUrl}
+            alt=""
+            className="news-card-thumb"
+            loading="lazy"
+            decoding="async"
+            onError={(e) => {
+              const wrap = (e.target as HTMLImageElement).closest('.news-card-media') as HTMLElement | null;
+              if (wrap) wrap.style.display = 'none';
+            }}
+          />
+        </div>
+      ) : null}
       <div className="news-card-top">
         <span
           className="source"

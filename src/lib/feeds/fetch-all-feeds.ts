@@ -2,6 +2,8 @@ import { getCached, setCache } from '@/lib/feeds/cache';
 import { FEED_SOURCES } from '@/lib/feeds/registry';
 import { scoreSignificance, deduplicateByUrl, deduplicateByTitle } from '@/lib/utils/relevance-scorer';
 import { extractValidDate, isFresh } from '@/lib/feeds/date-utils';
+import { extractRssImageUrl } from '@/lib/feeds/rss-image';
+import { startBackgroundIngest } from '@/lib/rag/ingest';
 import type { NewsItem, Category } from '@/types';
 import Parser from 'rss-parser';
 
@@ -18,6 +20,10 @@ const parser = new Parser({
       ['published', 'published'],
       ['updated', 'updated'],
       ['date', 'date'],
+      ['media:content', 'mediaContent', { keepArray: true }],
+      ['media:thumbnail', 'mediaThumbnail', { keepArray: true }],
+      ['itunes:image', 'itunesImage'],
+      ['content:encoded', 'contentEncoded'],
     ],
   },
 });
@@ -25,7 +31,7 @@ const parser = new Parser({
 const CACHE_TTL = 5 * 60 * 1000;
 const BATCH_SIZE = 8;
 const MAX_ITEMS_PER_FEED = 8;
-const ALL_FEEDS_CACHE_KEY = 'feeds_v5:all';
+const ALL_FEEDS_CACHE_KEY = 'feeds_v6:all';
 const FEED_TIMEOUT_MS = 3500;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -79,11 +85,12 @@ async function fetchSingleFeed(source: (typeof FEED_SOURCES)[number]): Promise<N
       const significance = scoreSignificance(
         title,
         description,
-        source.category,
+        source.name,
         publishedAt,
         source.category
       );
       const urlHash = Buffer.from(url).toString('base64');
+      const imageUrl = extractRssImageUrl(item as unknown as Record<string, unknown>);
 
       items.push({
         id: `${source.id}-${urlHash}`,
@@ -94,6 +101,7 @@ async function fetchSingleFeed(source: (typeof FEED_SOURCES)[number]): Promise<N
         category: source.category,
         subcategory: source.subcategories[0],
         publishedAt,
+        imageUrl,
         significance,
         tags: source.subcategories,
       });
@@ -158,16 +166,18 @@ export async function getAllFeedItems(force = false): Promise<NewsItem[]> {
   const bootstrapItems = await fetchFeedsUntil(prioritized, 320);
   const processed = processItems(bootstrapItems);
   setCache(ALL_FEEDS_CACHE_KEY, processed, CACHE_TTL);
+  startBackgroundIngest(processed);
 
   void (async () => {
     try {
       const allItems = await fetchFeedsBatch(prioritized);
       const fullProcessed = processItems(allItems);
       setCache(ALL_FEEDS_CACHE_KEY, fullProcessed, CACHE_TTL);
+      startBackgroundIngest(fullProcessed);
 
       for (const cat of ['ai', 'crypto', 'trading', 'github', 'tech', 'research', 'startups', 'global'] as Category[]) {
         const catItems = fullProcessed.filter((i) => i.category === cat);
-        setCache(`feeds_v5:${cat}`, catItems, CACHE_TTL);
+        setCache(`feeds_v6:${cat}`, catItems, CACHE_TTL);
       }
     } catch {
       // ignore background refresh failures
@@ -212,13 +222,14 @@ export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
   if (cached && cached.length >= MIN_HEALTHY) {
     // Keep answering from cache; refresh the catalog in the background (throttled).
     startBackgroundRefresh();
+    startBackgroundIngest(cached);
     return cached;
   }
 
   const merged = new Map<string, NewsItem>();
   if (cached) for (const item of cached) merged.set(item.id, item);
   for (const cat of ['global', 'ai', 'crypto', 'trading', 'tech', 'research', 'startups', 'github'] as Category[]) {
-    const part = getCached<NewsItem[]>(`feeds_v5:${cat}`);
+    const part = getCached<NewsItem[]>(`feeds_v6:${cat}`);
     if (!part) continue;
     for (const item of part) merged.set(item.id, item);
   }
@@ -253,7 +264,7 @@ export async function getFeedItemsForQuery(): Promise<NewsItem[]> {
     setCache(ALL_FEEDS_CACHE_KEY, items, CACHE_TTL);
     for (const cat of ['ai', 'crypto', 'trading', 'github', 'tech', 'research', 'startups', 'global'] as Category[]) {
       const catItems = items.filter((i) => i.category === cat);
-      if (catItems.length) setCache(`feeds_v5:${cat}`, catItems, CACHE_TTL);
+      if (catItems.length) setCache(`feeds_v6:${cat}`, catItems, CACHE_TTL);
     }
     startBackgroundRefresh();
     return items;

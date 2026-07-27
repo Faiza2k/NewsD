@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 export const dynamic = 'force-dynamic';
 import Parser from 'rss-parser';
 import { extractValidDate, isFresh } from '@/lib/feeds/date-utils';
+import { extractRssImageUrl } from '@/lib/feeds/rss-image';
 import type { NewsItem, Category } from '@/types';
 
 const parser = new Parser({
@@ -17,6 +18,10 @@ const parser = new Parser({
       ['published', 'published'],
       ['updated', 'updated'],
       ['date', 'date'],
+      ['media:content', 'mediaContent', { keepArray: true }],
+      ['media:thumbnail', 'mediaThumbnail', { keepArray: true }],
+      ['itunes:image', 'itunesImage'],
+      ['content:encoded', 'contentEncoded'],
     ],
   },
 });
@@ -78,6 +83,8 @@ async function fetchCustomSource(source: CustomSourceInput): Promise<NewsItem[]>
         '';
       const urlHash = Buffer.from(url).toString('base64');
 
+      const imageUrl = extractRssImageUrl(raw as unknown as Record<string, unknown>);
+
       items.push({
         id: `custom-${urlHash}`,
         title,
@@ -87,6 +94,7 @@ async function fetchCustomSource(source: CustomSourceInput): Promise<NewsItem[]>
         category,
         subcategory: 'custom',
         publishedAt,
+        imageUrl,
         significance: 6,
         tags: ['custom'],
       });
