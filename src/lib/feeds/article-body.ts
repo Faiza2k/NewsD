@@ -1,9 +1,11 @@
+import { getPublicAppUrl } from '@/lib/app-url';
+
 /**
  * WhatsApp-only article body enrichment.
  * Prefer long RSS text when present; otherwise fetch the publisher page.
  */
 
-const USER_AGENT = 'NewsDash/1.0 Ask Agent (+https://news-d.vercel.app)';
+const USER_AGENT = `NewsDash/1.0 Ask Agent (+${getPublicAppUrl()})`;
 const FETCH_TIMEOUT_MS = 6000;
 const BODY_CAP = 7500;
 const THIN_BODY_CHARS = 280;

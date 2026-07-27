@@ -10,14 +10,18 @@ For **both channels**, see [DUAL_CHANNEL_SETUP.md](./DUAL_CHANNEL_SETUP.md).
 Discord user → /ask question: …
        │
        ▼
-POST /api/discord/interactions   (Vercel)
+POST /api/discord/interactions   (Coolify)
        │  verify Ed25519
-       │  defer (type 5) within 3s
+       │  defer ephemeral (type 5, flags 64) within 3s
        ▼
-POST /api/query  { q, chatId: discord:guild:channel:user }
+POST /api/query  { q, chatId: discord:user:{userId} }
        ▼
-Edit interaction message (Discord markdown + source link buttons)
+Edit interaction message (private to that user + source link buttons)
 ```
+
+**Privacy:** `/ask` replies are **ephemeral** — only the person who ran the command can see the answer. Other server members cannot read their chat with the bot.
+
+**Memory:** Each Discord user gets one durable Redis session (`discord:user:{userId}`), shared across channels and DMs. Requires `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`.
 
 No WAHA, n8n, or Meta Cloud API required for Ask.
 
@@ -38,7 +42,7 @@ OAuth2 → URL Generator:
 
 Open the generated URL, pick your server, authorize.
 
-## 3. Vercel environment variables
+## 3. Coolify environment variables
 
 | Variable | Required | Notes |
 |----------|----------|--------|
@@ -56,15 +60,15 @@ In the Developer Portal → your app → **General Information**:
 **Interactions Endpoint URL:**
 
 ```text
-https://news-d.vercel.app/api/discord/interactions
+http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/discord/interactions
 ```
 
-Click **Save**. Discord sends a `PING`; the route must return `PONG` with a valid signature (needs `DISCORD_PUBLIC_KEY` live on Vercel).
+Click **Save**. Discord sends a `PING`; the route must return `PONG` with a valid signature (needs `DISCORD_PUBLIC_KEY` live on Coolify).
 
 Health check (browser):
 
 ```text
-https://news-d.vercel.app/api/discord/interactions
+http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/discord/interactions
 ```
 
 Expect `"configured": true`.
@@ -74,7 +78,7 @@ Expect `"configured": true`.
 After env is live:
 
 ```bash
-curl -X POST "https://news-d.vercel.app/api/discord/register" ^
+curl -X POST "http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/discord/register" ^
   -H "Authorization: Bearer YOUR_BOT_TOKEN"
 ```
 
@@ -82,7 +86,7 @@ Global commands can take up to ~1 hour to appear; for instant testing you can al
 
 ## 6. Use it
 
-In your Discord server:
+In your Discord server (or in a DM with the bot):
 
 ```text
 /ask question: bitcoin price
@@ -91,7 +95,7 @@ In your Discord server:
 /ask question: US Iran war
 ```
 
-Follow-ups in the same channel from the same user reuse session memory (`chatId`).
+Only **you** see the reply (ephemeral). Follow-ups from the same Discord user reuse long-term session memory even if you switch channels or DM the bot.
 
 ## Local testing
 

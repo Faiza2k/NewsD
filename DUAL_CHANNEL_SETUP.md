@@ -1,13 +1,13 @@
 # NewsDash Ask — WhatsApp + Discord (dual channel)
 
-Both channels use the **same brain**: `POST /api/query` on Vercel.
+Both channels use the **same brain**: `POST /api/query` on Coolify.
 
 | Channel | Where it runs | User entry |
 |---------|---------------|------------|
 | **WhatsApp** | Local WAHA + n8n | DM business number |
 | **Discord** | Vercel | `/ask question: …` in server |
 
-Memory is **per channel** (WhatsApp phone JID vs `discord:guild:channel:user`).
+Memory is **isolated by channel identity**: WhatsApp phone JID vs Discord `discord:user:{userId}` (one memory per Discord user across servers/channels/DMs). Discord `/ask` replies are **ephemeral** (private to the asking user).
 
 ---
 
@@ -22,19 +22,19 @@ Memory is **per channel** (WhatsApp phone JID vs `discord:guild:channel:user`).
            ┌────────────────────┼────────────────────┐
            │                    │                    │
            ▼                    ▼                    ▼
-   WhatsApp (WAHA)        Discord (Vercel)    Optional Cloud API
+   WhatsApp (WAHA)        Discord (Coolify)    Optional Cloud API
    n8n → sendText         /api/discord/...    /api/whatsapp/webhook
 ```
 
 Health check (after deploy):
 
 ```text
-https://news-d.vercel.app/api/ask/status
+http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/ask/status
 ```
 
 ---
 
-## Part A — Discord (Vercel)
+## Part A — Discord (Coolify)
 
 ### 1. Create Discord app + bot
 [Discord Developer Portal](https://discord.com/developers/applications) → New Application → Add Bot.
@@ -45,7 +45,7 @@ Copy:
 - Bot Token → `DISCORD_BOT_TOKEN`
 
 ### 2. Vercel env vars
-Add on Vercel (and `.env.local` for local dev):
+Add on Coolify (and `.env.local` for local dev):
 
 ```env
 DISCORD_PUBLIC_KEY=
@@ -55,20 +55,20 @@ DISCORD_ALLOWED_GUILD_IDS=   # optional, comma-separated
 ```
 
 ### 3. Deploy code
-Push latest repo to Vercel (`news-d.vercel.app`).
+Push latest repo / redeploy Coolify (`news-d.vercel.app`).
 
 ### 4. Interactions Endpoint URL
 Developer Portal → General Information:
 
 ```text
-https://news-d.vercel.app/api/discord/interactions
+http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/discord/interactions
 ```
 
 Save — Discord verifies with PING/PONG.
 
 ### 5. Register `/ask`
 ```bash
-curl -X POST "https://news-d.vercel.app/api/discord/register" -H "Authorization: Bearer YOUR_BOT_TOKEN"
+curl -X POST "http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/discord/register" -H "Authorization: Bearer YOUR_BOT_TOKEN"
 ```
 
 ### 6. Invite bot
@@ -148,17 +148,17 @@ Voice notes: workflow transcribes via `/api/transcribe` then queries.
 
 | Step | WhatsApp | Discord |
 |------|----------|---------|
-| Brain | `/api/query` on Vercel | same |
+| Brain | `/api/query` on Coolify | same |
 | Keep running | WAHA + n8n containers | Vercel only |
 | User says | text/voice DM | `/ask question: …` |
-| Memory key | `923…@c.us` | `discord:guild:channel:user` |
+| Memory key | `923…@c.us` | `discord:user:{userId}` |
 
 **Do not** stop WAHA if you want WhatsApp users. **Do not** remove Discord env vars if you want Discord users.
 
 Check status:
 
 ```text
-GET https://news-d.vercel.app/api/ask/status
+GET http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/ask/status
 ```
 
 ---
@@ -181,7 +181,7 @@ GET https://news-d.vercel.app/api/ask/status
 
 ### Follow-ups not working
 - Same user + same channel required
-- Memory TTL is 45 minutes on Vercel
+- Memory TTL is 45 minutes on Coolify
 
 ---
 

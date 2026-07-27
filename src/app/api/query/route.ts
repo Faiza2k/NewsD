@@ -2,18 +2,24 @@ import { getFeedItemsForQuery } from '@/lib/feeds/fetch-all-feeds';
 import { isFresh } from '@/lib/feeds/date-utils';
 import { resolveArticleBodies } from '@/lib/feeds/article-body';
 import {
+  buildConversationalReply,
   buildExtractiveAnswer,
   buildGroundedAnswer,
+  buildGroundedAnswerWithPath,
   detectQueryLanguage,
   englishSearchHints,
+  isDegenerateRepetition,
   isWeakGroundedAnswer,
+  mapClaimsToSources,
   planNewsQuery,
   resolveReplyLanguage,
+  selectRelevantCandidateIndexes,
   translateAnswerText,
   type GroundedSource,
   type ReplyLanguage,
 } from '@/lib/query/grounded-answer';
 import {
+  getConversationStateForChat,
   isVagueFollowUp,
   normalizeChatId,
   resolveEffectiveQuery,
@@ -22,21 +28,56 @@ import {
   type HistoryTurn,
   type StoredSource,
 } from '@/lib/query/memory';
+import { classifyTurn, type TurnClassification } from '@/lib/query/classify-turn';
+import {
+  awaitingWeatherCitySlot,
+  extractWeatherCitiesFromAsk,
+  looksLikeCitySlotFill,
+  normalizeCityQuery,
+  requestedPumpProducts,
+  splitWeatherCities,
+  stripWeatherFillers,
+  wantsPakistanPumpFuel,
+  WEATHER_NON_CITY,
+} from '@/lib/query/plugin-gates';
+import {
+  buildDawnOpinionListReply,
+  buildDawnOpinionPickBrief,
+  DAWN_OPINION_LIST_INTENT,
+  dawnItemsToStoredSources,
+  fetchDawnOpinionItems,
+  isDawnOpinionListAsk,
+  isDawnOpinionMenuPending,
+  parseDawnOpinionSelection,
+  type DawnOpinionItem,
+} from '@/lib/query/dawn-opinion';
+import { isIdentityAsk } from '@/lib/query/persona';
+import {
+  beginTurnPaths,
+  getTurnPaths,
+  logTurnPaths,
+  setClassifyPath,
+  setGroundingPath,
+  type TurnPathLog,
+} from '@/lib/query/turn-paths';
+import { createStageTimer, newRequestId } from '@/lib/rag/metrics';
+import { inferNeedTag } from '@/lib/rag/chunk';
+import { fuseHybridAndLexical, hybridRetrieve } from '@/lib/rag/retrieve';
+import type { RagNeedTag } from '@/lib/rag/types';
+import { isVectorConfigured } from '@/lib/rag/vector';
 import type { Category, NewsItem } from '@/types';
 import { getRedisClient } from '@/lib/kv/redis';
+import {
+  expandTopicTokens,
+  isAbstractTopicAsk,
+  questionLooksAbstract,
+} from '@/lib/query/topic-expand';
 
 
 export const dynamic = 'force-dynamic';
 
-// A single stray rejected promise (feed fetch, URL shortener, …) must never
-// crash the whole serverless instance — that produced clusters of HTML 500s.
-const rejectionGuard = globalThis as typeof globalThis & { __newsdashRejectionGuard?: boolean };
-if (!rejectionGuard.__newsdashRejectionGuard && typeof process?.on === 'function') {
-  rejectionGuard.__newsdashRejectionGuard = true;
-  process.on('unhandledRejection', (err) => {
-    console.error('[query] unhandled rejection (suppressed)', err);
-  });
-}
+/** Active request id for path instrumentation inside nested helpers. */
+let currentRequestId = '';
 
 /**
  * Universal NewsDash query brain:
@@ -109,6 +150,19 @@ type OilQuote = {
   wtiChange24h?: number;
   brentChange24h?: number;
   usdPkrRate?: number;
+  wtiPkrApprox?: number;
+  brentPkrApprox?: number;
+};
+
+/** Pakistan pump / ex-depot prices (PKR per litre) — not WTI/Brent barrels. */
+type PakistanFuelQuote = {
+  petrolPkr: number;
+  dieselPkr: number;
+  effectiveDate?: string;
+  source: string;
+  scrapedAt?: string;
+  /** Publisher pages the user can open to verify (full https URLs). */
+  verifyUrls: Array<{ label: string; url: string }>;
 };
 
 type PluginKind = 'greeting' | 'weather' | 'gold_price' | 'crypto_price' | 'fuel_price' | 'news';
@@ -206,6 +260,11 @@ const LIGHT_EXPAND: Record<string, string[]> = {
   hukumat: ['government', 'government', 'administration'],
   ekonomi: ['economy', 'economic', 'market'],
   mehngai: ['inflation', 'prices', 'economy'],
+  macro: ['macroeconomic', 'inflation', 'gdp', 'trade', 'tariff', 'fed', 'rates', 'markets'],
+  macroeconomic: ['macro', 'inflation', 'gdp', 'trade', 'tariff', 'fed', 'rates', 'recession', 'markets'],
+  macroeconomics: ['macro', 'macroeconomic', 'inflation', 'gdp', 'trade', 'tariff', 'fed', 'rates'],
+  economy: ['economic', 'inflation', 'gdp', 'recession', 'growth', 'markets', 'trade'],
+  economic: ['economy', 'inflation', 'gdp', 'recession', 'growth', 'markets', 'trade'],
   dollar: ['usd', 'currency', 'exchange', 'pkr'],
   rupee: ['pkr', 'currency', 'exchange'],
   lebanon: ['lebanese', 'hezbollah', 'beirut', 'israel'],
@@ -247,6 +306,8 @@ const WA_ANSWER_MIN = 40;
 const MIN_MATCH = 8;
 const GRAMS_PER_TROY_OZ = 31.1034768;
 const GRAMS_PER_TOLA = 11.6638038;
+/** Rotates no-match boilerplate so consecutive empty retrievals don't clone one sentence. */
+let noMatchVariantSeq = 0;
 
 function clean(q: string): string {
   return q
@@ -295,6 +356,8 @@ function expandTokens(tokens: string[]): string[] {
   for (const t of tokens) {
     for (const x of LIGHT_EXPAND[t] || []) out.add(x);
   }
+  // Concept expansions (macro → inflation/tariff/…) for recall only.
+  for (const x of expandTopicTokens(tokens)) out.add(x);
   return [...out];
 }
 
@@ -376,11 +439,13 @@ function normalizeVoiceQuery(raw: string): string {
   q = q.replace(/انکریز/g, 'increase');
   q = q.replace(/ڈیکریز/g, 'decrease');
 
-  // Nastaliq / mixed: bitcoin/سونا/پیٹرول + قیمت/پرائز
+  // Nastaliq / mixed: bitcoin/سونا|سونے/پیٹرول + قیمت/پرائز
+  // Map inflected gold forms first so detectPlugin sees English "gold".
+  q = q.replace(/سونے|سونا|گولڈ/g, 'gold');
   if (/قیمت|ریٹ|پرائز|price|increase|decrease/i.test(q)) {
     if (/بٹ\s*کوائن|بٹکوائن|بٹ\s*کون|bitcoin|btc/i.test(q) || /بی\s*ٹی\s*سی/.test(raw)) {
       q = `bitcoin price ${q}`;
-    } else if (/سونا|گولڈ|gold/i.test(q)) {
+    } else if (/\bgold\b/i.test(q)) {
       q = `gold price ${q}`;
     } else if (/ایتھیریم|ethereum|eth/i.test(q)) {
       q = `ethereum price ${q}`;
@@ -400,6 +465,15 @@ function isPriceClarifyQuery(q: string): boolean {
 
 function isSimplePriceCheck(q: string): boolean {
   const s = clean(q).toLowerCase();
+  // Clear asset+price asks are always simple live quotes — even with Roman Urdu
+  // question particles ("kya hai", "aaj", "yaar") that are not analysis words.
+  const clearLivePrice =
+    (/\b(bitcoin|btc|ethereum|eth|solana|sol|gold|xau|petrol|diesel|fuel)\b/.test(s) ||
+      /بٹ\s*کوائن|بٹکوائن|ایتھیریم|سونا|سونے|گولڈ|پیٹرول|پٹرول|ڈیزل/.test(q)) &&
+    (/\b(price|rate|spot|keemat|qimat|qiymat|kimat|worth|how much)\b/.test(s) ||
+      /قیمت|ریٹ|پرائز|پرائیس/.test(q));
+  if (clearLivePrice) return true;
+
   // If it contains question words, analysis words, or intent to know reasons/causes
   if (
     /\b(why|how|reason|because|war|wars|news|explain|explanation|detail|details|predict|prediction|forecast|trend|affect|impact|batao|bataen|bataiye|sunao|sunayein|bolo|bolain|likho|likhein|kya\s+hua|kia\s+hua|kyun|kyu|ku|wajah|وجہ|کیوں|ہوا|did|is\s+it|up|down|going|go|drop|fell|fall|rose|rise|rally|dump|crash|change|percent|percentage)\b/i.test(
@@ -424,27 +498,24 @@ function detectPlugin(q: string): Plugin {
     (/\b(weather|forecast|temperature|humidity|mosam|mosaam|موسم)\b/.test(s) &&
       !/\b(oil|stock|market|bitcoin|crypto|gold|ai|nvidia|news)\b/.test(s))
   ) {
-    let city = s
-      .replace(
-        /\b(weather|forecast|temperature|humidity|mosam|mosaam|today|now|current|please|tell|me|about|of|in|for|the|a|an|to|know|want|need|check|see|find|out|give|show|i|is|what|whats|how|kya|hai)\b/g,
-        ' ',
-      )
-      .replace(/موسم|بتاؤ|بتاو|کیا|ہے/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    if (!city) return { kind: 'weather', city: 'London', cityAsked: false };
-    return { kind: 'weather', city: normalizeCityQuery(city), cityAsked: true };
+    const cities = extractWeatherCitiesFromAsk(s);
+    if (!cities.length) {
+      // Do not invent Karachi/London — ask the user which city.
+      return { kind: 'weather', city: '', cityAsked: false };
+    }
+    return { kind: 'weather', city: cities.join(', '), cityAsked: true };
   }
 
   if (isPriceClarifyQuery(s)) {
-    return { kind: 'crypto_price', cryptoId: 'bitcoin' };
+    // Coin resolved later from session (last crypto), not forced to bitcoin here.
+    return { kind: 'crypto_price', cryptoId: 'pending' };
   }
 
   const priceAsk = wantsLivePrice(q) || /\b(increasing|decreasing|up or down)\b/.test(s);
   const mentionsBtc = /\b(bitcoin|btc)\b/.test(s) || /بٹ\s*کوائن|بٹکوائن/.test(q);
   const mentionsEth = /\b(ethereum|eth)\b/.test(s) || /ایتھیریم/.test(q);
   const mentionsSol = /\b(solana|sol)\b/.test(s);
-  const mentionsGold = /\b(gold|xau|bullion)\b/.test(s) || /سونا|گولڈ/.test(q);
+  const mentionsGold = /\b(gold|xau|bullion|sona|sone|sonay)\b/.test(s) || /سونا|سونے|گولڈ/.test(q);
   const mentionsFuel =
     /\b(petrol|diesel|gasoline|fuel|pump)\b/.test(s) || /پیٹرول|پٹرول|ڈیزل|ایندھن/.test(q);
   const shortAsk = tokenize(s).length <= 5;
@@ -480,6 +551,89 @@ type DomainHint = {
 } | null;
 function detectDomainHint(q: string): DomainHint {
   const s = clean(q);
+
+  // Named outlets — always from THIS query string (never sticky prior outlet).
+  if (/\bbbc\b/i.test(s) || /بی\s*بی\s*سی/.test(q)) {
+    return {
+      category: 'global',
+      searchOverride: 'BBC news world politics BBC.com latest headlines',
+      topicLabel: 'BBC News',
+      mustMatch: /\bbbc\b/i,
+    };
+  }
+  if (/\breuters\b/i.test(s) || /روئٹرز|رائٹرز/.test(q)) {
+    return {
+      category: 'global',
+      searchOverride: 'Reuters news world politics markets',
+      topicLabel: 'Reuters',
+      mustMatch: /\breuters\b/i,
+    };
+  }
+  if (/\b(the\s+)?guardian\b/i.test(s)) {
+    return {
+      category: 'global',
+      searchOverride: 'Guardian news world politics technology',
+      topicLabel: 'The Guardian',
+      mustMatch: /\bguardian\b/i,
+    };
+  }
+  if (/\bal\s*jazeera\b|\baljazeera\b/i.test(s)) {
+    return {
+      category: 'global',
+      searchOverride: 'Al Jazeera news world middle east',
+      topicLabel: 'Al Jazeera',
+      mustMatch: /\bal\s*jazeera\b|\baljazeera\b/i,
+    };
+  }
+
+  // Dawn newspaper / Dawn opinions — pin global feeds and require Dawn attribution.
+  if (
+    /\b(dawn(?:\s+(?:news|newspaper|paper|editorial|editorials|opinion|opinions|column|columns))?)\b/i.test(
+      s,
+    ) ||
+    /\bdawn\s+(?:ka|ki|ke)\b/i.test(s) ||
+    /ڈان/.test(q)
+  ) {
+    const wantsOpinion = /\b(opinion|opinions|editorial|editorials|column|columns|view|views|stance|analysis)\b/i.test(
+      s,
+    ) || /رائے|اداریہ|کالم/.test(q);
+    return {
+      category: 'global',
+      searchOverride: wantsOpinion
+        ? 'Dawn opinion editorial column Pakistan Dawn.com analysis view'
+        : 'Dawn news Pakistan Dawn.com politics editorial',
+      topicLabel: wantsOpinion ? 'Dawn Opinions' : 'Dawn News',
+      mustMatch: /\bdawn\b/i,
+    };
+  }
+
+  // Macro / economy / markets surveys — pin trading feeds; no mustMatch
+  // (headlines rarely contain the word "macroeconomic").
+  if (
+    /\b(macro(?:economic|economics)?|econom(?:y|ic|ics)|inflation|gdp|recession|interest rates?|central banks?|monetary|fiscal|tariffs?|trade deal|bond yields?)\b/i.test(
+      s,
+    )
+  ) {
+    return {
+      category: 'trading',
+      searchOverride:
+        'macroeconomy inflation gdp trade tariff fed interest rates central bank markets recession employment',
+      topicLabel: 'Macroeconomic News',
+    };
+  }
+
+  // Broad "new technologies / innovation" surveys → tech+ai recall.
+  if (
+    /\b(new technolog(?:y|ies)|emerging technolog(?:y|ies)|tech trends?|innovation(?:s)? (?:news|today|latest)|latest tech)\b/i.test(
+      s,
+    )
+  ) {
+    return {
+      category: 'tech',
+      searchOverride: 'technology AI chip semiconductor startup innovation product launch model',
+      topicLabel: 'New Tech Trends',
+    };
+  }
 
   // GitHub / Open-source / DevOps
   if (
@@ -895,7 +1049,9 @@ async function retrieveAndRank(
   let usedLatestFallback = false;
   if (opts?.mustMatch && scored.length) {
     const direct = scored.filter((i) =>
-      opts.mustMatch!.test(`${i.title} ${i.description || ''}`),
+      opts.mustMatch!.test(
+        `${i.title} ${i.description || ''} ${i.source || ''} ${i.url || ''}`,
+      ),
     );
     if (direct.length) {
       scored = direct;
@@ -974,7 +1130,14 @@ async function retrieveAndRank(
         const hay = `${i.title} ${i.description || ''}`.toLowerCase();
         return probes.some((t) => hay.includes(t));
       });
-      if (!anyDirect) usedLatestFallback = true;
+      if (!anyDirect) {
+        // Abstract theme asks ("macroeconomic", "new technologies") almost never
+        // appear literally in headlines — do not force the no-match template
+        // here. The LLM relevance judge decides after hybrid fusion.
+        if (!isAbstractTopicAsk(meaningfulBase) && !questionLooksAbstract(q)) {
+          usedLatestFallback = true;
+        }
+      }
     }
   }
 
@@ -994,29 +1157,70 @@ const GENERIC_QUERY_TOKENS = new Set([
   'new', 'daily', 'announced', 'announcement', 'price', 'prices', 'market', 'markets',
   'world', 'global', 'breaking', 'report', 'reports', 'story', 'stories', 'about',
   'more', 'detail', 'details', 'info', 'information', 'explain', 'follow', 'user',
-  'question', 'prior', 'batao', 'bataen', 'sunao', 'mazeed',
+  'question', 'prior', 'result', 'results', 'reason', 'reasons', 'effect', 'effects',
+  'record', 'coverage', 'batao', 'bataen', 'sunao', 'mazeed',
   'khabrein', 'khabren', 'khabar', 'khabrain', 'akhbar', 'khabarein', 'aaj', 'kal',
 ]);
 
-/** Common Whisper/STT mishearings for cities we serve often */
-const CITY_ALIASES: Record<string, string> = {
-  'fish hour': 'Peshawar',
-  fishhour: 'Peshawar',
-  'fish our': 'Peshawar',
-  'pishawar': 'Peshawar',
-  'peshawar': 'Peshawar',
-  'peshwar': 'Peshawar',
-  'peshawer': 'Peshawar',
-  'islam abad': 'Islamabad',
-  'isloambad': 'Islamabad',
-  'rawal pindi': 'Rawalpindi',
-  'lahore': 'Lahore',
-  'karachi': 'Karachi',
-};
+/** Infer BTC/ETH/SOL from free text; null if none named. */
+function inferCryptoIdFromText(...parts: Array<string | null | undefined>): 'bitcoin' | 'ethereum' | 'solana' | null {
+  const hay = parts.filter(Boolean).join(' ');
+  if (!hay.trim()) return null;
+  if (/\bethereum\b|\beth\b|ایتھیریم/i.test(hay)) return 'ethereum';
+  if (/\bsolana\b|\bsol\b/i.test(hay)) return 'solana';
+  if (/\bbitcoin\b|\bbtc\b|بٹ\s*کوائن|بٹکوائن/i.test(hay)) return 'bitcoin';
+  return null;
+}
 
-function normalizeCityQuery(name: string): string {
-  const key = name.trim().toLowerCase().replace(/\s+/g, ' ');
-  return CITY_ALIASES[key] || name.trim();
+/**
+ * True when the user names a new subject word not present in the prior ask
+ * (e.g. "what about Apple?" after a gold thread) — without needing an entity catalog.
+ */
+function hasNovelSubjectTokens(incoming: string, previous: string): boolean {
+  const stop = new Set([
+    ...STOP_WORDS,
+    'about',
+    'regarding',
+    'please',
+    'latest',
+    'today',
+    'price',
+    'prices',
+    'up',
+    'down',
+    'more',
+    'again',
+    'still',
+    'now',
+  ]);
+  const prev = new Set(
+    previous
+      .toLowerCase()
+      .split(/[^a-z0-9\u0600-\u06ff]+/i)
+      .filter((w) => w.length >= 3 && !stop.has(w)),
+  );
+  const words = incoming
+    .toLowerCase()
+    .split(/[^a-z0-9\u0600-\u06ff]+/i)
+    .filter((w) => w.length >= 4 && !stop.has(w));
+  return words.some((w) => !prev.has(w));
+}
+
+function buildWeatherCityClarify(lang: ReplyLanguage): string {
+  if (lang === 'ur') {
+    return [
+      '*NewsDash Analyst*',
+      '',
+      '*موضوع:* موسم',
+      'کس شہر کا موسم دیکھنا ہے؟ شہر کا نام لکھیں (مثلاً Zhob، Peshawar، Karachi)۔',
+    ].join('\n');
+  }
+  return [
+    '*NewsDash Analyst*',
+    '',
+    '*Topic:* Weather',
+    'Which city should I check? Reply with a city name (e.g. Zhob, Peshawar, Karachi).',
+  ].join('\n');
 }
 
 async function geocode(name: string): Promise<{ lat: number; lon: number; label: string } | null> {
@@ -1043,16 +1247,20 @@ async function geocode(name: string): Promise<{ lat: number; lon: number; label:
 async function fetchWeather(city: string, cityAsked: boolean): Promise<WeatherPayload | null> {
   try {
     const asked = normalizeCityQuery(city);
+    const askedKey = asked.trim().toLowerCase();
+    if (!askedKey || WEATHER_NON_CITY.has(askedKey)) {
+      return { error: 'Which city should I check the weather for?', requestedCity: '' };
+    }
     const geo = await geocode(asked);
-    if (cityAsked && !geo) {
+    if (!geo) {
       return {
         error: `Could not find location "${asked}". Try a clearer city name.`,
         requestedCity: asked,
       };
     }
-    const lat = geo?.lat ?? 51.5074;
-    const lon = geo?.lon ?? -0.1278;
-    const label = geo?.label ?? 'London, UK';
+    const lat = geo.lat;
+    const lon = geo.lon;
+    const label = geo.label;
     const wxRes = await fetch(
       `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
         '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m' +
@@ -1135,7 +1343,7 @@ async function fetchGold(): Promise<GoldQuote | null> {
   }
 }
 
-async function fetchCrypto(id: string, withPkr = false): Promise<CryptoQuote | null> {
+async function fetchCrypto(id: string, withPkr = true): Promise<CryptoQuote | null> {
   try {
     const url =
       `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}` +
@@ -1213,8 +1421,74 @@ async function fetchOil(): Promise<OilQuote | null> {
       brentUsd: brent?.price,
       brentChange24h: brent?.change24h,
     };
-    if (usdPkr) quote.usdPkrRate = usdPkr;
+    if (usdPkr) {
+      quote.usdPkrRate = usdPkr;
+      quote.wtiPkrApprox = Math.round(wti.price * usdPkr);
+      if (brent?.price) quote.brentPkrApprox = Math.round(brent.price * usdPkr);
+    }
     return quote;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pakistan petrol / diesel pump (ex-depot) prices in PKR/litre.
+ * Prefer Shell/PakWheels national figures (not city-specific Octane Plus).
+ */
+async function fetchPakistanFuelPrices(): Promise<PakistanFuelQuote | null> {
+  try {
+    const res = await fetch('https://fuel.trackmate.page/api/prices', {
+      headers: { Accept: 'application/json', 'User-Agent': 'NewsDash/1.0' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      prices?: Array<{
+        source?: string;
+        product?: string;
+        price_pkr?: number;
+        unit?: string;
+        city?: string | null;
+        effective_date?: string | null;
+        scraped_at?: string;
+      }>;
+    };
+    const rows = Array.isArray(data.prices) ? data.prices : [];
+    const national = rows.filter((r) => !r.city);
+    const pick = (product: string) => {
+      const pool = national.filter(
+        (r) => String(r.product || '').toLowerCase() === product && Number(r.price_pkr) > 0,
+      );
+      const ranked = [...pool].sort((a, b) => {
+        const rank = (s?: string) =>
+          s === 'shell' ? 0 : s === 'pakwheels' ? 1 : s === 'pso' ? 2 : 3;
+        return rank(a.source) - rank(b.source);
+      });
+      return ranked[0] || null;
+    };
+    const petrol = pick('petrol');
+    const diesel = pick('hsd') || pick('diesel');
+    if (!petrol && !diesel) return null;
+    const src = String(petrol?.source || diesel?.source || 'shell').toLowerCase();
+    const primaryUrl =
+      src === 'pso'
+        ? 'https://psopk.com/en/products-services/fuel-prices'
+        : src === 'pakwheels'
+          ? 'https://www.pakwheels.com/fuel-prices-in-pakistan/'
+          : 'https://www.shell.com.pk/motorists/shell-fuels/fuel-price.html';
+    return {
+      petrolPkr: Number(petrol?.price_pkr || 0),
+      dieselPkr: Number(diesel?.price_pkr || 0),
+      effectiveDate: String(petrol?.effective_date || diesel?.effective_date || '').trim() || undefined,
+      source: src,
+      scrapedAt: petrol?.scraped_at || diesel?.scraped_at,
+      verifyUrls: [
+        { label: src === 'pso' ? 'PSO' : src === 'pakwheels' ? 'PakWheels' : 'Shell PK', url: primaryUrl },
+        { label: 'OGRA', url: 'https://ogra.org.pk/notified-petroleum-prices' },
+        { label: 'Fuel feed', url: 'https://fuel.trackmate.page/' },
+      ],
+    };
   } catch {
     return null;
   }
@@ -1263,8 +1537,9 @@ function localizedTopicLabel(label: string, lang: ReplyLanguage): string {
   return map[label] || label;
 }
 
+import { getPublicAppUrl } from '@/lib/app-url';
+
 const SHORT_LINK_TIMEOUT_MS = 2500;
-const PUBLIC_APP = 'https://news-d.vercel.app';
 
 function makeBrandedRedirect(url: string): string {
   const b64 = Buffer.from(url.trim(), 'utf-8')
@@ -1272,7 +1547,7 @@ function makeBrandedRedirect(url: string): string {
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/, '');
-  return `${PUBLIC_APP}/api/r/${b64}`;
+  return `${getPublicAppUrl()}/api/r/${b64}`;
 }
 
 /**
@@ -1280,8 +1555,19 @@ function makeBrandedRedirect(url: string): string {
  * Prefer public shorteners; fall back to branded /api/r when shorter than original.
  */
 async function shortenArticleUrl(url: string): Promise<string> {
-  const original = url.trim();
+  let original = url.trim();
   if (!isValidArticleUrl(original)) return original;
+
+  // Strip tracking junk so shorteners / display stay tidy.
+  try {
+    const u = new URL(original);
+    for (const key of [...u.searchParams.keys()]) {
+      if (/^(utm_|fbclid|gclid|mc_|ref$)/i.test(key)) u.searchParams.delete(key);
+    }
+    original = u.toString();
+  } catch {
+    // keep original
+  }
 
   const endpoints = [
     'https://is.gd/create.php?format=simple&url=' + encodeURIComponent(original),
@@ -1316,9 +1602,21 @@ async function shortenArticleUrl(url: string): Promise<string> {
 }
 
 /**
- * Formats a source for WhatsApp with a short clickable https URL.
- * WhatsApp auto-linkifies https:// so users can open the real article.
+ * Compact source line: short article title (so the user can choose) + publisher + time.
+ * Title is the primary label; never dump the long publisher URL into the chat body.
  */
+function shortArticleTitle(title: string, max = 72): string {
+  const t = String(title || '')
+    .replace(/\s+/g, ' ')
+    .replace(/[\[\]*()]/g, '')
+    .trim();
+  if (!t) return '';
+  if (t.length <= max) return t;
+  const cut = t.slice(0, max - 1);
+  const sp = cut.lastIndexOf(' ');
+  return `${(sp > Math.floor(max * 0.45) ? cut.slice(0, sp) : cut).trim()}…`;
+}
+
 function formatSourceLine(
   i: QueryResultItem,
   idx: number,
@@ -1326,18 +1624,28 @@ function formatSourceLine(
   displayUrl: string,
 ): string {
   const when = formatTime(i.publishedAt);
-  const label = (i.source || 'Publisher').replace(/[\[\]]/g, '').trim() || 'Publisher';
-  const prefix = showIndex ? `*${idx + 1}. ${i.title.trim()}*` : `*${i.title.trim()}*`;
-  const meta = [label, when].filter(Boolean).join(' · ');
-  return [`${prefix}${meta ? ` — ${meta}` : ''}`, displayUrl].join('\n');
+  const publisher = (i.source || 'Source').replace(/[\[\]*()]/g, '').trim() || 'Source';
+  const shortPub = publisher.length > 22 ? publisher.slice(0, 19) + '…' : publisher;
+  const title = shortArticleTitle(i.title || '', 72);
+  const idxBit = showIndex ? `${idx + 1}. ` : '';
+  if (title) {
+    const meta = [shortPub, when].filter(Boolean).join(' · ');
+    return `• [${idxBit}${title}](${displayUrl})${meta ? ` · ${meta}` : ''}`;
+  }
+  return `• [${idxBit}${shortPub}](${displayUrl})${when ? ` · ${when}` : ''}`;
 }
 
 type SourceButton = { type: 'url'; text: string; url: string };
 
-function buttonLabel(source: string, idx: number, total: number): string {
-  const base = (source || 'Open article').replace(/[\[\]*]/g, '').trim() || 'Open article';
+function buttonLabel(item: QueryResultItem, idx: number, total: number): string {
+  const title = shortArticleTitle(item.title || '', 52);
+  const base =
+    title ||
+    (item.source || 'Open article').replace(/[\[\]*]/g, '').trim() ||
+    'Open article';
   let label = total > 1 ? `${idx + 1}. ${base}` : base;
-  if (label.length > 20) label = label.slice(0, 17) + '...';
+  // Discord link-button labels allow up to 80 chars.
+  if (label.length > 80) label = label.slice(0, 77) + '...';
   return label;
 }
 
@@ -1347,7 +1655,7 @@ function buildSourceButtons(items: QueryResultItem[], displayUrls: string[]): So
     .slice(0, 3)
     .map((i, idx, arr) => ({
       type: 'url' as const,
-      text: buttonLabel(i.source || 'Open article', idx, arr.length),
+      text: buttonLabel(i, idx, arr.length),
       url: displayUrls[idx] || i.url.trim(),
     }));
 }
@@ -1377,22 +1685,27 @@ async function buildNewsReply(
   note?: string,
   closestCoverage?: boolean,
   langOverride?: ReplyLanguage,
-  history?: any[],
+  history?: Array<{ role?: string; text?: string; content?: string }>,
   liveQuoteText?: string,
+  needTag?: RagNeedTag,
+  rollingSummary?: string,
 ): Promise<{
   text: string;
   answer: string;
   sources: GroundedSource[];
   sourceButtons: SourceButton[];
   displayUrls: string[];
+  /** True only when the LLM produced a real grounded answer (safe to reuse as evidence). */
+  grounded: boolean;
 }> {
   const lang = langOverride ?? detectQueryLanguage(question);
   const topicHdr = localizedTopicLabel(topicLabel, lang);
   const topicKey = lang === 'ur' ? '*موضوع:*' : '*Topic:*';
-  const parts = ['*NewsDash Analyst*', '', `${topicKey} ${topicHdr}`];
-  if (note) parts.push(note);
+  /** Rigid header template — last-resort / fallback paths only. */
+  const templateHeader = ['*NewsDash Analyst*', '', `${topicKey} ${topicHdr}`];
+  if (note) templateHeader.push(note);
   else if (closestCoverage && items.length) {
-    parts.push(
+    templateHeader.push(
       lang === 'ur'
         ? '_قریب ترین تازہ کوریج:_'
         : '_Closest live coverage from NewsDash:_',
@@ -1407,22 +1720,35 @@ async function buildNewsReply(
         lang === 'ur'
           ? 'اس وقت فیڈز میں اس پر کوئی براہِ راست خبر نہیں — اوپر تازہ لائیو ریٹ ہے۔'
           : 'No directly related news in the feeds right now — the live rate above is the freshest data.';
-      parts.push('', answerLabel, liveQuoteText, tail);
+      const parts = [...templateHeader, '', answerLabel, liveQuoteText, tail];
       return {
         text: parts.join('\n'),
         answer: liveQuoteText,
         sources: [],
         sourceButtons: [],
         displayUrls: [],
+        grounded: false,
       };
     }
-    // Only when the whole feed pool is empty (syncing). Never claim the topic was "not published".
-    const syncing =
-      lang === 'ur'
-        ? 'NewsDash کی فیڈز ابھی تازہ ہو رہی ہیں۔ ایک لمحے بعد دوبارہ پوچھیں — میں تازہ کوریج سے جواب دوں گا۔'
-        : 'NewsDash feeds are refreshing. Ask again in a moment and I will answer from the latest coverage.';
-    parts.push(syncing);
-    return { text: parts.join('\n'), answer: '', sources: [], sourceButtons: [], displayUrls: [] };
+    // Empty result set: honest no-coverage (A2 pattern). Only mention syncing
+    // when the entire feed pool is actually empty.
+    setGroundingPath(currentRequestId, 'none', poolSize === 0 ? 'feeds_empty' : 'no_match_empty');
+    const emptyNote =
+      poolSize === 0
+        ? lang === 'ur'
+          ? 'NewsDash کی فیڈز ابھی دستیاب نہیں۔ ایک لمحے بعد دوبارہ پوچھیں، یا کوئی اور موضوع آزمائیں۔'
+          : "I couldn't reach the live feeds just now. Try again in a moment, or ask about something else."
+        : lang === 'ur'
+          ? `نیوزڈیش کی تازہ فیڈز میں "${question.trim().slice(0, 60)}" سے متعلق براہِ راست کوریج نہیں ملی۔ مزید مخصوص سوال پوچھیں، یا میں تازہ ترین سرخیاں دکھا سکتا ہوں۔`
+          : `No direct coverage found for "${question.trim().slice(0, 60)}" in NewsDash feeds right now. Try a more specific keyword, or ask me for the latest headlines.`;
+    return {
+      text: [...templateHeader, '', emptyNote].join('\n'),
+      answer: emptyNote,
+      sources: [],
+      sourceButtons: [],
+      displayUrls: [],
+      grounded: false,
+    };
   }
 
   const sources = await enrichGroundedSources(items);
@@ -1430,7 +1756,7 @@ async function buildNewsReply(
     sources.unshift({
       title: lang === 'ur' ? 'لائیو ریٹ کارڈ' : 'Live Price Quote Card',
       source: 'NewsDash Live API',
-      url: 'https://news-d.vercel.app',
+      url: getPublicAppUrl(),
       body: liveQuoteText,
     });
   }
@@ -1439,24 +1765,66 @@ async function buildNewsReply(
   // they are the freshest items from the entire feed pool. Do NOT pass them to
   // the LLM (it will hallucinate a confident answer about unrelated stories).
   // Instead, skip grounding and show a honest "no direct match" note.
+  // Rotate variants so consecutive empty-match turns don't share an identical sentence.
   if (closestCoverage) {
-    const noMatchNote =
-      langOverride === 'ur'
-        ? `نیوزڈیش کی تازہ فیڈز میں "${question.trim().slice(0, 60)}" سے متعلق براہِ راست کوریج نہیں ملی۔ ذیل میں تازہ ترین عالمی خبریں ہیں — مزید مخصوص سوال پوچھیں تاکہ بہتر جواب مل سکے۔`
-        : `No direct coverage found for "${question.trim().slice(0, 60)}" in NewsDash feeds right now. Showing latest headlines instead — try a more specific keyword for a targeted answer.`;
+    setGroundingPath(currentRequestId, 'extractive', 'closest_coverage_nomatch');
+    const qSlice = question.trim().slice(0, 60);
+    const urVariants = [
+      `نیوزڈیش کی تازہ فیڈز میں "${qSlice}" سے متعلق براہِ راست کوریج نہیں ملی۔ ذیل میں تازہ ترین عالمی خبریں ہیں — مزید مخصوص سوال پوچھیں۔`,
+      `"${qSlice}" پر ابھی کوئی سیدھی میچ نہیں ملی۔ تازہ سرخیاں دے رہا ہوں — زیادہ مخصوص لفظ آزمائیں۔`,
+      `اس موضوع ("${qSlice}") پر براہِ راست کوریج نہیں ملی۔ نیچے تازہ ترین ہیڈلائنز ہیں؛ کوئی اور زاویہ پوچھ سکتے ہیں۔`,
+    ];
+    const enVariants = [
+      `No direct coverage found for "${qSlice}" in NewsDash feeds right now. Showing latest headlines instead — try a more specific keyword for a targeted answer.`,
+      `I couldn't find a direct match for "${qSlice}" in the current feeds. Here are the newest headlines meanwhile — a sharper keyword usually helps.`,
+      `Nothing on "${qSlice}" lined up cleanly in today's pool. Sharing the latest headlines below; feel free to rephrase with a more specific ask.`,
+    ];
+    const variants = lang === 'ur' ? urVariants : enVariants;
+    const pick = noMatchVariantSeq++ % variants.length;
+    const noMatchNote = variants[pick];
     const displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
     const sourceButtons = buildSourceButtons(items, displayUrls);
-    const answerLabel = langOverride === 'ur' ? '*جواب:*' : '*Answer:*';
-    const sourcesLabel = langOverride === 'ur' ? '*ذرائع:*' : '*Sources*';
-    parts.push('', answerLabel, noMatchNote, '', sourcesLabel);
+    const answerLabel = lang === 'ur' ? '*جواب:*' : '*Answer:*';
+    const sourcesLabel = lang === 'ur' ? '*ذرائع:*' : '*Sources*';
+    const parts = [...templateHeader, '', answerLabel, noMatchNote, '', sourcesLabel];
     const showIndex = items.length > 1;
     parts.push(
       items.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
     );
-    return { text: parts.join('\n'), answer: noMatchNote, sources, sourceButtons, displayUrls };
+    return {
+      text: parts.join('\n'),
+      answer: noMatchNote,
+      sources,
+      sourceButtons,
+      displayUrls,
+      grounded: false,
+    };
   }
 
-  let answer = await buildGroundedAnswer(question, sources, langOverride ?? detectQueryLanguage(question), history);
+  const groundedResult = await buildGroundedAnswerWithPath(
+    question,
+    sources,
+    lang,
+    history,
+    { needTag, rollingSummary },
+  );
+  let answer = groundedResult.answer;
+  if (groundedResult.path === 'llm') {
+    setGroundingPath(currentRequestId, 'llm');
+  } else {
+    setGroundingPath(currentRequestId, groundedResult.path === 'skipped' ? 'skipped' : 'fallback', groundedResult.reason);
+  }
+
+  // If we asked for Urdu but the model replied in English (common with English
+  // source text), translate the body once so labels and narrative stay aligned.
+  if (answer && lang === 'ur' && !/[\u0600-\u06FF]/.test(answer)) {
+    const translated = await translateAnswerText(answer, 'ur');
+    if (translated && /[\u0600-\u06FF]/.test(translated)) answer = translated;
+  }
+  if (answer && lang === 'en' && /[\u0600-\u06FF]/.test(answer) && !/[a-zA-Z]{4,}/.test(answer)) {
+    const translated = await translateAnswerText(answer, 'en');
+    if (translated) answer = translated;
+  }
 
   // Strip leading refusal sentences the model sometimes still emits
   if (answer) {
@@ -1468,20 +1836,79 @@ async function buildNewsReply(
       .trim();
   }
   const weak = Boolean(!answer || isWeakGroundedAnswer(answer));
+  // Extractive fallback quotes raw article text — good enough to display, but
+  // never store it as conversation evidence (it compounds into garbage threads).
+  let grounded = true;
   if (!answer || answer.length < WA_ANSWER_MIN || weak) {
     answer = buildExtractiveAnswer(question, sources, lang);
+    grounded = false;
+    setGroundingPath(currentRequestId, 'extractive', groundedResult.reason || 'weak_or_empty_llm');
   }
 
   const displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
   const sourceButtons = buildSourceButtons(items, displayUrls);
-  const answerLabel = lang === 'ur' ? '*جواب:*' : '*Answer:*';
-  const sourcesLabel = lang === 'ur' ? '*ذرائع:*' : '*Sources*';
-  parts.push('', answerLabel, answer, '', sourcesLabel);
+  // Labels must match answer body script (avoid Urdu headers wrapping English extractive text).
+  const bodyUrduChars = (String(answer).match(/[\u0600-\u06FF]/g) || []).length;
+  const labelLang: ReplyLanguage =
+    bodyUrduChars >= 40 ? 'ur' : bodyUrduChars < 8 && /[A-Za-z]{4,}/.test(String(answer)) ? 'en' : lang;
+  const sourcesLabel = labelLang === 'ur' ? '*ذرائع:*' : '*Sources*';
   const showIndex = items.length > 1;
-  parts.push(
-    items.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
-  );
-  return { text: parts.join('\n'), answer, sources, sourceButtons, displayUrls };
+  const sourceBlock = items
+    .map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx]))
+    .join('\n\n');
+
+  // Grounded conversational voice: no rigid Topic/Answer header.
+  // Fallback extractive path keeps the rigid template for observability.
+  if (grounded) {
+    const quoteBlock = liveQuoteText ? `${liveQuoteText}\n\n` : '';
+    const text = `${quoteBlock}${answer}\n\n${sourcesLabel}\n${sourceBlock}`;
+    return { text, answer, sources, sourceButtons, displayUrls, grounded };
+  }
+
+  const topicKeyAligned = labelLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+  const answerLabel = labelLang === 'ur' ? '*جواب:*' : '*Answer:*';
+  const topicHdrAligned = localizedTopicLabel(topicLabel, labelLang);
+  const extractiveHeader = ['*NewsDash Analyst*', '', `${topicKeyAligned} ${topicHdrAligned}`];
+  if (note) extractiveHeader.push(note);
+  const parts = [
+    ...extractiveHeader,
+    '',
+    answerLabel,
+    answer,
+    '',
+    sourcesLabel,
+    sourceBlock,
+  ];
+  return { text: parts.join('\n'), answer, sources, sourceButtons, displayUrls, grounded };
+}
+
+function buildIdentityReply(lang: ReplyLanguage): string {
+  if (lang === 'ur') {
+    return [
+      '*NewsDash Analyst*',
+      '',
+      '*تعارف:*',
+      'میں NewsDash Analyst ہوں — ایک AI نیوز اسسٹنٹ۔ میں NewsDash کی لائیو فیڈز سے تازہ خبریں تلاش کر کے مختصر، ذرائع کے ساتھ جواب دیتا ہوں۔',
+      '',
+      'آپ مجھ سے پوچھ سکتے ہیں:',
+      '• کسی بھی موضوع کی تازہ خبریں (AI، کرپٹو، سیکیورٹی، کاروبار)',
+      '• لائیو قیمتیں — سونا، بٹ کوائن، تیل',
+      '• کسی بھی شہر کا موسم',
+      '• فالو اپ سوالات — "وجہ کیا ہے؟"، "مزید بتاؤ"، "اردو میں سمجھاؤ"',
+    ].join('\n');
+  }
+  return [
+    '*NewsDash Analyst*',
+    '',
+    '*About me:*',
+    "I'm NewsDash Analyst — an AI news assistant. I search live NewsDash feeds and answer with a short grounded brief plus source links.",
+    '',
+    'You can ask me for:',
+    '• Latest news on any topic (AI, crypto, security, business)',
+    '• Live prices — gold, Bitcoin, oil',
+    '• Weather in any city',
+    '• Follow-ups — "why?", "explain more", "translate to Urdu"',
+  ].join('\n');
 }
 
 function buildGreeting(lang: ReplyLanguage): string {
@@ -1546,110 +1973,162 @@ function buildWeatherReply(topicLabel: string, weather: WeatherPayload, lang: Re
   ].join('\n');
 }
 
-function buildGoldReply(topicLabel: string, gold: GoldQuote, lang: ReplyLanguage): string {
+function buildMultiWeatherReply(
+  topicLabel: string,
+  rows: WeatherPayload[],
+  lang: ReplyLanguage,
+): string {
+  if (rows.length === 1) return buildWeatherReply(topicLabel, rows[0], lang);
   const topicKey = lang === 'ur' ? '*موضوع:*' : '*Topic:*';
   const topicHdr = localizedTopicLabel(topicLabel, lang);
-  const liveHdr = lang === 'ur' ? '*لائیو سونے کی قیمت*' : '*Live gold price*';
-  const lines = [
-    '*NewsDash Analyst*',
-    '',
-    `${topicKey} ${topicHdr}`,
-    lang === 'ur' ? 'بین الاقوامی سونے کی اسپاٹ قیمت۔' : 'Live gold spot (international).',
-    '',
-    liveHdr,
-    `*XAU/USD* - $${gold.price.toLocaleString('en-US', { maximumFractionDigits: 2 })} / oz`,
-  ];
+  const liveHdr = lang === 'ur' ? '*لائیو موسم*' : '*Live weather*';
+  const lines = ['*NewsDash Analyst*', '', `${topicKey} ${topicHdr}`, '', liveHdr];
+  for (const weather of rows) {
+    if (weather.error) {
+      lines.push(`• ${weather.requestedCity || 'City'}: ${weather.error}`);
+      continue;
+    }
+    const stats =
+      lang === 'ur'
+        ? `${weather.temperature ?? '-'}°C, ${weather.condition || '-'} | نمی ${weather.humidity ?? '-'}% | ہوا ${weather.windKmh ?? '-'} کلومیٹر/گھنٹہ`
+        : `${weather.temperature ?? '-'} C, ${weather.condition || '-'} | Humidity ${weather.humidity ?? '-'}% | Wind ${weather.windKmh ?? '-'} km/h`;
+    lines.push(`• *${weather.location}* — ${stats}`);
+  }
+  return lines.join('\n');
+}
+
+/** Live quote cards are intentionally template-only (latency/cost) — no Topic/Answer scaffold. */
+function buildGoldReply(_topicLabel: string, gold: GoldQuote, lang: ReplyLanguage): string {
+  const usd = gold.price.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  const lines =
+    lang === 'ur'
+      ? [`سونے کی لائیو قیمت: *XAU* $${usd} / oz (USD)`]
+      : [`Live gold: *XAU* $${usd} / oz (USD)`];
   if (gold.pkrPerTolaApprox && gold.usdPkrRate) {
     lines.push(
       lang === 'ur'
-        ? `*تخمینہ PKR/تولہ* — Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} (@ ${gold.usdPkrRate.toFixed(2)} PKR/USD)`
-        : `*Approx PKR/tola* - Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} (converted @ ${gold.usdPkrRate.toFixed(2)} PKR/USD)`,
-      lang === 'ur'
-        ? '_تخمینہ — مقامی زیورات کی قیمتیں مختلف ہو سکتی ہیں۔_'
-        : '_Converted estimate - local jewellery rates may differ._',
+        ? `پاکستانی روپیہ: *Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} / تولہ* (تقریباً · ${gold.usdPkrRate.toFixed(2)} PKR/USD)`
+        : `Pakistani Rupees: *Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} / tola* (approx · ${gold.usdPkrRate.toFixed(2)} PKR/USD)`,
+    );
+  } else {
+    lines.push(
+      lang === 'ur' ? 'PKR شرح ابھی دستیاب نہیں۔' : 'PKR rate temporarily unavailable.',
     );
   }
-  lines.push(lang === 'ur' ? '_ابھی اپ ڈیٹ_' : '_Updated just now_');
   return lines.join('\n');
 }
 
-function buildCryptoReply(topicLabel: string, quote: CryptoQuote, lang: ReplyLanguage): string {
-  const topicKey = lang === 'ur' ? '*موضوع:*' : '*Topic:*';
-  const topicHdr = localizedTopicLabel(topicLabel, lang);
+function buildCryptoReply(_topicLabel: string, quote: CryptoQuote, lang: ReplyLanguage): string {
   const ch =
     quote.change24h == null
       ? ''
-      : ` | 24h ${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}%`;
-  const liveHdr =
+      : ` · 24h ${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}%`;
+  const usd = quote.usd.toLocaleString('en-US', {
+    maximumFractionDigits: quote.usd >= 100 ? 2 : 4,
+  });
+  const lines =
     lang === 'ur'
-      ? `*لائیو ${localizedTopicLabel(topicLabel, 'ur')}*`
-      : `*Live ${quote.name} price*`;
-  const lines = [
-    '*NewsDash Analyst*',
-    '',
-    `${topicKey} ${topicHdr}`,
-    lang === 'ur' ? `لائیو ${quote.name} قیمت۔` : `Live ${quote.name} price.`,
-    '',
-    liveHdr,
-    `*${quote.symbol}/USD* - $${quote.usd.toLocaleString('en-US', {
-      maximumFractionDigits: quote.usd >= 100 ? 2 : 4,
-    })}${ch}`,
-  ];
+      ? [`لائیو ${quote.name}: *$${usd}* (USD)${ch}`]
+      : [`Live ${quote.name}: *$${usd}* (USD)${ch}`];
   if (quote.pkrApprox && quote.usdPkrRate) {
     lines.push(
       lang === 'ur'
-        ? `*تخمینہ PKR* — Rs ${quote.pkrApprox.toLocaleString('en-PK')} (@ ${quote.usdPkrRate.toFixed(2)} PKR/USD)`
-        : `*Approx PKR* - Rs ${quote.pkrApprox.toLocaleString('en-PK')} (@ ${quote.usdPkrRate.toFixed(2)} PKR/USD)`,
+        ? `پاکستانی روپیہ: *Rs ${quote.pkrApprox.toLocaleString('en-PK')}* (تقریباً · ${quote.usdPkrRate.toFixed(2)} PKR/USD)`
+        : `Pakistani Rupees: *Rs ${quote.pkrApprox.toLocaleString('en-PK')}* (approx · ${quote.usdPkrRate.toFixed(2)} PKR/USD)`,
+    );
+  } else {
+    lines.push(
+      lang === 'ur' ? 'PKR شرح ابھی دستیاب نہیں۔' : 'PKR rate temporarily unavailable.',
     );
   }
-  lines.push(lang === 'ur' ? '_ابھی اپ ڈیٹ_' : '_Updated just now_');
   return lines.join('\n');
 }
 
-function buildFuelReply(topicLabel: string, oil: OilQuote, lang: ReplyLanguage): string {
-  const topicKey = lang === 'ur' ? '*موضوع:*' : '*Topic:*';
-  const topicHdr = localizedTopicLabel(topicLabel, lang);
+function buildFuelReply(_topicLabel: string, oil: OilQuote, lang: ReplyLanguage): string {
   const fmtCh = (n?: number) =>
-    n == null ? '' : ` | 24h ${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
-  const direction = (n?: number) => {
-    if (n == null) return '';
-    if (lang === 'ur') {
-      if (n > 0.15) return ' بڑھ رہی ہے / up';
-      if (n < -0.15) return ' گر رہی ہے / down';
-      return ' تقریباً فلیٹ / flat';
-    }
-    if (n > 0.15) return ' (up)';
-    if (n < -0.15) return ' (down)';
-    return ' (flat)';
-  };
-  const liveHdr = lang === 'ur' ? '*لائیو کرڈ آئل (بین الاقوامی)*' : '*Live crude oil (international)*';
-  const lines = [
-    '*NewsDash Analyst*',
-    '',
-    `${topicKey} ${topicHdr}`,
-    '',
-    liveHdr,
-    `*WTI* - $${oil.wtiUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel${fmtCh(oil.wtiChange24h)}${direction(oil.wtiChange24h)}`,
-  ];
-  if (oil.brentUsd) {
-    lines.push(
-      `*Brent* - $${oil.brentUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel${fmtCh(oil.brentChange24h)}${direction(oil.brentChange24h)}`,
-    );
-  }
-  if (oil.usdPkrRate) {
-    const wtiPkr = Math.round(oil.wtiUsd * oil.usdPkrRate);
+    n == null ? '' : ` · 24h ${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+  const lines =
+    lang === 'ur'
+      ? [
+          `لائیو بین الاقوامی تیل: *WTI* $${oil.wtiUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel (USD)${fmtCh(oil.wtiChange24h)}`,
+        ]
+      : [
+          `Live international crude: *WTI* $${oil.wtiUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel (USD)${fmtCh(oil.wtiChange24h)}`,
+        ];
+  if (oil.wtiPkrApprox && oil.usdPkrRate) {
     lines.push(
       lang === 'ur'
-        ? `*WTI تخمینہ PKR* — Rs ${wtiPkr.toLocaleString('en-PK')} فی بیرل (@ ${oil.usdPkrRate.toFixed(2)} PKR/USD)`
-        : `*WTI approx PKR* - Rs ${wtiPkr.toLocaleString('en-PK')} / barrel (@ ${oil.usdPkrRate.toFixed(2)} PKR/USD)`,
+        ? `WTI PKR: *Rs ${oil.wtiPkrApprox.toLocaleString('en-PK')} / barrel* (تقریباً)`
+        : `WTI PKR: *Rs ${oil.wtiPkrApprox.toLocaleString('en-PK')} / barrel* (approx)`,
     );
   }
-  lines.push(
+  if (oil.brentUsd) {
+    lines.push(
+      `*Brent* $${oil.brentUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} / barrel (USD)${fmtCh(oil.brentChange24h)}`,
+    );
+    if (oil.brentPkrApprox) {
+      lines.push(
+        lang === 'ur'
+          ? `Brent PKR: *Rs ${oil.brentPkrApprox.toLocaleString('en-PK')} / barrel* (تقریباً)`
+          : `Brent PKR: *Rs ${oil.brentPkrApprox.toLocaleString('en-PK')} / barrel* (approx)`,
+      );
+    }
+  }
+  if (!oil.usdPkrRate) {
+    lines.push(
+      lang === 'ur' ? 'PKR شرح ابھی دستیاب نہیں۔' : 'PKR rate temporarily unavailable.',
+    );
+  }
+  return lines.join('\n');
+}
+
+function buildPakistanFuelReply(
+  fuel: PakistanFuelQuote,
+  lang: ReplyLanguage,
+  displayLinks: Array<{ label: string; url: string }>,
+  products: { petrol: boolean; diesel: boolean },
+): string {
+  const dateBit = fuel.effectiveDate
+    ? lang === 'ur'
+      ? ` (موثر: ${fuel.effectiveDate})`
+      : ` (effective ${fuel.effectiveDate})`
+    : '';
+  const showPetrol = products.petrol && fuel.petrolPkr > 0;
+  const showDiesel = products.diesel && fuel.dieselPkr > 0;
+  const topic =
+    showPetrol && showDiesel
+      ? lang === 'ur'
+        ? 'پاکستان پیٹرول / ڈیزل'
+        : 'Pakistan petrol / diesel'
+      : showDiesel
+        ? lang === 'ur'
+          ? 'پاکستان ڈیزل'
+          : 'Pakistan diesel'
+        : lang === 'ur'
+          ? 'پاکستان پیٹرول'
+          : 'Pakistan petrol';
+  const lines =
     lang === 'ur'
-      ? '_نوٹ: پاکستان کے پمپ ریٹ OGRA سے الگ ہوتے ہیں؛ یہ بین الاقوامی تیل کی قیمت ہے۔_'
-      : '_Note: Pakistan pump rates are set by OGRA and differ from international crude._',
-    lang === 'ur' ? '_ابھی اپ ڈیٹ_' : '_Updated just now_',
-  );
+      ? ['*NewsDash Analyst*', '', `*موضوع:* ${topic}`, `پاکستان پمپ قیمت${dateBit}:`]
+      : ['*NewsDash Analyst*', '', `*Topic:* ${topic}`, `Pakistan pump price${dateBit}:`];
+  if (showPetrol) {
+    lines.push(
+      lang === 'ur'
+        ? `• *پیٹرول:* Rs ${fuel.petrolPkr.toLocaleString('en-PK')} / لیٹر`
+        : `• *Petrol:* Rs ${fuel.petrolPkr.toLocaleString('en-PK')} / litre`,
+    );
+  }
+  if (showDiesel) {
+    lines.push(
+      lang === 'ur'
+        ? `• *ڈیزل (HSD):* Rs ${fuel.dieselPkr.toLocaleString('en-PK')} / لیٹر`
+        : `• *Diesel (HSD):* Rs ${fuel.dieselPkr.toLocaleString('en-PK')} / litre`,
+    );
+  }
+  lines.push('', lang === 'ur' ? '*ذرائع (تصدیق کریں):*' : '*Sources (verify):*');
+  for (const link of displayLinks.slice(0, 3)) {
+    lines.push(`• [${link.label}](${link.url})`);
+  }
   return lines.join('\n');
 }
 
@@ -1688,13 +2167,13 @@ function assertQuality(args: {
     return { ok: false, reason: 'Live crypto price unavailable. Please try again.' };
   }
   if (kind === 'fuel_price' && !(oil && oil.wtiUsd > 0)) {
+    // Pakistan pump quotes are validated separately; crude path still needs WTI.
     return { ok: false, reason: 'Live oil price unavailable. Please try again.' };
   }
 
   if (kind === 'news' && items?.length) {
-    if (!text.includes('*Answer:*') && !text.includes('*جواب:*')) {
-      return { ok: false, reason: 'Could not build a grounded answer.' };
-    }
+    // Conversational replies no longer require rigid *Answer:* labels.
+    // Require a usable answer body and that each source URL appears in the text.
     if (!answer || answer.length < WA_ANSWER_MIN) {
       return { ok: false, reason: 'Could not build a grounded answer.' };
     }
@@ -1742,9 +2221,21 @@ export async function POST(request: Request) {
 }
 
 async function handleQueryPost(request: Request) {
+  const requestId = newRequestId();
+  beginTurnPaths(requestId);
+  currentRequestId = requestId;
+  const timer = createStageTimer(requestId);
+  const respond = (data: Record<string, unknown>, status = 200) => {
+    const paths = getTurnPaths(requestId) || {
+      classify_turn: 'fallback' as const,
+      grounding: 'none' as const,
+    };
+    logTurnPaths(requestId, { intent: data.intent });
+    return Response.json({ ...data, paths }, { status });
+  };
   const body = (await request.json().catch(() => null)) as QueryRequest | null;
   if (!body || typeof body.q !== 'string' || body.q.trim().length < 1) {
-    return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
+    return respond({ error: 'Provide a query string `q`.' }, 400);
   }
 
   const chatId = normalizeChatId(
@@ -1763,7 +2254,19 @@ async function handleQueryPost(request: Request) {
   });
 
   if (resolved.needsClarify && resolved.clarifyText) {
-    return Response.json({
+    // Prefer LLM clarification when possible (Phase 3/4); static text is last resort.
+    // Never pass the full canned menu into the LLM — it gets echoed into the reply.
+    setClassifyPath(requestId, 'heuristic', 'needs_clarify');
+    setGroundingPath(requestId, 'none', 'clarify');
+    const convState = await getConversationStateForChat(chatId);
+    const llmClarify = await buildConversationalReply(incomingQ, {
+      lang: replyLangEarly,
+      mode: 'clarification',
+      clarifyReason: 'Ambiguous follow-up with no prior topic in this chat',
+      rollingSummary: convState?.rollingSummary,
+      recentTurns: convState?.recentTurns,
+    });
+    return respond({
       query: incomingQ,
       rawQuery: incomingQ,
       displayTopic: 'Clarify',
@@ -1771,20 +2274,207 @@ async function handleQueryPost(request: Request) {
       brief: 'Need a clearer question',
       items: [],
       total: 0,
-      whatsappText: resolved.clarifyText,
+      whatsappText: llmClarify || resolved.clarifyText,
       usedMemory: false,
       lastUpdated: new Date().toISOString(),
     });
   }
 
-  const rawQ = normalizeVoiceQuery(resolved.effectiveQ.trim());
+  // Conversational classifier — small talk / clarification skip retrieval.
+  // Translate evidence-reuse still wins when clearly a language switch.
+  // Elaborate from the regex cascade must NOT skip the classifier — that was
+  // the B1 bug (topic switches mislabeled "elaborate" never reached classifyTurn).
+  const convStateEarly = await getConversationStateForChat(chatId);
+  const isBareGreeting =
+    /^(hi|hello|hey|salam|assalamualaikum|hola|yo|help|start|menu)$/i.test(
+      incomingQ.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim(),
+    ) && !convStateEarly?.topics?.length;
+
+  let turnClass: TurnClassification | null = null;
+  let classifyMeta: { path: 'llm' | 'heuristic' | 'fallback'; reason?: string } | null = null;
+  if (!isBareGreeting && resolved.followUpKind !== 'translate') {
+    const classified = await classifyTurn(incomingQ, convStateEarly);
+    turnClass = classified.classification;
+    classifyMeta = classified.meta;
+    setClassifyPath(requestId, classified.meta.path, classified.meta.reason);
+  } else if (resolved.followUpKind === 'translate') {
+    setClassifyPath(requestId, 'heuristic', 'translate_ask');
+  } else {
+    setClassifyPath(requestId, 'heuristic', 'bare_greeting');
+  }
+
+  // Classifier overrides stale elaborate/more labels on clear topic changes.
+  if (
+    turnClass &&
+    (turnClass.kind === 'new_topic' ||
+      turnClass.kind === 'plugin' ||
+      turnClass.kind === 'small_talk' ||
+      turnClass.kind === 'clarification_needed' ||
+      turnClass.kind === 'translate_previous') &&
+    (resolved.followUpKind === 'elaborate' || resolved.followUpKind === 'more')
+  ) {
+    resolved.followUpKind = undefined;
+    resolved.followUpText = undefined;
+    resolved.memoryIntent = undefined;
+    if (turnClass.kind === 'new_topic') {
+      resolved.effectiveQ = turnClass.effectiveQuery;
+      resolved.usedMemory = Boolean(convStateEarly);
+    }
+  }
+
+  // Classifier translate_previous → same evidence-reuse path as translateAskTarget.
+  if (turnClass?.kind === 'translate_previous') {
+    resolved.followUpKind = 'translate';
+    resolved.preferredLang = turnClass.targetLang;
+    resolved.usedMemory = true;
+  }
+
+  // Classifier continue_topic with wantsNewInfo → fetch additional stories (not rewrite).
+  if (turnClass?.kind === 'continue_topic' && turnClass.wantsNewInfo) {
+    resolved.followUpKind = 'more';
+    resolved.followUpText = incomingQ;
+    resolved.usedMemory = true;
+  }
+
+  const pathsPayload = (): TurnPathLog => {
+    const p = getTurnPaths(requestId);
+    return {
+      classify_turn: classifyMeta?.path || p?.classify_turn || 'fallback',
+      classify_reason: classifyMeta?.reason || p?.classify_reason,
+      grounding: p?.grounding || 'none',
+      grounding_reason: p?.grounding_reason,
+    };
+  };
+  const withPaths = <T extends Record<string, unknown>>(data: T): T & { paths: TurnPathLog } => {
+    // Refresh classify meta onto the shared store before snapshotting.
+    if (classifyMeta) setClassifyPath(requestId, classifyMeta.path, classifyMeta.reason);
+    const paths = pathsPayload();
+    logTurnPaths(requestId, { intent: data.intent, chatId });
+    return { ...data, paths };
+  };
+
+  if (turnClass?.kind === 'small_talk') {
+    setGroundingPath(requestId, 'none', 'small_talk');
+    const replyLangSt =
+      resolveReplyLanguage(incomingQ, incomingQ, body.replyLang || body.lang || resolved.preferredLang);
+    // Identity questions keep the dedicated canned reply (accurate capabilities list).
+    if (isIdentityAsk(incomingQ)) {
+      return Response.json(
+        withPaths({
+          query: incomingQ,
+          rawQuery: incomingQ,
+          displayTopic: replyLangSt === 'ur' ? 'تعارف' : 'About NewsDash Analyst',
+          intent: 'identity',
+          brief: 'Identity / persona question',
+          items: [],
+          total: 0,
+          whatsappText: buildIdentityReply(replyLangSt),
+          usedMemory: false,
+          lastUpdated: new Date().toISOString(),
+        }),
+      );
+    }
+    const chatReply =
+      (await buildConversationalReply(incomingQ, {
+        lang: replyLangSt,
+        style: turnClass.suggestedReplyStyle,
+        mode: 'small_talk',
+        rollingSummary: convStateEarly?.rollingSummary,
+        recentTurns: convStateEarly?.recentTurns,
+      })) ||
+      (replyLangSt === 'ur'
+        ? 'شکریہ! خبریں، قیمتیں یا موسم پوچھیں — میں یہاں ہوں۔'
+        : "Thanks! Ask me about news, prices, or weather anytime.");
+    return Response.json(
+      withPaths({
+        query: incomingQ,
+        rawQuery: incomingQ,
+        displayTopic: replyLangSt === 'ur' ? 'گفتگو' : 'Chat',
+        intent: 'small_talk',
+        brief: 'Conversational reply',
+        items: [],
+        total: 0,
+        whatsappText: chatReply,
+        usedMemory: Boolean(convStateEarly),
+        lastUpdated: new Date().toISOString(),
+      }),
+    );
+  }
+
+  if (turnClass?.kind === 'clarification_needed') {
+    setGroundingPath(requestId, 'none', 'clarification');
+    const replyLangCl =
+      resolveReplyLanguage(incomingQ, incomingQ, body.replyLang || body.lang || resolved.preferredLang);
+    const clarify =
+      (await buildConversationalReply(incomingQ, {
+        lang: replyLangCl,
+        mode: 'clarification',
+        clarifyReason: turnClass.reason,
+        rollingSummary: convStateEarly?.rollingSummary,
+        recentTurns: convStateEarly?.recentTurns,
+      })) || turnClass.reason;
+    return Response.json(
+      withPaths({
+        query: incomingQ,
+        rawQuery: incomingQ,
+        displayTopic: 'Clarify',
+        intent: 'clarify',
+        brief: turnClass.reason,
+        items: [],
+        total: 0,
+        whatsappText: clarify,
+        usedMemory: Boolean(convStateEarly),
+        lastUpdated: new Date().toISOString(),
+      }),
+    );
+  }
+
+  // Classifier may rewrite the effective lookup for continue/new topic.
+  let classifiedEffectiveQ: string | null = null;
+  let classifiedTopicId: string | null = null;
+  let forceNewTopic = false;
+  let classifiedDisplayLabel: string | null = null;
+  if (turnClass?.kind === 'continue_topic') {
+    classifiedEffectiveQ = turnClass.effectiveQuery;
+    classifiedTopicId = turnClass.topicId;
+  } else if (turnClass?.kind === 'new_topic') {
+    classifiedEffectiveQ = turnClass.effectiveQuery;
+    classifiedDisplayLabel = turnClass.displayLabel;
+    forceNewTopic = true;
+  } else if (turnClass?.kind === 'plugin') {
+    classifiedEffectiveQ = turnClass.effectiveQuery;
+  }
+
+  // Named-outlet switch: "bbc news today" after a Dawn thread must NOT keep
+  // Dawn's effectiveQuery / mustMatch — that produced empty "no coverage" replies.
+  const incomingOutlet = detectDomainHint(incomingQ);
+  if (incomingOutlet?.mustMatch) {
+    const merged = String(classifiedEffectiveQ || resolved.effectiveQ || '');
+    const otherOutletStuck =
+      (/\bdawn\b/i.test(merged) && !/\bdawn\b/i.test(incomingQ)) ||
+      (/\bbbc\b/i.test(merged) && !/\bbbc\b/i.test(incomingQ)) ||
+      (/\breuters\b/i.test(merged) && !/\breuters\b/i.test(incomingQ)) ||
+      (/\bguardian\b/i.test(merged) && !/\bguardian\b/i.test(incomingQ)) ||
+      (!incomingOutlet.mustMatch.test(merged) &&
+        (turnClass?.kind === 'continue_topic' || Boolean(resolved.usedMemory)));
+    if (otherOutletStuck) {
+      classifiedEffectiveQ = incomingQ;
+      classifiedDisplayLabel = incomingOutlet.topicLabel;
+      classifiedTopicId = null;
+      forceNewTopic = true;
+    }
+  }
+
+  const rawQ = normalizeVoiceQuery(
+    (classifiedEffectiveQ || resolved.effectiveQ).trim(),
+  );
   if (rawQ.length < 2) {
     return Response.json({ error: 'Provide a query string `q`.' }, { status: 400 });
   }
   // Memory language preference only applies to vague follow-ups — a clear
   // English (or Urdu) question always answers in its own language.
   // Translate asks always take the requested target language verbatim.
-  let replyLang =
+  const replyLang =
     resolved.followUpKind === 'translate' && resolved.preferredLang
       ? resolved.preferredLang
       : resolveReplyLanguage(
@@ -1793,58 +2483,171 @@ async function handleQueryPost(request: Request) {
           body.replyLang || body.lang || (isVagueFollowUp(incomingQ) ? resolved.preferredLang : undefined),
         );
 
+  // Identity / small-talk asks ("what's your name?", "tumhara naam kya hai?")
+  // must never reach news retrieval — no news corpus can answer them, and the
+  // vector index will happily return the closest garbage. Answer directly and
+  // leave chat memory untouched so the previous news topic still continues.
+  if (isIdentityAsk(incomingQ) || isIdentityAsk(rawQ)) {
+    setGroundingPath(requestId, 'none', 'identity');
+    return Response.json(
+      withPaths({
+        query: incomingQ,
+        rawQuery: incomingQ,
+        displayTopic: replyLang === 'ur' ? 'تعارف' : 'About NewsDash Analyst',
+        intent: 'identity',
+        brief: 'Identity / persona question',
+        items: [],
+        total: 0,
+        whatsappText: buildIdentityReply(replyLang),
+        usedMemory: false,
+        lastUpdated: new Date().toISOString(),
+      }),
+    );
+  }
+
   // Strip follow-up decorations ("— more detail / latest update", "User follow-up: …")
   // before tokenizing, so retrieval ranks on the real topic, not filler words.
   const q = extractTopicQuery(stableAsk(rawQ));
   const limit = Math.min(Math.max(body.limit ?? WA_STORY_LIMIT, 1), WA_STORY_LIMIT_MAX);
   let plugin = detectPlugin(q);
 
-  // Prefer explicit new asset names in the resolved ask over sticky session intent.
-  const incomingMentionsCrypto = /\b(bitcoin|btc|ethereum|eth|solana|sol)\b/i.test(`${incomingQ} ${q}`);
-  const incomingMentionsGold = /\b(gold|xau|sona)\b/i.test(`${incomingQ} ${q}`);
-  const incomingMentionsFuel = /\b(petrol|diesel|fuel|oil)\b/i.test(`${incomingQ} ${q}`);
+  // Classifier plugin wins when regex detectPlugin stayed on news
+  if (turnClass?.kind === 'plugin' && plugin.kind === 'news') {
+    if (turnClass.plugin === 'weather') {
+      const cities = extractWeatherCitiesFromAsk(`${incomingQ} ${turnClass.effectiveQuery || q}`);
+      plugin = {
+        kind: 'weather',
+        city: cities.length ? cities.join(', ') : '',
+        cityAsked: cities.length > 0,
+      };
+    } else if (turnClass.plugin === 'gold_price') {
+      plugin = { kind: 'gold_price' };
+    } else if (turnClass.plugin === 'fuel_price') {
+      plugin = { kind: 'fuel_price' };
+    } else if (turnClass.plugin === 'crypto_price') {
+      const fromAsk =
+        inferCryptoIdFromText(incomingQ, turnClass.effectiveQuery, q) || 'pending';
+      plugin = { kind: 'crypto_price', cryptoId: fromAsk };
+    }
+  }
 
-  // Sticky only for vague continues — never when user names a different asset.
+  // Prefer explicit asset names in the *user's* message only — never scan
+  // resolved `q`, which may still contain sticky "diesel petrol…" domain hints
+  // and would force a pump card into every later reply.
+  const incomingMentionsCrypto = /\b(bitcoin|btc|ethereum|eth|solana|sol)\b/i.test(incomingQ)
+    || /بٹ\s*کوائن|بٹکوائن|ایتھیریم/.test(incomingQ);
+  const incomingMentionsGold = /\b(gold|xau|sona|sone|sonay)\b/i.test(incomingQ)
+    || /سونا|سونے|گولڈ/.test(incomingQ);
+  const incomingMentionsFuel = /\b(petrol|diesel|gasoline|fuel|pump)\b/i.test(incomingQ)
+    || /پیٹرول|پٹرول|ڈیزل|ایندھن|پمپ/.test(incomingQ);
+  // Bare "oil" alone is crude/news — do not force the Pakistan pump card.
+
+  const activeTopic =
+    (convStateEarly?.activeTopicId &&
+      convStateEarly.topics.find((t) => t.id === convStateEarly.activeTopicId)) ||
+    convStateEarly?.topics?.[0];
+
+  // Slot-fill: after "which city?", a short place reply must stay on weather —
+  // even if the classifier says new_topic (city names look "novel").
+  if (
+    plugin.kind === 'news' &&
+    !incomingMentionsCrypto &&
+    !incomingMentionsGold &&
+    !incomingMentionsFuel &&
+    awaitingWeatherCitySlot({
+      memoryIntent: resolved.memoryIntent || body.previousIntent,
+      topicIntent: activeTopic?.intent,
+      lastBrief: activeTopic?.lastAnswerBrief,
+      lastAnswer: activeTopic?.lastAnswer,
+    }) &&
+    looksLikeCitySlotFill(incomingQ)
+  ) {
+    const cities = extractWeatherCitiesFromAsk(incomingQ);
+    const city = cities[0] || stripWeatherFillers(incomingQ);
+    if (city) {
+      plugin = { kind: 'weather', city: normalizeCityQuery(city), cityAsked: true };
+    }
+  }
+
+  const sessionHay = [
+    activeTopic?.label,
+    activeTopic?.lastQ,
+    convStateEarly?.rollingSummary,
+    resolved.effectiveQ,
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  // Sticky live-price intent ONLY for vague continues — never when the
+  // classifier already decided this is a new topic / different plugin.
+  // Using memoryIntent unconditionally was the B1 bug: "Iran situation"
+  // stayed glued to crypto_price for the entire 15-turn thread.
+  // (small_talk / clarification_needed already returned earlier.)
+  const classifierOverridesSticky =
+    turnClass?.kind === 'new_topic' ||
+    turnClass?.kind === 'plugin' ||
+    forceNewTopic;
+  const novelSubject = hasNovelSubjectTokens(
+    incomingQ,
+    `${activeTopic?.label || ''} ${activeTopic?.lastQ || ''} ${resolved.effectiveQ || ''}`,
+  );
   const stickyIntent =
-    resolved.memoryIntent ||
-    (isVagueFollowUp(incomingQ) && !incomingMentionsCrypto && !incomingMentionsGold && !incomingMentionsFuel
-      ? String(body.previousIntent || '').trim()
-      : '');
+    classifierOverridesSticky || novelSubject
+      ? ''
+      : isVagueFollowUp(incomingQ) && !incomingMentionsCrypto && !incomingMentionsGold && !incomingMentionsFuel
+        ? String(resolved.memoryIntent || body.previousIntent || '').trim()
+        : '';
 
   if (incomingMentionsCrypto) {
-    const id = /\bethereum|eth\b/i.test(`${incomingQ} ${q}`)
-      ? 'ethereum'
-      : /\bsolana|sol\b/i.test(`${incomingQ} ${q}`)
-        ? 'solana'
-        : 'bitcoin';
+    const id = inferCryptoIdFromText(incomingQ, q) || 'bitcoin';
     plugin = { kind: 'crypto_price', cryptoId: id };
   } else if (incomingMentionsGold && !incomingMentionsFuel) {
     plugin = { kind: 'gold_price' };
   } else if (incomingMentionsFuel) {
     plugin = { kind: 'fuel_price' };
   } else if (plugin.kind === 'news' && stickyIntent) {
-    if (stickyIntent === 'fuel_price') plugin = { kind: 'fuel_price' };
-    else if (stickyIntent === 'gold_price') plugin = { kind: 'gold_price' };
-    else if (stickyIntent === 'crypto_price') {
-      plugin = { kind: 'crypto_price', cryptoId: 'bitcoin' };
+    if (stickyIntent === 'fuel_price') {
+      // Only keep pump sticky for clear price follow-ups — not every later message.
+      if (
+        isSimplePriceCheck(incomingQ) ||
+        /\b(price|rate|keemat|qimat|qiymat|kimat|kitna|kitni)\b/i.test(incomingQ) ||
+        /قیمت|ریٹ|کتن/.test(incomingQ)
+      ) {
+        plugin = { kind: 'fuel_price' };
+      }
+    } else if (stickyIntent === 'gold_price') {
+      plugin = { kind: 'gold_price' };
+    } else if (stickyIntent === 'crypto_price') {
+      plugin = {
+        kind: 'crypto_price',
+        cryptoId: inferCryptoIdFromText(sessionHay, activeTopic?.label, activeTopic?.lastQ) || 'bitcoin',
+      };
     } else if (stickyIntent === 'weather') {
       // "and lahore?" after "weather in karachi" — a bare place name
       // continues the weather thread instead of falling into news search.
-      const cityGuess = incomingQ
-        .toLowerCase()
-        .replace(/\b(and|aur|or|what about|how about|weather|mosam|mausam|in|ka|ki|ke|mein|about|the)\b/gi, ' ')
-        .replace(/[^a-z\s]/gi, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-      const notCity = /^(kyun|why|kab|when|how|kaisa|kya|ok|okay|more|batao|it|this|that|there|now|today)$/;
+      const cityGuess = stripWeatherFillers(
+        incomingQ
+          .toLowerCase()
+          .replace(/\b(and|aur|or|what about|how about)\b/gi, ' '),
+      );
       if (
         cityGuess.length >= 3 &&
         cityGuess.split(' ').length <= 3 &&
-        !cityGuess.split(' ').some((w) => notCity.test(w))
+        !cityGuess.split(' ').some((w) => WEATHER_NON_CITY.has(w))
       ) {
         plugin = { kind: 'weather', city: normalizeCityQuery(cityGuess), cityAsked: true };
       }
     }
+  }
+
+  // Resolve pending crypto id from session (never invent BTC when ETH/SOL was last).
+  if (plugin.kind === 'crypto_price' && (plugin.cryptoId === 'pending' || !plugin.cryptoId)) {
+    plugin = {
+      kind: 'crypto_price',
+      cryptoId:
+        inferCryptoIdFromText(sessionHay, activeTopic?.label, activeTopic?.lastQ, incomingQ, q) ||
+        'bitcoin',
+    };
   }
 
   const topicLabel = displayTopic(q, plugin);
@@ -1863,31 +2666,177 @@ async function handleQueryPost(request: Request) {
       answerBrief,
       preferredLang: replyLang,
       assistantText,
+      userText: incomingQ,
       shownUrls,
-      answerFull: evidence?.answer,
+      // Always persist answer text for translate/remind follow-ups; sources when grounded.
+      answerFull: evidence?.answer || assistantText,
       sources: evidence?.sources,
+      topicId: classifiedTopicId,
+      forceNewTopic,
     });
   };
+
+  // ── Dawn Opinion section: browse → pick → read (live RSS, not hardcoded titles) ──
+  const dawnMenuPending = isDawnOpinionMenuPending({
+    memoryIntent: resolved.memoryIntent || activeTopic?.intent,
+    topicIntent: activeTopic?.intent,
+    lastBrief: activeTopic?.lastAnswerBrief,
+    lastAnswer: activeTopic?.lastAnswer || resolved.lastAnswer,
+  });
+  const otherOutletAsk =
+    Boolean(detectDomainHint(incomingQ)?.mustMatch) && !isDawnOpinionListAsk(incomingQ);
+
+  if (isDawnOpinionListAsk(incomingQ) && !otherOutletAsk) {
+    const dawnItems = await fetchDawnOpinionItems(8);
+    const asQueryItems: QueryResultItem[] = dawnItems.map((d, i) => ({
+      id: `dawn-op-${i}`,
+      title: d.title,
+      description: d.body || '',
+      url: d.url,
+      source: d.source,
+      category: 'global' as const,
+      publishedAt: d.publishedAt || now,
+      significance: 50,
+      tags: ['opinion'],
+      matchScore: 50,
+      score: 50,
+      matchedTerms: ['dawn', 'opinion'],
+    }));
+    const displayUrls = await Promise.all(asQueryItems.map((i) => shortenArticleUrl(i.url)));
+    const sourceButtons = buildSourceButtons(asQueryItems, displayUrls);
+    const whatsappText = buildDawnOpinionListReply(dawnItems, replyLang, (item, idx) =>
+      formatSourceLine(
+        {
+          ...asQueryItems[idx],
+          title: item.title,
+        },
+        idx,
+        true,
+        displayUrls[idx],
+      ),
+    );
+    const stored = dawnItemsToStoredSources(dawnItems);
+    await remember(
+      'Dawn Opinion',
+      DAWN_OPINION_LIST_INTENT,
+      `Dawn Opinion menu (${dawnItems.length})`,
+      whatsappText,
+      dawnItems.map((d) => d.url),
+      { answer: whatsappText, sources: stored },
+    );
+    setGroundingPath(requestId, 'none', 'dawn_opinion_list');
+    return Response.json(
+      withPaths({
+        query: q,
+        rawQuery: incomingQ,
+        displayTopic: 'Dawn Opinion',
+        intent: DAWN_OPINION_LIST_INTENT,
+        brief: `Dawn Opinion list (${dawnItems.length})`,
+        items: asQueryItems,
+        total: dawnItems.length,
+        whatsappText,
+        sourceButtons,
+        usedMemory: true,
+        lastUpdated: now,
+      }),
+    );
+  }
+
+  if (dawnMenuPending && !otherOutletAsk && !isDawnOpinionListAsk(incomingQ)) {
+    const menuSources = (resolved.lastSources || activeTopic?.lastSources || []) as StoredSource[];
+    const pickIdx = parseDawnOpinionSelection(incomingQ, menuSources);
+    if (pickIdx != null && menuSources[pickIdx]) {
+      const chosen = menuSources[pickIdx];
+      const dawnItem: DawnOpinionItem = {
+        title: chosen.title,
+        url: chosen.url,
+        source: chosen.source || 'Dawn',
+        publishedAt: chosen.publishedAt,
+        body: chosen.body,
+      };
+      const brief = buildDawnOpinionPickBrief(dawnItem, replyLang);
+      const asItem: QueryResultItem = {
+        id: 'dawn-op-pick',
+        title: dawnItem.title,
+        description: dawnItem.body || '',
+        url: dawnItem.url,
+        source: dawnItem.source,
+        category: 'global',
+        publishedAt: dawnItem.publishedAt || now,
+        significance: 50,
+        tags: ['opinion'],
+        matchScore: 50,
+        score: 50,
+        matchedTerms: ['dawn', 'opinion'],
+      };
+      const displayUrl = await shortenArticleUrl(dawnItem.url);
+      const sourceButtons = buildSourceButtons([asItem], [displayUrl]);
+      const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+      const sourcesLabel = replyLang === 'ur' ? '*ذرائع:*' : '*Sources*';
+      const whatsappText = [
+        '*NewsDash Analyst*',
+        '',
+        `${topicKey} Dawn Opinion`,
+        '',
+        brief,
+        '',
+        sourcesLabel,
+        formatSourceLine(asItem, 0, false, displayUrl),
+      ].join('\n');
+      await remember(
+        'Dawn Opinion',
+        'news',
+        dawnItem.title.slice(0, 120),
+        whatsappText,
+        [dawnItem.url],
+        { answer: brief, sources: [chosen] },
+      );
+      setGroundingPath(requestId, 'none', 'dawn_opinion_pick');
+      return Response.json(
+        withPaths({
+          query: q,
+          rawQuery: incomingQ,
+          displayTopic: 'Dawn Opinion',
+          intent: 'news',
+          brief: dawnItem.title,
+          items: [asItem],
+          total: 1,
+          whatsappText,
+          sourceButtons,
+          usedMemory: true,
+          lastUpdated: now,
+        }),
+      );
+    }
+  }
 
   // ── Evidence-based follow-ups ──
   // "explain it in Urdu" / "explain more" must reuse the PREVIOUS answer's
   // stored evidence, not re-run retrieval (which drifts to other articles).
-  // Only for news threads: price threads re-run live so quotes stay fresh.
+  // Evidence belongs to the conversation, regardless of which live-data or
+  // news plugin produced it.
   const evidenceSources = resolved.lastSources || [];
-  const hasNewsEvidence =
-    evidenceSources.length > 0 && (!resolved.memoryIntent || resolved.memoryIntent === 'news');
+  const hasGroundedEvidence = evidenceSources.length > 0;
+  const threadIntent = resolved.memoryIntent || plugin.kind;
 
-  if (resolved.followUpKind === 'translate' && resolved.lastAnswer && hasNewsEvidence) {
-    // Already in the target language? Reuse as-is (also the safe fallback).
-    const answerIsUrdu = /[\u0600-\u06FF]/.test(resolved.lastAnswer);
+  if (resolved.followUpKind === 'translate' && resolved.lastAnswer) {
+    // Keep the prior news topic — never title the reply after "isy urdu mai".
+    const priorTopic =
+      (convStateEarly?.activeTopicId &&
+        convStateEarly.topics.find((t) => t.id === convStateEarly.activeTopicId)?.label) ||
+      convStateEarly?.topics[0]?.label ||
+      topicLabel;
+    const answerIsUrdu = ((resolved.lastAnswer.match(/[\u0600-\u06FF]/g) || []).length || 0) >= 80;
     const alreadyTarget = (replyLang === 'ur') === answerIsUrdu;
-    let translated = alreadyTarget
-      ? resolved.lastAnswer
-      : (await translateAnswerText(resolved.lastAnswer, replyLang));
-    // If Groq translation failed / returned wrong language, rebuild an
-    // extractive answer from the SAME sources in the target language so the
-    // user still gets a correct-language reply without new retrieval.
-    if (!translated) {
+    let translated: string | null = alreadyTarget ? resolved.lastAnswer : null;
+
+    // Always try a direct translation of the stored answer first — same facts,
+    // no new retrieval. Then fall back to re-grounding from stored sources.
+    if (!translated && !alreadyTarget) {
+      translated = await translateAnswerText(resolved.lastAnswer, replyLang);
+    }
+
+    if ((!translated || (replyLang === 'ur' && ((translated.match(/[\u0600-\u06FF]/g) || []).length < 40))) && hasGroundedEvidence) {
       const bodies = await resolveArticleBodies(
         evidenceSources.map((s) => ({ url: s.url, description: s.body || '', title: s.title })),
       );
@@ -1898,40 +2847,81 @@ async function handleQueryPost(request: Request) {
         publishedAt: s.publishedAt,
         body: bodies[i] || s.body || s.title,
       }));
+      const rebuilt = await buildGroundedAnswer(
+        replyLang === 'ur'
+          ? 'ان ذرائع کی بنیاد پر پچھلے جواب کا مکمل اردو خلاصہ لکھو۔ ہر جملہ اردو رسم الخط میں ہو۔ لفظ دہراؤ مت۔'
+          : 'Faithfully restate the prior answer from these sources in English.',
+        sources,
+        replyLang,
+      );
+      if (rebuilt && !isDegenerateRepetition(rebuilt)) {
+        const ur = (rebuilt.match(/[\u0600-\u06FF]/g) || []).length;
+        if (replyLang !== 'ur' || ur >= 40) translated = rebuilt;
+        else {
+          const forced = await translateAnswerText(rebuilt, 'ur');
+          if (forced && !isDegenerateRepetition(forced)) translated = forced;
+        }
+      }
+    }
+
+    if (translated && isDegenerateRepetition(translated)) {
+      translated = null;
+    }
+
+    if (!translated) {
+      // Honest fallback: keep English prior answer rather than a broken Urdu loop.
       translated =
-        (await buildGroundedAnswer(stableAsk(rawQ) || rawQ, sources, replyLang)) ||
-        buildExtractiveAnswer(stableAsk(rawQ) || rawQ, sources, replyLang);
+        replyLang === 'ur'
+          ? `${resolved.lastAnswer}\n\n_(Urdu translation failed — showing the previous English answer.)_`
+          : resolved.lastAnswer;
     }
     const srcItems = evidenceSources as unknown as QueryResultItem[];
-    const displayUrls = await Promise.all(evidenceSources.map((s) => shortenArticleUrl(s.url)));
-    const sourceButtons = buildSourceButtons(srcItems, displayUrls);
-    const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
-    const aLabel = replyLang === 'ur' ? '*جواب:*' : '*Answer:*';
-    const sLabel = replyLang === 'ur' ? '*ذرائع:*' : '*Sources*';
+    const displayUrls = hasGroundedEvidence
+      ? await Promise.all(evidenceSources.map((s) => shortenArticleUrl(s.url)))
+      : [];
+    const sourceButtons = hasGroundedEvidence ? buildSourceButtons(srcItems, displayUrls) : [];
+    const bodyUrduChars = (translated.match(/[\u0600-\u06FF]/g) || []).length;
+    const labelLang: 'en' | 'ur' =
+      replyLang === 'ur' && bodyUrduChars >= 40
+        ? 'ur'
+        : replyLang === 'en' && bodyUrduChars < 20
+          ? 'en'
+          : bodyUrduChars >= 40
+            ? 'ur'
+            : 'en';
+    const translateFailed = replyLang === 'ur' && labelLang !== 'ur';
+    const topicKey = labelLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+    const aLabel = labelLang === 'ur' ? '*جواب:*' : '*Answer:*';
+    const sLabel = labelLang === 'ur' ? '*ذرائع:*' : '*Sources*';
     const showIndex = evidenceSources.length > 1;
     const whatsappText = [
       '*NewsDash Analyst*',
       '',
-      `${topicKey} ${topicLabel}`,
+      `${topicKey} ${priorTopic}`,
       '',
       aLabel,
       translated,
-      '',
-      sLabel,
-      srcItems.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
+      ...(hasGroundedEvidence
+        ? [
+            '',
+            sLabel,
+            srcItems.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
+          ]
+        : []),
     ].join('\n');
     // Keep the ORIGINAL answer as evidence so "now in English" after
     // "in Urdu" restores it losslessly without another translation.
-    await remember(topicLabel, 'news', translated.split(/[.!?۔]/)[0].trim().slice(0, 200), translated, undefined, {
+    await remember(priorTopic, threadIntent, translated.split(/[.!?۔]/)[0].trim().slice(0, 200), translated, undefined, {
       answer: resolved.lastAnswer,
       sources: evidenceSources,
     });
-    return Response.json({
+    setGroundingPath(requestId, 'none', translateFailed ? 'translate_failed_kept_en' : 'translate_reuse');
+    return Response.json(withPaths({
       query: q,
       rawQuery: incomingQ,
       effectiveQuery: rawQ,
-      displayTopic: topicLabel,
-      intent: 'news',
+      displayTopic: priorTopic,
+      intent: threadIntent,
       followUpKind: 'translate',
       brief: translated.slice(0, 200),
       items: [],
@@ -1941,10 +2931,17 @@ async function handleQueryPost(request: Request) {
       usedMemory: true,
       memoryBackend: getRedisClient() ? 'redis' : 'in-process',
       lastUpdated: now,
-    });
+    }));
   }
 
-  if (resolved.followUpKind === 'elaborate' && hasNewsEvidence) {
+  // Elaborate only on prior grounded evidence — skip if the stored answer was
+  // a thin extractive fallback (starts with publisher dump only and no LLM brief).
+  if (
+    resolved.followUpKind === 'elaborate' &&
+    hasGroundedEvidence &&
+    resolved.lastAnswer &&
+    !/^According to [^:]+:\s*\S+\s+According to /i.test(resolved.lastAnswer.trim())
+  ) {
     // Fetch fuller article bodies so the answer can actually go deeper.
     const bodies = await resolveArticleBodies(
       evidenceSources.map((s) => ({ url: s.url, description: s.body || '', title: s.title })),
@@ -1956,36 +2953,27 @@ async function handleQueryPost(request: Request) {
       publishedAt: s.publishedAt,
       body: bodies[i] || s.body || s.title,
     }));
-    const question = stableAsk(rawQ) || rawQ;
-    const sameAsPrev = (a: string) => {
-      const prev = (resolved.lastAnswer || '').toLowerCase();
-      if (!prev) return false;
-      const words = a.toLowerCase().match(/[a-z\u0600-\u06FF]{5,}/g) || [];
-      if (!words.length) return false;
-      const hits = words.filter((w) => prev.includes(w)).length;
-      return hits / words.length > 0.85;
-    };
+    const question = resolved.followUpText || incomingQ;
     let answer = await buildGroundedAnswer(question, sources, replyLang, undefined, {
       previousAnswer: resolved.lastAnswer,
       focusAsk: incomingQ,
+      needTag: inferNeedTag(question),
+      rollingSummary: resolved.rollingSummary,
     });
-    if (!answer || answer.length < WA_ANSWER_MIN || sameAsPrev(answer)) {
-      // Extractive fallback: rotate to the later sources so the user gets
-      // material beyond what the first answer already quoted.
-      const rotated = sources.length > 1 ? [...sources.slice(1), sources[0]] : sources;
-      const extractive = buildExtractiveAnswer(question, rotated, replyLang);
-      if (!answer || answer.length < WA_ANSWER_MIN) {
-        answer = extractive;
-      } else if (sameAsPrev(answer) && !sameAsPrev(extractive)) {
-        answer = extractive;
-      }
+    let elaborateGrounded = true;
+    let elaborateLabelLang: 'en' | 'ur' = replyLang;
+    if (!answer || answer.length < WA_ANSWER_MIN) {
+      const verified = buildExtractiveAnswer(question, sources, 'en');
+      answer = `The available verified coverage does not establish a direct answer to “${question.slice(0, 120)}.” Relevant facts:\n\n${verified}`;
+      elaborateGrounded = false;
+      elaborateLabelLang = 'en';
     }
     const srcItems = evidenceSources as unknown as QueryResultItem[];
     const displayUrls = await Promise.all(evidenceSources.map((s) => shortenArticleUrl(s.url)));
     const sourceButtons = buildSourceButtons(srcItems, displayUrls);
-    const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
-    const aLabel = replyLang === 'ur' ? '*جواب:*' : '*Answer:*';
-    const sLabel = replyLang === 'ur' ? '*ذرائع:*' : '*Sources*';
+    const topicKey = elaborateLabelLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+    const aLabel = elaborateLabelLang === 'ur' ? '*جواب:*' : '*Answer:*';
+    const sLabel = elaborateLabelLang === 'ur' ? '*ذرائع:*' : '*Sources*';
     const showIndex = evidenceSources.length > 1;
     const whatsappText = [
       '*NewsDash Analyst*',
@@ -1998,57 +2986,110 @@ async function handleQueryPost(request: Request) {
       sLabel,
       srcItems.map((i, idx) => formatSourceLine(i, idx, showIndex, displayUrls[idx])).join('\n\n'),
     ].join('\n');
-    await remember(topicLabel, 'news', answer.split(/[.!?۔]/)[0].trim().slice(0, 200), answer, undefined, {
+    // A fallback ("does not establish…") reply must not replace the original
+    // grounded evidence; keep the previous answer/sources for later follow-ups.
+    await remember(
+      topicLabel,
+      threadIntent,
+      answer.split(/[.!?۔]/)[0].trim().slice(0, 200),
       answer,
-      sources: evidenceSources,
+      undefined,
+      elaborateGrounded ? { answer, sources: evidenceSources } : undefined,
+    );
+    timer.mark('evidence_reuse');
+    const ragMetrics = timer.snapshot({
+      candidateCount: sources.length,
+      vectorHit: false,
+      fallbackReason: 'memory_evidence',
+      needTag: inferNeedTag(question),
     });
-    return Response.json({
-      query: q,
-      rawQuery: incomingQ,
-      effectiveQuery: rawQ,
-      displayTopic: topicLabel,
-      intent: 'news',
-      followUpKind: 'elaborate',
-      brief: answer.slice(0, 200),
-      items: [],
-      total: evidenceSources.length,
-      whatsappText,
-      sourceButtons,
-      usedMemory: true,
-      memoryBackend: getRedisClient() ? 'redis' : 'in-process',
-      lastUpdated: now,
-    });
+    setGroundingPath(
+      requestId,
+      elaborateGrounded ? 'llm' : 'extractive',
+      elaborateGrounded ? undefined : 'elaborate_extractive',
+    );
+    return Response.json(
+      withPaths({
+        query: q,
+        rawQuery: incomingQ,
+        effectiveQuery: rawQ,
+        displayTopic: topicLabel,
+        intent: threadIntent,
+        followUpKind: 'elaborate',
+        brief: answer.slice(0, 200),
+        items: [],
+        total: evidenceSources.length,
+        whatsappText,
+        sourceButtons,
+        usedMemory: true,
+        memoryBackend: getRedisClient() ? 'redis' : 'in-process',
+        claimSources: mapClaimsToSources(answer, sources),
+        ragMetrics,
+        lastUpdated: now,
+      }),
+    );
   }
 
   if (plugin.kind === 'greeting') {
-    return Response.json({
-      query: q,
-      rawQuery: incomingQ,
-      displayTopic: topicLabel,
-      intent: 'greeting',
-      brief: 'Greeting',
-      items: [],
-      total: 0,
-      whatsappText: buildGreeting(replyLang),
-      usedMemory: resolved.usedMemory,
-      lastUpdated: now,
-    });
+    setGroundingPath(requestId, 'none', 'greeting');
+    return Response.json(
+      withPaths({
+        query: q,
+        rawQuery: incomingQ,
+        displayTopic: topicLabel,
+        intent: 'greeting',
+        brief: 'Greeting',
+        items: [],
+        total: 0,
+        whatsappText: buildGreeting(replyLang),
+        usedMemory: resolved.usedMemory || turnClass?.kind === 'continue_topic' || Boolean(classifiedTopicId),
+        lastUpdated: now,
+      }),
+    );
   }
 
   if (plugin.kind === 'weather') {
-    const weather = await fetchWeather(plugin.city, plugin.cityAsked);
-    let whatsappText = buildWeatherReply(
-      topicLabel,
-      weather || { error: 'Could not fetch live weather.' },
-      replyLang,
+    const cities = splitWeatherCities(plugin.city);
+    const cityList = cities.length ? cities : plugin.cityAsked && plugin.city.trim() ? [plugin.city] : [];
+
+    // Bare "weather" / "mosam" with no city — ask instead of inventing Karachi/London.
+    if (!cityList.length) {
+      const whatsappText = buildWeatherCityClarify(replyLang);
+      await remember('Weather', 'weather', 'Need city for weather', whatsappText);
+      setGroundingPath(requestId, 'none', 'weather_need_city');
+      return Response.json(
+        withPaths({
+          query: q,
+          rawQuery: incomingQ,
+          displayTopic: 'Weather',
+          intent: 'weather',
+          brief: 'Need a city name for weather',
+          items: [],
+          total: 0,
+          whatsappText,
+          usedMemory: resolved.usedMemory || turnClass?.kind === 'continue_topic' || Boolean(classifiedTopicId),
+          lastUpdated: now,
+        }),
+      );
+    }
+
+    const weatherRows = await Promise.all(
+      cityList.map((city) => fetchWeather(city, true)),
     );
+    const rows = weatherRows.map((w, i) => w || {
+      error: `Could not fetch live weather for ${cityList[i]}.`,
+      requestedCity: cityList[i],
+    });
+    const okRows = rows.filter((w) => !w.error);
+    let whatsappText = buildMultiWeatherReply(topicLabel, rows, replyLang);
+    const primary = okRows[0] || rows[0];
     const gate = assertQuality({
       kind: 'weather',
       text: whatsappText,
-      weather,
-      requestedCity: plugin.cityAsked ? plugin.city : undefined,
+      weather: primary,
+      requestedCity: plugin.cityAsked && cityList.length === 1 ? cityList[0] : undefined,
     });
-    if (!gate.ok) {
+    if (!gate.ok && okRows.length === 0) {
       const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
       whatsappText =
         replyLang === 'ur'
@@ -2056,37 +3097,36 @@ async function handleQueryPost(request: Request) {
               '*NewsDash Analyst*',
               '',
               `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`,
-              `*${plugin.city}* کے لیے موسم ابھی دستیاب نہیں۔`,
-              '',
-              'براہِ کرم:',
-              '• واضح شہر لکھیں (مثلاً "Karachi weather")',
-              '• چند منٹ بعد دوبارہ کوشش کریں',
+              'موسم ابھی دستیاب نہیں۔ واضح شہر نام لکھیں (مثلاً Karachi weather)۔',
             ].join('\n')
           : [
               '*NewsDash Analyst*',
               '',
               `${topicKey} ${topicLabel}`,
-              `Live weather for *${plugin.city}* is not available right now.`,
-              '',
-              'Please try:',
-              '• A more specific city name (e.g. "Karachi weather", "Lahore weather")',
-              '• Checking again in a few minutes',
+              'Live weather is not available right now. Try a clearer city name (e.g. "Karachi weather").',
             ].join('\n');
     }
-    await remember(topicLabel, 'weather', weather?.error || `Live weather for ${weather?.location || topicLabel}`, whatsappText);
-    return Response.json({
-      query: q,
-      rawQuery: incomingQ,
-      displayTopic: topicLabel,
-      intent: 'weather',
-      weather: weather ?? undefined,
-      brief: weather?.error || `Live conditions for ${weather?.location || topicLabel}.`,
-      items: [],
-      total: weather && !weather.error ? 1 : 0,
-      whatsappText,
-      usedMemory: resolved.usedMemory,
-      lastUpdated: now,
-    });
+    const brief =
+      okRows.length > 1
+        ? `Live weather for ${okRows.map((w) => w.location).join(', ')}.`
+        : primary.error || `Live conditions for ${primary.location || topicLabel}.`;
+    await remember(topicLabel, 'weather', brief, whatsappText);
+    setGroundingPath(requestId, 'none', 'live_weather');
+    return Response.json(
+      withPaths({
+        query: q,
+        rawQuery: incomingQ,
+        displayTopic: topicLabel,
+        intent: 'weather',
+        weather: primary ?? undefined,
+        brief,
+        items: [],
+        total: okRows.length,
+        whatsappText,
+        usedMemory: resolved.usedMemory || turnClass?.kind === 'continue_topic' || Boolean(classifiedTopicId),
+        lastUpdated: now,
+      }),
+    );
   }
 
   if (plugin.kind === 'gold_price' && isSimplePriceCheck(incomingQ)) {
@@ -2099,7 +3139,8 @@ async function handleQueryPost(request: Request) {
         whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
       await remember(topicLabel, 'gold_price', `Gold $${gold.price}/oz`, whatsappText);
-      return Response.json({
+      setGroundingPath(requestId, 'none', 'live_quote');
+      return Response.json(withPaths({
         query: q,
         rawQuery: incomingQ,
         displayTopic: topicLabel,
@@ -2109,15 +3150,15 @@ async function handleQueryPost(request: Request) {
         total: 1,
         goldPrice: gold,
         whatsappText,
-        usedMemory: resolved.usedMemory,
+        usedMemory: resolved.usedMemory || turnClass?.kind === 'continue_topic' || Boolean(classifiedTopicId),
         lastUpdated: now,
-      });
+      }));
     }
     // Fall through to universal news if live quote fails.
   }
 
   if (plugin.kind === 'crypto_price' && isSimplePriceCheck(incomingQ)) {
-    const quote = await fetchCrypto(plugin.cryptoId, replyLang === 'ur');
+    const quote = await fetchCrypto(plugin.cryptoId, true);
     if (quote) {
       let whatsappText = buildCryptoReply(topicLabel, quote, replyLang);
       const gate = assertQuality({ kind: 'crypto_price', text: whatsappText, crypto: quote });
@@ -2126,7 +3167,8 @@ async function handleQueryPost(request: Request) {
         whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
       }
       await remember(topicLabel, 'crypto_price', `${quote.symbol} $${quote.usd}`, whatsappText);
-      return Response.json({
+      setGroundingPath(requestId, 'none', 'live_quote');
+      return Response.json(withPaths({
         query: q,
         rawQuery: incomingQ,
         displayTopic: topicLabel,
@@ -2136,42 +3178,101 @@ async function handleQueryPost(request: Request) {
         total: 1,
         cryptoPrice: quote,
         whatsappText,
-        usedMemory: resolved.usedMemory,
+        usedMemory: resolved.usedMemory || turnClass?.kind === 'continue_topic' || Boolean(classifiedTopicId),
         lastUpdated: now,
-      });
+      }));
     }
   }
 
   if (plugin.kind === 'fuel_price' && isSimplePriceCheck(incomingQ)) {
-    const oil = await fetchOil();
-    if (oil) {
-      let whatsappText = buildFuelReply(topicLabel, oil, replyLang);
-      const gate = assertQuality({ kind: 'fuel_price', text: whatsappText, oil });
-      if (!gate.ok) {
-        const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
-        whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
+    // Petrol/diesel asks → Pakistan pump PKR/litre (NOT WTI/Brent barrels).
+    if (wantsPakistanPumpFuel(`${incomingQ} ${q}`)) {
+      const pkFuel = await fetchPakistanFuelPrices();
+      if (pkFuel && (pkFuel.petrolPkr > 0 || pkFuel.dieselPkr > 0)) {
+        const products = requestedPumpProducts(incomingQ);
+        const displayLinks = await Promise.all(
+          pkFuel.verifyUrls.map(async (v) => ({
+            label: v.label,
+            url: await shortenArticleUrl(v.url),
+          })),
+        );
+        const whatsappText = buildPakistanFuelReply(pkFuel, replyLang, displayLinks, products);
+        const sourceButtons: SourceButton[] = displayLinks.map((v) => ({
+          type: 'url',
+          text: v.label.slice(0, 20),
+          url: v.url,
+        }));
+        const briefParts = [
+          products.petrol && pkFuel.petrolPkr > 0 ? `Petrol Rs ${pkFuel.petrolPkr}/L` : '',
+          products.diesel && pkFuel.dieselPkr > 0 ? `Diesel Rs ${pkFuel.dieselPkr}/L` : '',
+        ].filter(Boolean);
+        await remember(
+          products.petrol && products.diesel
+            ? 'Pakistan petrol / diesel'
+            : products.diesel
+              ? 'Pakistan diesel'
+              : 'Pakistan petrol',
+          'fuel_price',
+          briefParts.join(' · '),
+          whatsappText,
+        );
+        setGroundingPath(requestId, 'none', 'pk_pump_fuel');
+        return Response.json(
+          withPaths({
+            query: q,
+            rawQuery: incomingQ,
+            displayTopic:
+              products.petrol && products.diesel
+                ? 'Pakistan petrol / diesel'
+                : products.diesel
+                  ? 'Pakistan diesel'
+                  : 'Pakistan petrol',
+            intent: 'fuel_price',
+            brief: briefParts.join(', '),
+            items: [],
+            total: 1,
+            whatsappText,
+            sourceButtons,
+            usedMemory: resolved.usedMemory || turnClass?.kind === 'continue_topic' || Boolean(classifiedTopicId),
+            lastUpdated: now,
+          }),
+        );
       }
-      await remember(
-        topicLabel,
-        'fuel_price',
-        `WTI $${oil.wtiUsd}${oil.brentUsd ? ` / Brent $${oil.brentUsd}` : ''}`,
-        whatsappText,
-      );
-      return Response.json({
-        query: q,
-        rawQuery: incomingQ,
-        displayTopic: topicLabel,
-        intent: 'fuel_price',
-        brief: 'Live crude oil (WTI/Brent).',
-        items: [],
-        total: 1,
-        oilPrice: oil,
-        whatsappText,
-        usedMemory: resolved.usedMemory,
-        lastUpdated: now,
-      });
+      // If PK pump feed fails, fall through to news — do NOT show crude as "petrol price".
+    } else {
+      const oil = await fetchOil();
+      if (oil) {
+        let whatsappText = buildFuelReply(topicLabel, oil, replyLang);
+        const gate = assertQuality({ kind: 'fuel_price', text: whatsappText, oil });
+        if (!gate.ok) {
+          const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
+          whatsappText = ['*NewsDash Analyst*', '', `${topicKey} ${localizedTopicLabel(topicLabel, replyLang)}`, gate.reason].join('\n');
+        }
+        await remember(
+          topicLabel,
+          'fuel_price',
+          `WTI $${oil.wtiUsd}${oil.brentUsd ? ` / Brent $${oil.brentUsd}` : ''}`,
+          whatsappText,
+        );
+        setGroundingPath(requestId, 'none', 'live_quote');
+        return Response.json(
+          withPaths({
+            query: q,
+            rawQuery: incomingQ,
+            displayTopic: topicLabel,
+            intent: 'fuel_price',
+            brief: 'Live crude oil (WTI/Brent).',
+            items: [],
+            total: 1,
+            oilPrice: oil,
+            whatsappText,
+            usedMemory: resolved.usedMemory || turnClass?.kind === 'continue_topic' || Boolean(classifiedTopicId),
+            lastUpdated: now,
+          }),
+        );
+      }
     }
-    // Fall through to oil-news path if live quote fails.
+    // Fall through to oil/fuel-news path if live quote fails.
   }
 
   // ── Universal NewsDash path (default for any question) ──
@@ -2185,23 +3286,36 @@ async function handleQueryPost(request: Request) {
           : q;
 
   // Fuel/pump asks: never invent a pump number; answer with oil/fuel market evidence.
+  // Scan the user's words only — resolved `q` may still carry sticky fuel hints.
   const fuelAsk =
     plugin.kind === 'fuel_price' ||
-    stickyIntent === 'fuel_price' ||
-    /\b(petrol|diesel|gasoline|pump\s*price|fuel\s*price)\b/i.test(q) ||
-    /پیٹرول|ڈیزل|پیٹرولیم|ایندھن|پرائز/.test(rawQ);
+    /\b(petrol|diesel|gasoline|pump\s*price|fuel\s*price)\b/i.test(incomingQ) ||
+    /پیٹرول|ڈیزل|پیٹرولیم|ایندھن/.test(incomingQ);
 
-  // Smart rewrite: better keywords + topic label than raw tokenize.
-  const plan = plugin.kind === 'news' ? await planNewsQuery(rawQ) : null;
-  const urduHints = await englishSearchHints(rawQ, replyLang);
+  // Smart rewrite is topic-agnostic. Keep the stable thread topic and the
+  // literal follow-up separate so causal/outlook/comparison meaning survives.
+  const semanticQuestion = resolved.followUpText
+    ? `Topic: ${q}. Question: ${resolved.followUpText}`
+    : rawQ;
+  const [plan, urduHints] = await Promise.all([
+    planNewsQuery(semanticQuestion),
+    englishSearchHints(rawQ, replyLang),
+  ]);
   let baseSearch = plan?.searchQuery || urduHints || newsQ;
   if (fuelAsk) {
-    // Prefer oil market headlines over literal "pakistan petrol" which often match nothing.
-    baseSearch = `${plan?.searchQuery || 'oil crude petroleum fuel gasoline'} oil crude petroleum fuel opec diesel`;
+    // Pakistan pump / OGRA petrol-diesel news — not generic WTI barrel headlines.
+    baseSearch = wantsPakistanPumpFuel(`${incomingQ} ${q}`)
+      ? `${plan?.searchQuery || 'pakistan petrol diesel'} pakistan petrol diesel OGRA fuel price litre`
+      : `${plan?.searchQuery || 'oil crude petroleum fuel gasoline'} oil crude petroleum fuel opec diesel`;
   }
 
   // Professional domain auto-detection: pin category + override search for precision.
-  const domainHint = plugin.kind === 'news' && !fuelAsk ? detectDomainHint(rawQ) : null;
+  // Prefer the *user's* words so a prior Dawn thread cannot force Dawn mustMatch onto "bbc news today".
+  const domainHint =
+    plugin.kind === 'news' && !fuelAsk
+      ? detectDomainHint(incomingQ) ||
+        (isVagueFollowUp(incomingQ) ? detectDomainHint(rawQ) : null)
+      : null;
   let pinnedCategories: string[] | undefined = body.categories?.length ? body.categories : undefined;
   if (domainHint) {
     baseSearch = domainHint.searchOverride;
@@ -2217,28 +3331,67 @@ async function handleQueryPost(request: Request) {
         : null);
 
   const newsTopicLabel =
-    domainHint?.topicLabel ??
+    classifiedDisplayLabel ||
+    domainHint?.topicLabel ||
     (plugin.kind === 'news' && plan?.displayTopic
       ? plan.displayTopic
       : topicLabel);
 
-  // On memory follow-ups, exclude stories the chat has already seen so "more"
-  // surfaces new articles (usually from other sources) instead of repeating.
-  // Never on elaborate fall-through — those need the SAME articles.
+  // Exclude already-shown stories whenever we are NOT deepening/translating
+  // the same evidence — including "more", near-duplicate re-asks, and same-topic continues.
   const excludeUrls =
-    resolved.usedMemory &&
     resolved.followUpKind !== 'elaborate' &&
+    resolved.followUpKind !== 'translate' &&
     resolved.shownUrls?.length
       ? new Set(resolved.shownUrls)
       : undefined;
 
   const ranked = await retrieveAndRank(
     baseSearch,
-    limit,
+    Math.min(Math.max(limit * 3, limit), 9),
     pinnedCategories as import('@/types').Category[] | undefined,
     preferFresh,
     { excludeUrls, mustMatch: domainHint?.mustMatch },
   );
+  timer.mark('lexical_retrieve');
+
+  // Hybrid RAG: dense+sparse Upstash Vector fused with lexical candidates.
+  const answerQuestion = resolved.followUpText || incomingQ;
+  const hybridQuery = `${baseSearch} ${answerQuestion}`.trim();
+  let vectorHit = false;
+  let needTag: RagNeedTag | undefined;
+  let fallbackReason: string | undefined;
+  try {
+    const hybrid = await hybridRetrieve(hybridQuery, {
+      categories: pinnedCategories as import('@/types').Category[] | undefined,
+      preferFreshHours: preferFresh,
+      excludeUrls,
+      mustMatch: domainHint?.mustMatch,
+      topK: 16,
+    });
+    vectorHit = hybrid.vectorHit;
+    needTag = hybrid.needTag;
+    if (hybrid.hits.length) {
+      const fused = fuseHybridAndLexical(hybrid.hits, ranked.items, limit, preferFresh);
+      if (fused.length) {
+        ranked.items = fused.map((i) => ({
+          ...i,
+          score: i.score,
+          matchScore: i.matchScore,
+          matchedTerms: i.matchedTerms,
+        })) as QueryResultItem[];
+        ranked.total = Math.max(ranked.total, fused.length);
+      }
+    } else if (isVectorConfigured()) {
+      fallbackReason = 'vector_empty';
+    } else {
+      fallbackReason = 'vector_unconfigured';
+    }
+  } catch (err) {
+    fallbackReason = 'vector_error';
+    console.warn('[query] hybrid retrieve failed', err);
+  }
+  timer.mark('hybrid_retrieve');
 
   let items = ranked.items;
   if (plugin.kind === 'gold_price') {
@@ -2268,13 +3421,52 @@ async function handleQueryPost(request: Request) {
     }
   }
 
+  // Final relevance gate: keep only evidence that answers the information need.
+  // This LLM judge is the authority — lexical usedLatestFallback is only a hint.
+  if (items.length) {
+    const selected = await selectRelevantCandidateIndexes(
+      answerQuestion,
+      items.map((item) => ({
+        title: item.title,
+        description: item.description,
+        source: item.source,
+      })),
+      limit,
+    );
+    if (selected) {
+      if (selected.length) {
+        items = selected.map((index) => items[index]).filter(Boolean);
+        // Judge accepted on-theme articles → allow conversational grounding.
+        ranked.usedLatestFallback = false;
+        fallbackReason = fallbackReason === 'relevance_gate_empty' ? undefined : fallbackReason;
+      } else if (plugin.kind === 'news') {
+        ranked.usedLatestFallback = true;
+        items = items.slice(0, limit);
+        fallbackReason = fallbackReason || 'relevance_gate_empty';
+      } else {
+        // Live-data domains can still answer with their current quote without
+        // pretending unrelated topical coverage explains the user's question.
+        items = [];
+        fallbackReason = fallbackReason || 'relevance_gate_empty_live';
+      }
+    } else {
+      // Judge unavailable (quota/key) — keep candidates. Soft lexical veto must
+      // not block grounding when domain/hybrid already found a pool.
+      items = items.slice(0, limit);
+      if (vectorHit || domainHint || questionLooksAbstract(answerQuestion)) {
+        ranked.usedLatestFallback = false;
+      }
+    }
+  }
+  timer.mark('relevance_gate');
+
   const note = fuelAsk
     ? replyLang === 'ur'
-      ? 'نوٹ: پاکستان کے لائیو پمپ ریٹ ابھی منسلک نہیں۔ تیل/ایندھن کی متعلقہ کوریج دے رہا ہوں۔'
-      : 'Note: live Pakistan pump rates are not connected yet. Sharing related oil/fuel coverage.'
+      ? 'نوٹ: متعلقہ ایندھن/تیل کوریج۔ لائیو پمپ ریٹ کے لیے "petrol price" یا "diesel price" پوچھیں۔'
+      : 'Note: related fuel/oil coverage. For live pump rates, ask "petrol price" or "diesel price".'
     : undefined;
 
-  const combinedHistory: any[] = [];
+  const combinedHistory: Array<{ role?: string; text?: string; content?: string }> = [];
   if (resolved.turns) {
     for (const t of resolved.turns) {
       combinedHistory.push({ role: t.role, content: t.text });
@@ -2297,7 +3489,7 @@ async function handleQueryPost(request: Request) {
         : `Live gold spot price: XAU/USD is $${gold.price.toLocaleString('en-US')} / oz` + (gold.pkrPerTolaApprox ? `, approx Rs ${gold.pkrPerTolaApprox.toLocaleString('en-PK')} / tola` : '');
     }
   } else if (plugin.kind === 'crypto_price') {
-    const quote = await fetchCrypto(plugin.cryptoId, replyLang === 'ur');
+    const quote = await fetchCrypto(plugin.cryptoId, true);
     if (quote) {
       const changeStr = quote.change24h != null ? ` (${quote.change24h >= 0 ? '+' : ''}${quote.change24h.toFixed(2)}% in 24h)` : '';
       liveQuoteText = replyLang === 'ur'
@@ -2305,16 +3497,12 @@ async function handleQueryPost(request: Request) {
         : `Live ${quote.name} price: $${quote.usd.toLocaleString('en-US')}${changeStr}` + (quote.pkrApprox ? `, approx Rs ${quote.pkrApprox.toLocaleString('en-PK')}` : '');
     }
   } else if (plugin.kind === 'fuel_price') {
-    const oil = await fetchOil();
-    if (oil) {
-      liveQuoteText = replyLang === 'ur'
-        ? `لائیو بین الاقوامی تیل کی قیمت: WTI $${oil.wtiUsd.toLocaleString('en-US')} / barrel` + (oil.brentUsd ? `، Brent $${oil.brentUsd.toLocaleString('en-US')} / barrel` : '')
-        : `Live international oil prices: WTI is $${oil.wtiUsd.toLocaleString('en-US')} / barrel` + (oil.brentUsd ? `, Brent is $${oil.brentUsd.toLocaleString('en-US')} / barrel` : '');
-    }
+    // Never prepend petrol/diesel prices into news replies — price cards are returned earlier.
+    // Leaving liveQuoteText unset avoids polluting every fuel-related news answer.
   }
 
   const built = await buildNewsReply(
-    rawQ,
+    resolved.followUpText || incomingQ,
     newsTopicLabel,
     items,
     ranked.poolSize,
@@ -2323,8 +3511,12 @@ async function handleQueryPost(request: Request) {
     replyLang,
     combinedHistory,
     liveQuoteText,
+    needTag,
+    resolved.rollingSummary,
   );
   let whatsappText = built.text;
+  let finalAnswer = built.answer;
+  let finalGrounded = built.grounded;
   let sourceButtons = built.sourceButtons;
   let displayUrls = built.displayUrls;
   const gate = assertQuality({
@@ -2336,6 +3528,12 @@ async function handleQueryPost(request: Request) {
     displayUrls,
   });
   if (!gate.ok && items.length) {
+    console.warn('[quality_gate] fallback_triggered', {
+      chatId,
+      reason: gate.reason,
+      query: rawQ,
+      requestId,
+    });
     displayUrls = await Promise.all(items.map((i) => shortenArticleUrl(i.url)));
     sourceButtons = buildSourceButtons(items, displayUrls);
     const fallbackAnswer = buildExtractiveAnswer(
@@ -2349,6 +3547,8 @@ async function handleQueryPost(request: Request) {
       })),
       replyLang,
     );
+    finalAnswer = fallbackAnswer;
+    finalGrounded = false;
     const aLabel = replyLang === 'ur' ? '*جواب:*' : '*Answer:*';
     const sLabel = replyLang === 'ur' ? '*ذرائع:*' : '*Sources*';
     const topicKey = replyLang === 'ur' ? '*موضوع:*' : '*Topic:*';
@@ -2374,15 +3574,29 @@ async function handleQueryPost(request: Request) {
     : plugin.kind === 'gold_price' ? 'gold_price'
     : plugin.kind === 'crypto_price' ? 'crypto_price'
     : 'news';
-  const answerBrief = (built.answer || note || newsTopicLabel).split(/[.!?]/)[0].trim().slice(0, 200);
-  // Store the answer + cited articles as evidence for translate/elaborate
-  // follow-ups — but not when we fell back to unrelated latest headlines.
+  const answerBrief = (finalAnswer || note || newsTopicLabel).split(/[.!?]/)[0].trim().slice(0, 200);
+  // Persist answer text always (for translate). Persist article sources whenever
+  // we have real feed items so "say that in Urdu" can rebuild without a fresh
+  // search — even if the LLM path fell back to extractive.
+  const appOrigin = getPublicAppUrl();
   const evidence =
-    savedIntent === 'news' && !ranked.usedLatestFallback && built.answer
+    finalAnswer &&
+    !ranked.usedLatestFallback &&
+    (built.sources.some((s) => s.url !== appOrigin) || items.length > 0)
       ? {
-          answer: built.answer,
-          sources: built.sources
-            .filter((s) => s.url !== 'https://news-d.vercel.app')
+          answer: finalAnswer,
+          sources: (
+            built.sources.some((s) => s.url !== appOrigin)
+              ? built.sources
+              : items.map((i) => ({
+                  title: i.title,
+                  source: i.source || 'Publisher',
+                  url: i.url,
+                  publishedAt: i.publishedAt,
+                  body: i.description || i.title,
+                }))
+          )
+            .filter((s) => s.url !== appOrigin)
             .slice(0, 3)
             .map((s) => ({
               title: s.title,
@@ -2397,18 +3611,24 @@ async function handleQueryPost(request: Request) {
     newsTopicLabel,
     savedIntent,
     answerBrief,
-    built.answer || note || newsTopicLabel,
+    finalAnswer || note || newsTopicLabel,
     items.map((i) => i.url).filter(isValidArticleUrl),
     evidence,
   );
-  return Response.json({
+  const ragMetrics = timer.snapshot({
+    candidateCount: items.length,
+    vectorHit,
+    fallbackReason,
+    needTag,
+  });
+  return Response.json(withPaths({
     query: q,
     rawQuery: incomingQ,
     effectiveQuery: rawQ,
     displayTopic: newsTopicLabel,
     intent: savedIntent,
     terms: { primary: ranked.tokens, expanded: ranked.expanded },
-    brief: built.answer || note || (items.length ? 'Matching stories from NewsDash.' : 'No strong match.'),
+    brief: finalAnswer || note || (items.length ? 'Matching stories from NewsDash.' : 'No strong match.'),
     items,
     total: ranked.total,
     poolSize: ranked.poolSize,
@@ -2416,8 +3636,16 @@ async function handleQueryPost(request: Request) {
     sourceButtons,
     linkPreview: preview,
     linkPreviewEnabled: true,
-    usedMemory: resolved.usedMemory,
+    usedMemory: resolved.usedMemory || turnClass?.kind === 'continue_topic' || Boolean(classifiedTopicId),
     memoryBackend: getRedisClient() ? 'redis' : 'in-process',
+    retrieval: {
+      mode: vectorHit ? 'hybrid' : 'lexical',
+      vectorConfigured: isVectorConfigured(),
+      needTag,
+      fallbackReason,
+    },
+    ragMetrics,
+    claimSources: mapClaimsToSources(finalAnswer, built.sources),
     lastUpdated: now,
-  });
+  }));
 }

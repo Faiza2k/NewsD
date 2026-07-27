@@ -8,7 +8,7 @@ A short guide to explain **what this project is**, **how it works**, and **how W
 
 - A **news dashboard** (web app) that collects headlines from many publishers via **RSS**.
 - A **WhatsApp ask bot** that answers user questions (text or voice) using that same news + live data.
-- Live on WhatsApp through: **WAHA** (WhatsApp API) → **n8n** (automation) → **NewsDash API** on Vercel.
+- Live on WhatsApp through: **WAHA** (WhatsApp API) → **n8n** (automation) → **NewsDash API** on Coolify.
 
 **One-line pitch:**  
 *Users ask on WhatsApp; the bot searches NewsDash feeds (and live price/weather APIs when needed) and replies with a short grounded answer plus source links.*
@@ -17,10 +17,10 @@ A short guide to explain **what this project is**, **how it works**, and **how W
 
 ## Is this RAG?
 
-- **No — not classic RAG.**
-- There is **no embedding model** and **no vector database**.
-- Flow is: **RSS fetch → cache → keyword ranking → grounded answer (optional LLM)**.
-- Sources are real article URLs (shortened) so the user can open the publisher page.
+- **Yes — hybrid RAG** for the Ask bot (`POST /api/query`).
+- Lexical RSS ranking plus Upstash Vector hybrid retrieval (dense + sparse).
+- Sources are real article URLs so the user can open the publisher page.
+- Anti-hallucination guards (`fabricatedVersionTokens`, weak-answer detection) remain mandatory.
 
 ---
 
@@ -33,14 +33,22 @@ A short guide to explain **what this project is**, **how it works**, and **how W
 - Dashboard APIs also serve the web UI (`/api/feeds`, etc.).
 
 ### 2) Brain API — `POST /api/query`
-- The WhatsApp “brain”.
-- Input: user question `q` (+ limit).
+- The WhatsApp/Discord “brain” and **source of truth for conversational design**.
+- Input: user question `q` (+ limit, chatId for memory).
 - Output: WhatsApp-ready text (`whatsappText`), sources, and optional live data.
+- Uses topic-stack + rolling-summary memory (`src/lib/query/conversation-state.ts`),
+  turn classification (`src/lib/query/classify-turn.ts`), and the shared persona
+  (`NEWSDASH_IDENTITY` in `src/lib/query/grounded-answer.ts`).
 - Routes by intent:
-  - **Greeting** → help text
+  - **Greeting / small-talk** → capability menu or short conversational reply
   - **Weather** → live weather API (geocoded city)
   - **Gold / BTC / ETH / SOL price** → live market APIs
-  - **News (default)** → search feed cache → rank → grounded answer + sources
+  - **News (default)** → hybrid retrieve → grounded answer + sources
+
+### Dashboard Ask AI — `POST /api/ai/chat`
+- Powers the in-dashboard Ask AI widget only.
+- Shares `NEWSDASH_IDENTITY` with `/api/query` so persona/tone cannot drift.
+- Does **not** run the full RAG pipeline — keep conversational changes in `/api/query` first.
 
 ### 3) Voice transcription — `POST /api/transcribe`
 - Accepts audio (multipart, `mediaUrl`, or **`audioBase64`**).
@@ -61,7 +69,7 @@ A short guide to explain **what this project is**, **how it works**, and **how W
   1. **Webhook** receives WAHA `message` event  
   2. **Parse** extracts text / voice media, chat id  
   3. **Resolve** downloads voice → base64 → `/api/transcribe` if needed  
-  4. **Query** calls `https://news-d.vercel.app/api/query`  
+  4. **Query** calls `http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/query`  
   5. **Format** builds final WhatsApp text  
   6. **Send** replies via WAHA `sendText`
 - Important: replies go to the user’s **phone JID (`@c.us`)**, not only `@lid` (or messages may not appear).
@@ -155,7 +163,7 @@ WhatsApp note:
 
 | Component | Where |
 |-----------|--------|
-| NewsDash app / APIs | **Vercel** (`https://news-d.vercel.app`) |
+| NewsDash app / APIs | **Coolify** (`http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io`) |
 | Code remote used for deploy | GitHub `NewsD` / `newsd` remote |
 | WAHA | Docker on machine (`:3001`) |
 | n8n | Docker on machine (`:5678`) |
@@ -204,7 +212,7 @@ WAHA (NOWEB)  ──webhook──►  n8n Ask workflow
                     voice? ──► /api/transcribe (Whisper)
                                 │
                                 ▼
-                         /api/query (NewsDash on Vercel)
+                         /api/query (NewsDash on Coolify)
                            │      │
                  live APIs ◄┘      └► RSS cache → rank → grounded answer
                                 │

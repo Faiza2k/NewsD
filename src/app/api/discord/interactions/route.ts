@@ -1,6 +1,7 @@
 import { discordChatId } from '@/lib/ask/chat-id';
 import { getAskFallbackReply, runAskQuery } from '@/lib/ask/brain';
 import { deferInteraction, editOriginalInteraction } from '@/lib/discord/api';
+import { getPublicAppUrl } from '@/lib/app-url';
 import { getDiscordConfig, isDiscordConfigured, isGuildAllowed } from '@/lib/discord/config';
 import { verifyDiscordSignature } from '@/lib/discord/verify';
 
@@ -46,8 +47,8 @@ export async function GET() {
     allowedGuilds: c.allowedGuildIds.length || 'all',
     dualChannel: 'Works alongside WhatsApp WAHA — see DUAL_CHANNEL_SETUP.md',
     hint: isDiscordConfigured()
-      ? 'Set Interactions Endpoint URL to https://news-d.vercel.app/api/discord/interactions then /ask in Discord.'
-      : 'Add DISCORD_PUBLIC_KEY, DISCORD_BOT_TOKEN, DISCORD_APPLICATION_ID on Vercel.',
+      ? `Set Interactions Endpoint URL to ${getPublicAppUrl()}/api/discord/interactions then /ask in Discord.`
+      : 'Add DISCORD_PUBLIC_KEY, DISCORD_BOT_TOKEN, DISCORD_APPLICATION_ID on Coolify.',
   });
 }
 

@@ -1,4 +1,6 @@
 import { getDiscordConfig, isDiscordConfigured } from '@/lib/discord/config';
+import { isVectorConfigured } from '@/lib/rag/vector';
+import { getRedisClient, isMemoryDurable } from '@/lib/kv/redis';
 import { isWhatsAppCloudConfigured } from '@/lib/whatsapp/cloud';
 
 export type ChannelStatus = {
@@ -16,6 +18,13 @@ export function getAskChannelStatus(): {
   channels: ChannelStatus[];
   dualChannelReady: boolean;
   discord: { allowedGuilds: string | number };
+  /** True when Redis/KV is configured so chat memory survives cold starts. */
+  memoryDurable: boolean;
+  rag: {
+    vectorConfigured: boolean;
+    redisConfigured: boolean;
+    groqConfigured: boolean;
+  };
 } {
   const discord = getDiscordConfig();
   const channels: ChannelStatus[] = [
@@ -30,21 +39,21 @@ export function getAskChannelStatus(): {
     {
       id: 'whatsapp_cloud',
       label: 'WhatsApp (Meta Cloud API)',
-      transport: 'vercel',
+      transport: 'coolify',
       configured: isWhatsAppCloudConfigured(),
       endpoint: '/api/whatsapp/webhook',
       hint: isWhatsAppCloudConfigured()
-        ? 'Optional second WhatsApp path on Vercel.'
+        ? 'Optional second WhatsApp path on Coolify.'
         : 'Optional. Set WHATSAPP_* env vars if you want Cloud API too.',
     },
     {
       id: 'discord',
       label: 'Discord (/ask)',
-      transport: 'vercel',
+      transport: 'coolify',
       configured: isDiscordConfigured(),
       endpoint: '/api/discord/interactions',
       hint: isDiscordConfigured()
-        ? 'Set Interactions URL in Discord Developer Portal.'
+        ? 'Set Interactions URL in Discord Developer Portal to your Coolify HTTPS URL.'
         : 'Add DISCORD_PUBLIC_KEY, DISCORD_BOT_TOKEN, DISCORD_APPLICATION_ID.',
     },
   ];
@@ -59,6 +68,12 @@ export function getAskChannelStatus(): {
     dualChannelReady,
     discord: {
       allowedGuilds: discord.allowedGuildIds.length || 'all',
+    },
+    memoryDurable: isMemoryDurable(),
+    rag: {
+      vectorConfigured: isVectorConfigured(),
+      redisConfigured: Boolean(getRedisClient()),
+      groqConfigured: Boolean(process.env.GROQ_API_KEY?.trim()),
     },
   };
 }

@@ -5,7 +5,7 @@ Users message a **Meta bot number**. Your personal/business WhatsApp is **never*
 Webhook (already deployed):
 
 ```text
-https://news-d.vercel.app/api/whatsapp/webhook
+http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/whatsapp/webhook
 ```
 
 Pre-chosen verify token (use exactly this in Meta + Vercel):
@@ -38,7 +38,7 @@ I cannot log into your Facebook/Meta account. Do this once:
 ### 2. Copy Meta credentials (test number)
 On **WhatsApp → API Setup**:
 
-| Field in Meta | Env name on Vercel |
+| Field in Meta | Env name on Coolify |
 |---------------|--------------------|
 | Temporary access token | `WHATSAPP_ACCESS_TOKEN` |
 | Phone number ID | `WHATSAPP_PHONE_NUMBER_ID` |
@@ -53,7 +53,7 @@ On API Setup → **To** / test recipients: add **your personal WhatsApp** and co
 ### 4. Webhook
 **WhatsApp → Configuration** → Webhooks → Edit:
 
-- Callback URL: `https://news-d.vercel.app/api/whatsapp/webhook`
+- Callback URL: `http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/whatsapp/webhook`
 - Verify token: `newsdash_cloud_verify_x9k2m`
 - Subscribe: **messages**
 - Click **Verify and save** (must go green)
@@ -71,7 +71,7 @@ WHATSAPP_APP_SECRET=<paste from Meta App settings>
 Redeploy (Deployments → … → Redeploy) after saving.
 
 ### 6. Test
-1. Browser: `https://news-d.vercel.app/api/whatsapp/webhook` → `"configured": true`
+1. Browser: `http://uln4n0vf3xlwibas8o3iowno.146.59.93.94.sslip.io/api/whatsapp/webhook` → `"configured": true`
 2. WhatsApp: message Meta’s **test** number (shown on API Setup), e.g. `bitcoin price`
 3. Reply comes from the **test** number — your business WhatsApp inbox stays empty
 
