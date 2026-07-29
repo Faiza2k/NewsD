@@ -1911,30 +1911,23 @@ function buildIdentityReply(lang: ReplyLanguage): string {
   ].join('\n');
 }
 
-function buildGreeting(lang: ReplyLanguage): string {
+function buildGreeting(lang: ReplyLanguage, greeting: string): string {
+  const isSalam = /\b(?:salam|assalamualaikum|assalamu\s*alaikum)\b/i.test(greeting);
   if (lang === 'ur') {
     return [
-      '*NewsDash Analyst*',
+      isSalam ? 'وعلیکم السلام! 👋' : 'خوش آمدید! 👋',
       '',
-      'انگریزی یا اردو میں (ٹیکسٹ یا آواز) سوال کریں۔ میں NewsDash کی تازہ خبریں تلاش کر کے مختصر جواب اور ذرائع کے لنک بھیجتا ہوں۔',
+      'آج آپ کس بارے میں جاننا چاہیں گے؟',
       '',
-      'مثالیں:',
-      '• gold price now / سونے کی قیمت',
-      '• bitcoin price / بٹ کوائن',
-      '• weather in Karachi / کراچی کا موسم',
-      '• AI regulation / OpenAI / oil markets',
+      'تازہ خبریں، مارکیٹ ریٹس یا موسم — اپنا سوال اردو یا انگریزی میں آسانی سے پوچھیں۔',
     ].join('\n');
   }
   return [
-    '*NewsDash Analyst*',
+    isSalam ? 'Wa alaikum assalam! 👋' : 'Hello! 👋',
     '',
-    'Ask in English or Urdu (text or voice). I search live NewsDash feeds and reply with a short clear answer plus source links.',
+    'Good to have you here. What would you like to know today?',
     '',
-    'Try:',
-    '• gold price now',
-    '• bitcoin price',
-    '• weather in Karachi',
-    '• AI regulation / OpenAI / oil markets',
+    'Ask naturally in English or Urdu — about the latest news, market prices, or weather.',
   ].join('\n');
 }
 
@@ -3041,7 +3034,7 @@ async function handleQueryPost(request: Request) {
         brief: 'Greeting',
         items: [],
         total: 0,
-        whatsappText: buildGreeting(replyLang),
+        whatsappText: buildGreeting(replyLang, incomingQ),
         usedMemory: resolved.usedMemory || turnClass?.kind === 'continue_topic' || Boolean(classifiedTopicId),
         lastUpdated: now,
       }),
