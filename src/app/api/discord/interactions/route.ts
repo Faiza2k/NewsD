@@ -153,6 +153,9 @@ function extractQuestion(interaction: DiscordInteraction): string {
   const opts = interaction.data?.options || [];
   const q = opts.find((o) => o.name === 'question');
   const value = q?.value != null ? String(q.value).trim() : '';
+  if (!value) return '';
+  // Allow single-digit Dawn menu picks: /ask question: 3
+  if (/^\d{1,2}$/.test(value)) return value;
   return value.length >= 2 ? value : '';
 }
 

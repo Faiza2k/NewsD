@@ -48,6 +48,16 @@ function stripHtml(s: string): string {
     .trim();
 }
 
+/** Dawn RSS often ships placeholder emails — keep human-readable bylines only. */
+function sanitizeDawnAuthor(raw: string): string | undefined {
+  let s = stripHtml(raw).trim();
+  if (!s || /^none$/i.test(s)) return undefined;
+  s = s.replace(/[\w.+-]+@[\w.-]+\.\w+/gi, ' ');
+  s = s.replace(/\s*[-—–|]\s*/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!s || /^none$/i.test(s)) return undefined;
+  return s.slice(0, 80);
+}
+
 /** Dawn Opinion *section* asks (not generic “give me opinions”). */
 export function isDawnOpinionListAsk(q: string): boolean {
   const raw = String(q || '').trim();
@@ -111,6 +121,29 @@ function parseEnglishOrdinalIndex(raw: string, itemCount: number): number | null
   return null;
 }
 
+/** Bare / conversational menu picks: "3", "the 3", "#2", "option 4". */
+function parseNumericPickIndex(raw: string, itemCount: number): number | null {
+  const s = raw.trim();
+  const patterns = [
+    /^(?:read|open|number|#|no\.?|option|pick|choose)?\s*(\d{1,2})\s*$/i,
+    /^(?:the|no\.?|option|pick|#)\s*(\d{1,2})\s*$/i,
+    /^(\d{1,2})[\).]?\s*$/i,
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (n >= 1 && n <= itemCount) return n - 1;
+    return null;
+  }
+  const embedded = s.match(/\b(?:the|no\.?|option|pick|#)\s*(\d{1,2})\b/i);
+  if (embedded && s.split(/\s+/).length <= 6) {
+    const n = Number(embedded[1]);
+    if (n >= 1 && n <= itemCount) return n - 1;
+  }
+  return null;
+}
+
 /** Dawn Opinion menu items from topic stack (not whatever topic is currently active). */
 export function dawnMenuSourcesFromState(
   state: ConversationState | null | undefined,
@@ -131,6 +164,7 @@ export function looksLikeDawnPickAttempt(q: string): boolean {
   const raw = String(q || '').trim();
   if (!raw || raw.length > 120) return false;
   if (/^\d{1,2}\s*$/.test(raw)) return true;
+  if (parseNumericPickIndex(raw, 8) != null) return true;
   if (parseEnglishOrdinalIndex(raw, 8) != null) return true;
   if (/دوسرا|پہلا|تیسرا|چوتھا|پانچواں|چھٹا|نمبر/.test(raw)) return true;
   if (/\b(read|open|show|tell me about)\b/i.test(raw) && raw.split(/\s+/).length <= 10) {
@@ -179,6 +213,9 @@ export function parseDawnOpinionSelection(
   const englishIdx = parseEnglishOrdinalIndex(raw, items.length);
   if (englishIdx != null) return englishIdx;
 
+  const numericIdx = parseNumericPickIndex(raw, items.length);
+  if (numericIdx != null) return numericIdx;
+
   const urduOrdinal: Record<string, number> = {
     پہلا: 1,
     پہلی: 1,
@@ -195,16 +232,6 @@ export function parseDawnOpinionSelection(
       const idx = n - 1;
       return idx >= 0 && idx < items.length ? idx : null;
     }
-  }
-
-  const num =
-    raw.match(/^(?:read|open|number|#)?\s*(\d{1,2})\s*$/i) ||
-    raw.match(/^(?:i\s+want\s+)?(?:number\s+)?(\d{1,2})$/i) ||
-    raw.match(/^(\d{1,2})[\).]?$/);
-  if (num) {
-    const n = Number(num[1]);
-    if (n >= 1 && n <= items.length) return n - 1;
-    return null;
   }
 
   const needle = raw.toLowerCase().replace(/[^a-z0-9\u0600-\u06ff\s]/gi, ' ').replace(/\s+/g, ' ').trim();
@@ -252,7 +279,7 @@ export async function fetchDawnOpinionItems(
             '',
         ),
       );
-      const creator = stripHtml(
+      const creator = sanitizeDawnAuthor(
         String(
           (item as { creator?: string; author?: string }).creator ||
             (item as { author?: string }).author ||
@@ -265,7 +292,7 @@ export async function fetchDawnOpinionItems(
         source: 'Dawn',
         publishedAt,
         body: rawBody.slice(0, 2000) || undefined,
-        author: creator || undefined,
+        author: creator,
       });
     }
     return out;

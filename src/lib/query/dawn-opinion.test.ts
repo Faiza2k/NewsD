@@ -39,6 +39,10 @@ describe('dawn opinion list/pick', () => {
     expect(parseDawnOpinionSelection('the second one', items)).toBe(1);
     expect(parseDawnOpinionSelection('second opinion piece', items)).toBe(1);
     expect(parseDawnOpinionSelection('tell me about the 2nd', items)).toBe(1);
+    expect(parseDawnOpinionSelection('3', items)).toBe(2);
+    expect(parseDawnOpinionSelection('the 3', items)).toBe(2);
+    expect(parseDawnOpinionSelection('#2', items)).toBe(1);
+    expect(parseDawnOpinionSelection('option 2', items)).toBe(1);
     expect(parseDawnOpinionSelection('bbc news today', items)).toBeNull();
     expect(parseDawnOpinionSelection('99', items)).toBeNull();
   });

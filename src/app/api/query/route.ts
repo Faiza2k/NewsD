@@ -2332,6 +2332,30 @@ async function handleQueryPost(request: Request) {
     resolved.usedMemory = true;
   }
 
+  // Dawn menu pick must not be swallowed by LLM small-talk / clarify paths.
+  const dawnTopicEarly = convStateEarly?.topics?.find((t) => t.intent === DAWN_OPINION_LIST_INTENT);
+  const dawnMenuPendingEarly =
+    isDawnOpinionMenuPending({
+      memoryIntent: resolved.memoryIntent || dawnTopicEarly?.intent,
+      topicIntent: dawnTopicEarly?.intent,
+      lastBrief: dawnTopicEarly?.lastAnswerBrief,
+      lastAnswer: dawnTopicEarly?.lastAnswer || resolved.lastAnswer,
+    }) || Boolean(dawnTopicEarly?.lastSources?.length);
+  const dawnPickAttemptEarly =
+    dawnMenuPendingEarly &&
+    !isDawnOpinionListAsk(incomingQ) &&
+    !(Boolean(detectDomainHint(incomingQ)?.mustMatch) && !isDawnOpinionListAsk(incomingQ)) &&
+    looksLikeDawnPickAttempt(incomingQ);
+  if (
+    dawnPickAttemptEarly &&
+    turnClass &&
+    (turnClass.kind === 'small_talk' || turnClass.kind === 'clarification_needed')
+  ) {
+    turnClass = null;
+    classifyMeta = { path: 'heuristic', reason: 'dawn_menu_pick' };
+    setClassifyPath(requestId, 'heuristic', 'dawn_menu_pick');
+  }
+
   const pathsPayload = (): TurnPathLog => {
     const p = getTurnPaths(requestId);
     return {
