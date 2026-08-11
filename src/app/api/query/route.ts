@@ -2356,6 +2356,17 @@ async function handleQueryPost(request: Request) {
     setClassifyPath(requestId, 'heuristic', 'dawn_menu_pick');
   }
 
+  // Dawn Opinion list ask must not be swallowed by LLM small-talk.
+  if (
+    isDawnOpinionListAsk(incomingQ) &&
+    turnClass &&
+    (turnClass.kind === 'small_talk' || turnClass.kind === 'clarification_needed')
+  ) {
+    turnClass = null;
+    classifyMeta = { path: 'heuristic', reason: 'dawn_opinion_list' };
+    setClassifyPath(requestId, 'heuristic', 'dawn_opinion_list');
+  }
+
   const pathsPayload = (): TurnPathLog => {
     const p = getTurnPaths(requestId);
     return {
