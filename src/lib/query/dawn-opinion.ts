@@ -4,6 +4,7 @@
  */
 import Parser from 'rss-parser';
 import { extractValidDate, isFresh } from '@/lib/feeds/date-utils';
+import type { ConversationState } from '@/lib/query/conversation-state';
 import type { StoredSource } from '@/lib/query/memory-types';
 import type { ReplyLanguage } from '@/lib/query/grounded-answer';
 
@@ -76,6 +77,84 @@ export function isDawnOpinionMenuPending(args: {
   );
 }
 
+const ENGLISH_ORDINAL: Record<string, number> = {
+  first: 1,
+  '1st': 1,
+  second: 2,
+  '2nd': 2,
+  third: 3,
+  '3rd': 3,
+  fourth: 4,
+  '4th': 4,
+  fifth: 5,
+  '5th': 5,
+  sixth: 6,
+  '6th': 6,
+  seventh: 7,
+  '7th': 7,
+  eighth: 8,
+  '8th': 8,
+};
+
+function parseEnglishOrdinalIndex(raw: string, itemCount: number): number | null {
+  const s = raw.toLowerCase();
+  if (/\blast\b/.test(s)) {
+    return itemCount > 0 ? itemCount - 1 : null;
+  }
+  const wordMatch = s.match(
+    /\b(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|1st|2nd|3rd|4th|5th|6th|7th|8th)\b(?:\s+(?:one|piece|article|column|story|item|option|entry|pick|opinion(?:\s+piece)?|from\s+dawn))?/,
+  );
+  if (wordMatch) {
+    const n = ENGLISH_ORDINAL[wordMatch[1]];
+    if (n != null && n >= 1 && n <= itemCount) return n - 1;
+  }
+  return null;
+}
+
+/** Dawn Opinion menu items from topic stack (not whatever topic is currently active). */
+export function dawnMenuSourcesFromState(
+  state: ConversationState | null | undefined,
+  fallback: StoredSource[] = [],
+): StoredSource[] {
+  const dawnTopic = state?.topics?.find(
+    (t) => t.intent === DAWN_OPINION_LIST_INTENT && t.lastSources?.length,
+  );
+  if (dawnTopic?.lastSources?.length) return dawnTopic.lastSources;
+  const dawnOnly = fallback.filter(
+    (s) => /dawn/i.test(String(s.source || '')) || /dawn\.com/i.test(String(s.url || '')),
+  );
+  return dawnOnly.length ? dawnOnly : fallback;
+}
+
+/** User is trying to pick from the Dawn list but phrasing may not parse. */
+export function looksLikeDawnPickAttempt(q: string): boolean {
+  const raw = String(q || '').trim();
+  if (!raw || raw.length > 120) return false;
+  if (/^\d{1,2}\s*$/.test(raw)) return true;
+  if (parseEnglishOrdinalIndex(raw, 8) != null) return true;
+  if (/دوسرا|پہلا|تیسرا|چوتھا|پانچواں|چھٹا|نمبر/.test(raw)) return true;
+  if (/\b(read|open|show|tell me about)\b/i.test(raw) && raw.split(/\s+/).length <= 10) {
+    return true;
+  }
+  return raw.split(/\s+/).filter(Boolean).length <= 6;
+}
+
+export function buildDawnOpinionPickClarify(lang: ReplyLanguage): string {
+  return lang === 'ur'
+    ? [
+        '*NewsDash Analyst*',
+        '',
+        '*موضوع:* Dawn Opinion',
+        'براہِ کرم نمبر لکھیں (جیسے 2) یا کالم کا عنوان تاکہ وہی Dawn Opinion کھول سکوں۔',
+      ].join('\n')
+    : [
+        '*NewsDash Analyst*',
+        '',
+        '*Topic:* Dawn Opinion',
+        'Reply with a number (e.g. 2) or paste the column title so I can open that Dawn Opinion piece.',
+      ].join('\n');
+}
+
 /**
  * Resolve "2" / "read 2" / title fragment to a 0-based index.
  * Returns null if this is not a selection (e.g. "bbc news today").
@@ -86,15 +165,19 @@ export function parseDawnOpinionSelection(
 ): number | null {
   if (!items.length) return null;
   const raw = String(q || '').trim();
-  if (!raw || raw.length > 80) return null;
+  if (!raw || raw.length > 120) return null;
 
   // Other outlet / new topic — not a pick
   if (
     /\b(bbc|reuters|guardian|al\s*jazeera|bitcoin|weather|petrol|gold)\b/i.test(raw) &&
-    !/^\d{1,2}\s*$/.test(raw)
+    !/^\d{1,2}\s*$/.test(raw) &&
+    !/\bdawn\b/i.test(raw)
   ) {
     return null;
   }
+
+  const englishIdx = parseEnglishOrdinalIndex(raw, items.length);
+  if (englishIdx != null) return englishIdx;
 
   const urduOrdinal: Record<string, number> = {
     پہلا: 1,

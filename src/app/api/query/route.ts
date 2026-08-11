@@ -43,11 +43,14 @@ import {
 import {
   buildDawnOpinionListReply,
   buildDawnOpinionPickBrief,
+  buildDawnOpinionPickClarify,
   DAWN_OPINION_LIST_INTENT,
   dawnItemsToStoredSources,
+  dawnMenuSourcesFromState,
   fetchDawnOpinionItems,
   isDawnOpinionListAsk,
   isDawnOpinionMenuPending,
+  looksLikeDawnPickAttempt,
   parseDawnOpinionSelection,
   type DawnOpinionItem,
 } from '@/lib/query/dawn-opinion';
@@ -2670,12 +2673,14 @@ async function handleQueryPost(request: Request) {
   };
 
   // ── Dawn Opinion section: browse → pick → read (live RSS, not hardcoded titles) ──
-  const dawnMenuPending = isDawnOpinionMenuPending({
-    memoryIntent: resolved.memoryIntent || activeTopic?.intent,
-    topicIntent: activeTopic?.intent,
-    lastBrief: activeTopic?.lastAnswerBrief,
-    lastAnswer: activeTopic?.lastAnswer || resolved.lastAnswer,
-  });
+  const dawnTopic = convStateEarly?.topics?.find((t) => t.intent === DAWN_OPINION_LIST_INTENT);
+  const dawnMenuPending =
+    isDawnOpinionMenuPending({
+      memoryIntent: resolved.memoryIntent || activeTopic?.intent || dawnTopic?.intent,
+      topicIntent: activeTopic?.intent || dawnTopic?.intent,
+      lastBrief: activeTopic?.lastAnswerBrief || dawnTopic?.lastAnswerBrief,
+      lastAnswer: activeTopic?.lastAnswer || resolved.lastAnswer || dawnTopic?.lastAnswer,
+    }) || Boolean(dawnTopic?.lastSources?.length);
   const otherOutletAsk =
     Boolean(detectDomainHint(incomingQ)?.mustMatch) && !isDawnOpinionListAsk(incomingQ);
 
@@ -2709,14 +2714,17 @@ async function handleQueryPost(request: Request) {
       ),
     );
     const stored = dawnItemsToStoredSources(dawnItems);
-    await remember(
-      'Dawn Opinion',
-      DAWN_OPINION_LIST_INTENT,
-      `Dawn Opinion menu (${dawnItems.length})`,
-      whatsappText,
-      dawnItems.map((d) => d.url),
-      { answer: whatsappText, sources: stored },
-    );
+    await setChatMemory(chatId, 'Dawn Opinion', 'Dawn Opinion', {
+      intent: DAWN_OPINION_LIST_INTENT,
+      answerBrief: `Dawn Opinion menu (${dawnItems.length})`,
+      preferredLang: replyLang,
+      assistantText: whatsappText,
+      userText: incomingQ,
+      shownUrls: dawnItems.map((d) => d.url),
+      answerFull: whatsappText,
+      sources: stored,
+      forceNewTopic: true,
+    });
     setGroundingPath(requestId, 'none', 'dawn_opinion_list');
     return Response.json(
       withPaths({
@@ -2736,7 +2744,10 @@ async function handleQueryPost(request: Request) {
   }
 
   if (dawnMenuPending && !otherOutletAsk && !isDawnOpinionListAsk(incomingQ)) {
-    const menuSources = (resolved.lastSources || activeTopic?.lastSources || []) as StoredSource[];
+    const menuSources = dawnMenuSourcesFromState(
+      convStateEarly,
+      (resolved.lastSources || activeTopic?.lastSources || []) as StoredSource[],
+    );
     const pickIdx = parseDawnOpinionSelection(incomingQ, menuSources);
     if (pickIdx != null && menuSources[pickIdx]) {
       const chosen = menuSources[pickIdx];
@@ -2796,6 +2807,23 @@ async function handleQueryPost(request: Request) {
           total: 1,
           whatsappText,
           sourceButtons,
+          usedMemory: true,
+          lastUpdated: now,
+        }),
+      );
+    }
+    if (looksLikeDawnPickAttempt(incomingQ)) {
+      setGroundingPath(requestId, 'none', 'dawn_opinion_pick_clarify');
+      return Response.json(
+        withPaths({
+          query: q,
+          rawQuery: incomingQ,
+          displayTopic: 'Dawn Opinion',
+          intent: DAWN_OPINION_LIST_INTENT,
+          brief: 'Need number or title for Dawn pick',
+          items: [],
+          total: 0,
+          whatsappText: buildDawnOpinionPickClarify(replyLang),
           usedMemory: true,
           lastUpdated: now,
         }),

@@ -10,12 +10,28 @@ const SUGGESTIONS = [
 ];
 
 const DASHBOARD_CHAT_KEY = 'newsdash.ask.chatId';
+const DASHBOARD_CHAT_DAY_KEY = 'newsdash.ask.chatDay';
 
 type SourceButton = { type?: string; text?: string; url?: string };
+
+function dashboardSessionDayKey(): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Karachi',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
 
 function dashboardChatId(): string {
   if (typeof window === 'undefined') return 'dashboard:web';
   try {
+    const today = dashboardSessionDayKey();
+    const storedDay = sessionStorage.getItem(DASHBOARD_CHAT_DAY_KEY);
+    if (storedDay !== today) {
+      sessionStorage.removeItem(DASHBOARD_CHAT_KEY);
+      sessionStorage.setItem(DASHBOARD_CHAT_DAY_KEY, today);
+    }
     const existing = sessionStorage.getItem(DASHBOARD_CHAT_KEY)?.trim();
     if (existing) return existing;
     const id = `dashboard:web:${crypto.randomUUID()}`;
@@ -68,8 +84,18 @@ export function AIAssistantPanel({ open, onClose }: AIAssistantPanelProps) {
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState<'ask' | 'groq' | 'offline' | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
+  const sessionDayRef = useRef<string>(dashboardSessionDayKey());
 
   const hasMessages = messages.length > 0;
+
+  useEffect(() => {
+    const today = dashboardSessionDayKey();
+    if (sessionDayRef.current !== today) {
+      sessionDayRef.current = today;
+      setMessages([]);
+      setMode(null);
+    }
+  }, [open]);
 
   useEffect(() => {
     if (chatRef.current) {

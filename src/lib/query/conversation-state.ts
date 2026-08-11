@@ -30,7 +30,9 @@ export type ConversationState = {
 };
 
 const TTL_MS = 45 * 60 * 1000;
-const REDIS_TTL_SEC = 2700;
+/** Redis TTL — also bounded by calendar-day reset on read. */
+const REDIS_TTL_SEC = 24 * 60 * 60;
+const SESSION_TZ = 'Asia/Karachi';
 const MAX_TOPICS = 5;
 const MAX_RECENT_TURNS = 6;
 const MAX_USER_FACTS = 10;
@@ -45,6 +47,28 @@ function store(): Map<string, ConversationState> {
     globalStore.__newsdashConversationState = new Map();
   }
   return globalStore.__newsdashConversationState;
+}
+
+function sessionDayKey(ts: number): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: SESSION_TZ,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date(ts));
+}
+
+/** True when memory belongs to a prior calendar day (fresh session each day). */
+export function isPreviousSessionDay(updatedAt: number | undefined | null): boolean {
+  if (!updatedAt || !Number.isFinite(updatedAt)) return false;
+  return sessionDayKey(updatedAt) !== sessionDayKey(Date.now());
+}
+
+function isExpiredConversation(row: { updatedAt?: number }): boolean {
+  const updatedAt = row.updatedAt || 0;
+  if (!updatedAt) return true;
+  if (isPreviousSessionDay(updatedAt)) return true;
+  return Date.now() - updatedAt > TTL_MS;
 }
 
 export function slugifyTopicId(label: string): string {
@@ -151,6 +175,16 @@ export async function getConversationState(
       for (const key of memoryKeys(chatId)) {
         const row = await redis.get<ConversationState | ChatMemory>(key);
         if (!row) continue;
+        const updatedAt =
+          (row as ConversationState).updatedAt || (row as ChatMemory).updatedAt || 0;
+        if (isExpiredConversation({ updatedAt })) {
+          try {
+            await redis.del(key);
+          } catch {
+            /* ignore */
+          }
+          continue;
+        }
         if (isConversationState(row)) return row;
         if (isLegacyChatMemory(row)) return chatMemoryToConversationState(chatId, row);
       }
@@ -163,7 +197,9 @@ export async function getConversationState(
   for (const key of memoryKeys(chatId)) {
     const row = map.get(key) as ConversationState | ChatMemory | undefined;
     if (!row) continue;
-    if (Date.now() - (row as ConversationState).updatedAt > TTL_MS) {
+    const updatedAt =
+      (row as ConversationState).updatedAt || (row as ChatMemory).updatedAt || 0;
+    if (isExpiredConversation({ updatedAt })) {
       map.delete(key);
       continue;
     }

@@ -315,7 +315,9 @@ export function needsConversationContext(
 
   // Ordinal references to listed items: "tell me about the first one", "the second story"
   if (
-    /\b(first|second|third|fourth|last|1st|2nd|3rd)\s+(one|item|story|article|source|repo|news|headline)\b/i.test(s)
+    /\b(first|second|third|fourth|last|1st|2nd|3rd)\s+(one|item|story|article|source|repo|news|headline|piece|column|opinion(?:\s+piece)?)\b/i.test(
+      s,
+    )
   ) {
     return true;
   }
